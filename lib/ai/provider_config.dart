@@ -81,6 +81,12 @@ class AiModelOption {
       );
 }
 
+/// 供应商请求协议。默认 OpenAI 兼容，旧配置无此字段时按 openaiCompatible 解析。
+enum AiApiStyle {
+  openaiCompatible,
+  anthropic,
+}
+
 class AiProviderConfig {
   AiProviderConfig({
     required this.id,
@@ -88,6 +94,8 @@ class AiProviderConfig {
     required this.baseUrl,
     required this.fullUrl,
     this.token = '',
+    this.apiStyle = AiApiStyle.openaiCompatible,
+    this.anthropicVersion = '2023-06-01',
     List<AiModelOption>? models,
   }) : models = models ?? [];
 
@@ -97,7 +105,13 @@ class AiProviderConfig {
   /// false：主机根，自动加 /v1；true：已是完整 chat 地址（…/chat/completions）
   bool fullUrl;
   String token;
+  /// 请求协议；默认 OpenAI，不改动既有兼容路径。
+  AiApiStyle apiStyle;
+  /// Anthropic 必填版本头；仅 anthropic 协议使用。
+  String anthropicVersion;
   List<AiModelOption> models;
+
+  bool get isAnthropic => apiStyle == AiApiStyle.anthropic;
 
   /// 去掉末尾斜杠。
   static String _trimSlash(String url) {
@@ -123,26 +137,32 @@ class AiProviderConfig {
     return RegExp(r'^v\d+[a-z0-9]*$').hasMatch(last);
   }
 
-  /// OpenAI 兼容 apiBase，对齐文档 `OPENAI_BASE_URL=https://…/v1`。
+  /// apiBase：对齐文档 `…/v1`。
   ///
-  /// - Base 模式：填 `https://host` 或已含 `/v1` 的地址（如 DashScope Coding Plan）
-  /// - 完整 chat：填 `…/v1/chat/completions`，剥到 `…/v1`
+  /// - Base 模式：填 `https://host` 或已含 `/v1` 的地址
+  /// - 完整 chat（OpenAI）：填 `…/v1/chat/completions`，剥到 `…/v1`
+  /// - 完整 messages（Anthropic）：填 `…/v1/messages`，剥到 `…/v1`
   String get apiBase {
     var base = _trimSlash(baseUrl);
     if (fullUrl) {
       const chatSuffix = '/chat/completions';
-      if (base.toLowerCase().endsWith(chatSuffix)) {
+      const messagesSuffix = '/messages';
+      final lower = base.toLowerCase();
+      if (lower.endsWith(chatSuffix)) {
         base = base.substring(0, base.length - chatSuffix.length);
+      } else if (lower.endsWith(messagesSuffix)) {
+        base = base.substring(0, base.length - messagesSuffix.length);
       } else {
         final uri = Uri.tryParse(base);
         if (uri != null && uri.pathSegments.isNotEmpty) {
           final segs = List<String>.from(uri.pathSegments);
           while (segs.isNotEmpty &&
-              (segs.last == 'chat' || segs.last == 'completions')) {
+              (segs.last == 'chat' ||
+                  segs.last == 'completions' ||
+                  segs.last == 'messages')) {
             segs.removeLast();
           }
-          base = _trimSlash(
-              uri.replace(pathSegments: segs).toString());
+          base = _trimSlash(uri.replace(pathSegments: segs).toString());
         }
       }
     }
@@ -154,8 +174,15 @@ class AiProviderConfig {
   /// GET 拉模型列表：`{apiBase}/models`
   String get modelsUrl => joinEndpoint(apiBase, 'models');
 
-  /// POST 对话：`{apiBase}/chat/completions`
+  /// POST 对话（OpenAI）：`{apiBase}/chat/completions`
   String get chatCompletionsUrl => joinEndpoint(apiBase, 'chat/completions');
+
+  /// POST 对话（Anthropic）：`{apiBase}/messages`
+  String get messagesUrl => joinEndpoint(apiBase, 'messages');
+
+  /// 当前协议实际对话 URL。
+  String get chatUrl =>
+      isAnthropic ? messagesUrl : chatCompletionsUrl;
 
   Map<String, dynamic> toJson() => {
         'id': id,
@@ -163,8 +190,18 @@ class AiProviderConfig {
         'baseUrl': baseUrl,
         'fullUrl': fullUrl,
         'token': token,
+        'apiStyle': apiStyle.name,
+        'anthropicVersion': anthropicVersion,
         'models': models.map((e) => e.toJson()).toList(),
       };
+
+  static AiApiStyle apiStyleFromJson(dynamic raw) {
+    final s = '$raw'.trim();
+    if (s == AiApiStyle.anthropic.name || s == 'anthropic') {
+      return AiApiStyle.anthropic;
+    }
+    return AiApiStyle.openaiCompatible;
+  }
 
   static AiProviderConfig fromJson(Map<String, dynamic> j) => AiProviderConfig(
         id: '${j['id'] ?? DateTime.now().millisecondsSinceEpoch}',
@@ -172,6 +209,8 @@ class AiProviderConfig {
         baseUrl: '${j['baseUrl'] ?? ''}',
         fullUrl: j['fullUrl'] == true,
         token: '${j['token'] ?? ''}',
+        apiStyle: apiStyleFromJson(j['apiStyle']),
+        anthropicVersion: '${j['anthropicVersion'] ?? '2023-06-01'}',
         models: ((j['models'] as List?) ?? [])
             .whereType<Map>()
             .map((e) => AiModelOption.fromJson(Map<String, dynamic>.from(e)))
@@ -207,16 +246,14 @@ class AiProviderConfig {
     return 'len=${key.length} prefix="${key.substring(0, 4)}" suffix="${key.substring(key.length - 4)}"';
   }
 
-  /// 标准 OpenAI 拉模型列表（与官网 curl 同鉴权，仅路径不同）：
-  /// ```
-  /// GET {modelsUrl}
-  /// Authorization: Bearer <token>
-  /// ```
-  /// 等价：
-  /// `curl -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" "$MODELS_URL"`
+  /// 拉模型列表。
+  /// - OpenAI：`Authorization: Bearer`
+  /// - Anthropic：`x-api-key` + `anthropic-version`
   static Future<List<String>> fetchModelIds({
     required String modelsUrl,
     required String token,
+    AiApiStyle apiStyle = AiApiStyle.openaiCompatible,
+    String anthropicVersion = '2023-06-01',
   }) async {
     final rawLen = token.length;
     final key = normalizeApiKey(token);
@@ -225,14 +262,29 @@ class AiProviderConfig {
       throw Exception('无效地址: $modelsUrl');
     }
 
-    // 严格按官网：有 key 就必须带 Authorization: Bearer
     final headers = <String, String>{
       'Accept': 'application/json',
       'Content-Type': 'application/json',
     };
     final sentAuth = key.isNotEmpty;
-    if (sentAuth) {
-      headers['Authorization'] = 'Bearer $key';
+    String authDesc;
+    if (apiStyle == AiApiStyle.anthropic) {
+      if (sentAuth) {
+        headers['x-api-key'] = key;
+        headers['anthropic-version'] =
+            anthropicVersion.trim().isEmpty ? '2023-06-01' : anthropicVersion.trim();
+      }
+      authDesc = sentAuth
+          ? 'x-api-key: <${debugKeyHint(token)}>; anthropic-version: ${headers['anthropic-version']}'
+          : '(无 x-api-key 头)';
+    } else {
+      // 严格按官网：有 key 就必须带 Authorization: Bearer
+      if (sentAuth) {
+        headers['Authorization'] = 'Bearer $key';
+      }
+      authDesc = sentAuth
+          ? 'Authorization: Bearer <${debugKeyHint(token)}>'
+          : '(无 Authorization 头)';
     }
 
     final resp = await http
@@ -243,9 +295,6 @@ class AiProviderConfig {
       final body = resp.body.length > 400
           ? '${resp.body.substring(0, 400)}…'
           : resp.body;
-      final authDesc = sentAuth
-          ? 'Authorization: Bearer <${debugKeyHint(token)}>'
-          : '(无 Authorization 头)';
       throw Exception(
         'GET $modelsUrl\n'
         'Header: $authDesc\n'

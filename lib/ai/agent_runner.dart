@@ -69,10 +69,11 @@ class AgentRunner extends ChangeNotifier {
   bool get running => _running;
 
   AgentMode mode = AgentMode.agent;
-  int maxSteps = 25;
+  int maxSteps = 45;
   int contextLimit = 20;
   int compactKeepRecent = 8;
   double compactTriggerRatio = 0.8;
+  int retryRounds = 5;
 
   ApprovalAction approveCreateInside = ApprovalAction.auto;
   ApprovalAction approveCreateOutside = ApprovalAction.ask;
@@ -949,13 +950,15 @@ class AgentRunner extends ChangeNotifier {
 
   void loadSettings(SettingsStore settings) {
     maxSteps =
-        (settings.getInt('agentMaxSteps') ?? 25).clamp(1, 100);
+        (settings.getInt('agentMaxSteps') ?? 45).clamp(1, 100);
     contextLimit =
         (settings.getInt('agentContextLimit') ?? 20).clamp(4, 100);
     compactKeepRecent =
         (settings.getInt('agentCompactKeep') ?? 8).clamp(2, 20);
     final pct = settings.getInt('agentCompactRatioPct') ?? 80;
     compactTriggerRatio = (pct.clamp(50, 95) / 100.0);
+    retryRounds = (settings.getInt('agentRetryRounds') ?? 5).clamp(0, 20);
+    _client.maxRetries = retryRounds;
     final modeStr = settings.getString('agentMode') ?? 'agent';
     // 兼容旧值 plan/act
     mode = (modeStr == 'chat' || modeStr == 'plan')

@@ -93,6 +93,7 @@ class _ProviderEditorState extends State<_ProviderEditor> {
   late final TextEditingController _name;
   late final TextEditingController _baseUrl;
   late final TextEditingController _token;
+  late final TextEditingController _version;
   bool _fetching = false;
   bool _tokenVisible = false;
   bool _modelsExpanded = false;
@@ -105,6 +106,7 @@ class _ProviderEditorState extends State<_ProviderEditor> {
     _name = TextEditingController(text: widget.provider.name);
     _baseUrl = TextEditingController(text: widget.provider.baseUrl);
     _token = TextEditingController(text: widget.provider.token);
+    _version = TextEditingController(text: widget.provider.anthropicVersion);
     // 已启用的默认展开，方便继续配置；其余默认收起
     for (final m in widget.provider.models) {
       if (m.enabled) _expandedModelIds.add(m.id);
@@ -116,6 +118,7 @@ class _ProviderEditorState extends State<_ProviderEditor> {
     _name.dispose();
     _baseUrl.dispose();
     _token.dispose();
+    _version.dispose();
     super.dispose();
   }
 
@@ -210,6 +213,44 @@ class _ProviderEditorState extends State<_ProviderEditor> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                Row(
+                  children: [
+                    _SegChip(
+                      label: 'OpenAI 兼容',
+                      selected: !p.isAnthropic,
+                      onTap: () {
+                        setState(() => p.apiStyle = AiApiStyle.openaiCompatible);
+                        widget.onChanged(p);
+                      },
+                    ),
+                    const SizedBox(width: 8),
+                    _SegChip(
+                      label: 'Anthropic',
+                      selected: p.isAnthropic,
+                      onTap: () {
+                        setState(() {
+                          p.apiStyle = AiApiStyle.anthropic;
+                          if (_baseUrl.text.contains('api.openai.com')) {
+                            _baseUrl.text = 'https://api.anthropic.com';
+                            p.baseUrl = _baseUrl.text;
+                          }
+                        });
+                        widget.onChanged(p);
+                      },
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        p.isAnthropic
+                            ? '走 /v1/messages + x-api-key'
+                            : '默认，走 /v1/chat/completions',
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(color: colors.textMuted, fontSize: 11),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
                 TextField(
                   controller: _baseUrl,
                   style: TextStyle(
@@ -220,9 +261,13 @@ class _ProviderEditorState extends State<_ProviderEditor> {
                   decoration: _fieldDeco(
                     colors,
                     label: 'BaseURL',
-                    hint: p.fullUrl
-                        ? 'https://host/v1/chat/completions'
-                        : 'https://host/v1',
+                    hint: p.isAnthropic
+                        ? (p.fullUrl
+                            ? 'https://api.anthropic.com/v1/messages'
+                            : 'https://api.anthropic.com')
+                        : (p.fullUrl
+                            ? 'https://host/v1/chat/completions'
+                            : 'https://host/v1'),
                   ),
                   onChanged: (v) {
                     p.baseUrl = v.trim();
@@ -243,7 +288,7 @@ class _ProviderEditorState extends State<_ProviderEditor> {
                     ),
                     const SizedBox(width: 8),
                     _SegChip(
-                      label: '完整chat',
+                      label: p.isAnthropic ? '完整messages' : '完整chat',
                       selected: p.fullUrl,
                       onTap: () {
                         setState(() => p.fullUrl = true);
@@ -254,7 +299,9 @@ class _ProviderEditorState extends State<_ProviderEditor> {
                     Expanded(
                       child: Text(
                         p.fullUrl
-                            ? '填 …/chat/completions，自动剥到 /v1'
+                            ? (p.isAnthropic
+                                ? '填 …/messages，自动剥到 /v1'
+                                : '填 …/chat/completions，自动剥到 /v1')
                             : '填 …/v1 或主机根',
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(color: colors.textMuted, fontSize: 11),
@@ -265,7 +312,7 @@ class _ProviderEditorState extends State<_ProviderEditor> {
                 const SizedBox(height: 8),
                 _EndpointHint(label: 'GET', url: p.modelsUrl),
                 const SizedBox(height: 2),
-                _EndpointHint(label: 'POST', url: p.chatCompletionsUrl),
+                _EndpointHint(label: 'POST', url: p.chatUrl),
                 const SizedBox(height: 10),
                 TextField(
                   controller: _token,
@@ -277,7 +324,7 @@ class _ProviderEditorState extends State<_ProviderEditor> {
                   ),
                   decoration: _fieldDeco(
                     colors,
-                    label: 'Token',
+                    label: p.isAnthropic ? 'x-api-key' : 'Token',
                     suffix: IconButton(
                       tooltip: _tokenVisible ? '隐藏 Token' : '显示 Token',
                       onPressed: () =>
@@ -296,6 +343,28 @@ class _ProviderEditorState extends State<_ProviderEditor> {
                     p.token = v;
                   },
                 ),
+                if (p.isAnthropic) ...[
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: _version,
+                    style: TextStyle(
+                      color: colors.textPrimary,
+                      fontSize: 12.5,
+                      fontFamily: 'Menlo',
+                    ),
+                    decoration: _fieldDeco(
+                      colors,
+                      label: 'anthropic-version',
+                      hint: '2023-06-01',
+                    ),
+                    onChanged: (v) {
+                      p.anthropicVersion = v.trim().isEmpty
+                          ? '2023-06-01'
+                          : v.trim();
+                      widget.onChanged(p);
+                    },
+                  ),
+                ],
                 const SizedBox(height: 12),
                 Row(
                   children: [
@@ -399,6 +468,9 @@ class _ProviderEditorState extends State<_ProviderEditor> {
     final tokenFromField = _token.text;
     p.baseUrl = _baseUrl.text.trim();
     p.token = tokenFromField.trim();
+    p.anthropicVersion = _version.text.trim().isEmpty
+        ? '2023-06-01'
+        : _version.text.trim();
     p.name = _name.text.trim().isEmpty ? p.name : _name.text.trim();
 
     if (p.baseUrl.isEmpty) {
@@ -420,6 +492,8 @@ class _ProviderEditorState extends State<_ProviderEditor> {
       final ids = await AiProviderConfig.fetchModelIds(
         modelsUrl: p.modelsUrl,
         token: tokenFromField,
+        apiStyle: p.apiStyle,
+        anthropicVersion: p.anthropicVersion,
       );
       final existing = p.models.map((e) => e.id).toSet();
       setState(() {

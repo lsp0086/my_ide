@@ -1181,6 +1181,7 @@ class _AgentSettingsCardState extends State<_AgentSettingsCard> {
   late final TextEditingController _context;
   late final TextEditingController _keep;
   late final TextEditingController _ratio;
+  late final TextEditingController _retry;
   late String _createInside;
   late String _createOutside;
   late String _delete;
@@ -1197,13 +1198,15 @@ class _AgentSettingsCardState extends State<_AgentSettingsCard> {
     super.initState();
     final settings = SettingsStore.instance;
     _steps = TextEditingController(
-        text: '${settings.getInt('agentMaxSteps') ?? 25}');
+        text: '${settings.getInt('agentMaxSteps') ?? 45}');
     _context = TextEditingController(
         text: '${settings.getInt('agentContextLimit') ?? 20}');
     _keep = TextEditingController(
         text: '${settings.getInt('agentCompactKeep') ?? 8}');
     _ratio = TextEditingController(
         text: '${settings.getInt('agentCompactRatioPct') ?? 80}');
+    _retry = TextEditingController(
+        text: '${settings.getInt('agentRetryRounds') ?? 5}');
     _createInside = settings.getString('approveCreateInside') ?? 'auto';
     _createOutside = settings.getString('approveCreateOutside') ?? 'ask';
     _delete = settings.getString('approveDelete') ?? 'ask';
@@ -1216,6 +1219,7 @@ class _AgentSettingsCardState extends State<_AgentSettingsCard> {
     _context.dispose();
     _keep.dispose();
     _ratio.dispose();
+    _retry.dispose();
     super.dispose();
   }
 
@@ -1293,7 +1297,7 @@ class _AgentSettingsCardState extends State<_AgentSettingsCard> {
           ),
           const SizedBox(height: 4),
           Text(
-            '最大步数防死循环（默认 25），上下文条数控制历史长度。压缩：超阈值自动摘要旧消息。',
+            '最大步数防死循环（默认 45），上下文条数控制历史长度。压缩：超阈值自动摘要旧消息。',
             style: TextStyle(color: colors.textMuted, fontSize: 12),
           ),
           const SizedBox(height: 10),
@@ -1383,6 +1387,25 @@ class _AgentSettingsCardState extends State<_AgentSettingsCard> {
                 ),
               ),
             ],
+          ),
+          const SizedBox(height: 10),
+          TextField(
+            controller: _retry,
+            keyboardType: TextInputType.number,
+            style: TextStyle(color: colors.textPrimary, fontSize: 12.5),
+            decoration: const InputDecoration(
+              labelText: '重试轮数',
+              hintText: '默认 5',
+              isDense: true,
+              helperText: '请求非 2xx 时静默重试；每次仍用初次请求内容，全部失败后再报错',
+            ),
+            onChanged: (v) {
+              final n = int.tryParse(v);
+              if (n != null) {
+                SettingsStore.instance
+                    .setInt('agentRetryRounds', n.clamp(0, 20));
+              }
+            },
           ),
           const SizedBox(height: 16),
           Divider(height: 1, color: colors.divider),
