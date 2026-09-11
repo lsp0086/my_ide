@@ -43,6 +43,8 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
+          # 与本地开发机对齐（见 README「推荐 Flutter 版本」）
+          flutter-version: '3.38.6'
           channel: stable
           cache: true
 

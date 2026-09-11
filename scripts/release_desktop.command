@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # 桌面发布：本机可编的平台 → dist/ 扁平打包 → flutter clean
+# 依赖 packages/clipboard（path），Windows 可直接 flutter build，无需再 patch。
 # 用法：
-#   ./scripts/release_desktop.sh
-#   ./scripts/release_desktop.sh --no-clean
-#   OUT_DIR=artifacts ./scripts/release_desktop.sh
+#   ./scripts/release_desktop.command
+#   ./scripts/release_desktop.command --no-clean
+#   OUT_DIR=artifacts ./scripts/release_desktop.command
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -70,9 +71,9 @@ build_macos() {
   zip_path="$OUT_DIR/${APP_NAME}-${VERSION}-macos-${ARCH}.zip"
   zip_dir "$ROOT/$app_path" "$zip_path"
   # 同时复制一份未压缩 app 方便本机直接跑（可选）
-  rm -rf "$OUT_DIR/${APP_NAME}-${VERSION}-macos-${ARCH}.app"
-  cp -R "$ROOT/$app_path" "$OUT_DIR/${APP_NAME}-${VERSION}-macos-${ARCH}.app"
-  echo "    已复制: $OUT_DIR/${APP_NAME}-${VERSION}-macos-${ARCH}.app"
+  # rm -rf "$OUT_DIR/${APP_NAME}-${VERSION}-macos-${ARCH}.app"
+  # cp -R "$ROOT/$app_path" "$OUT_DIR/${APP_NAME}-${VERSION}-macos-${ARCH}.app"
+  # echo "    已复制: $OUT_DIR/${APP_NAME}-${VERSION}-macos-${ARCH}.app"
 }
 
 build_linux() {

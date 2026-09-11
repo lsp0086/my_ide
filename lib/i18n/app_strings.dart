@@ -28,12 +28,40 @@ class AppStrings {
   String get newChat => isZh ? '新对话' : 'New chat';
   String get exportMd => isZh ? '导出为 MD' : 'Export MD';
   String get deleteChat => isZh ? '删除对话' : 'Delete chat';
+  String get deleteChatAndMergeVersions =>
+      isZh ? '删除对话&合并版本' : 'Delete chat & merge versions';
   String get emptyChat => isZh ? '暂无对话，新建一个开始' : 'No chats yet';
   String get chatHint => isZh ? '描述你想做的改动…' : 'Describe your change…';
   String get providers => isZh ? '供应商' : 'Providers';
   String get providersDesc => isZh ? 'OpenAI 兼容 BaseURL + Token，拉取模型列表后配置' : 'OpenAI-compatible BaseURL + token';
-  String get clearMemory => isZh ? '清除当前项目记忆' : 'Clear project memory';
-  String get confirmDelete => isZh ? '确认删除该对话？记录清除但保留差量。' : 'Delete chat? History removed, checkpoints kept.';
+  String get cleanProject => isZh ? '清理项目' : 'Clean project';
+  String get cleanProjectDesc => isZh
+      ? '清理当前项目的对话与记忆数据，不会删除工作区源码'
+      : 'Clear chats and memory for this project without deleting source files';
+  String get clearChats => isZh ? '清理对话' : 'Clear chats';
+  String get clearChatsDesc =>
+      isZh ? '仅删除所有对话，保留版本记录' : 'Delete all chats, keep version history';
+  String get clearProjectMemory => isZh ? '清空项目记忆' : 'Clear project memory';
+  String get clearProjectMemoryDesc => isZh
+      ? '删除所有对话和版本记录'
+      : 'Delete all chats and version history';
+  String get confirmDeleteChat => isZh
+      ? '仅删除该对话记录，保留相关版本。'
+      : 'Delete this chat only. Version history is kept.';
+  String get confirmDeleteChatAndMerge => isZh
+      ? '删除该对话，并合并/清理其关联版本节点。'
+      : 'Delete this chat and merge/drop its linked versions.';
+  String get confirmClearChats => isZh
+      ? '将删除当前项目的全部对话，版本记录会保留。'
+      : 'Delete all chats in this project. Version history is kept.';
+  String get confirmClearProjectMemory => isZh
+      ? '将删除全部对话、版本记录与项目记忆，此操作不可撤销。'
+      : 'Delete all chats, versions, and project memory. This cannot be undone.';
+
+  @Deprecated('Use cleanProject / clearProjectMemory')
+  String get clearMemory => clearProjectMemory;
+  @Deprecated('Use confirmDeleteChat')
+  String get confirmDelete => confirmDeleteChat;
 }
 
 class _StringsScope extends InheritedWidget {

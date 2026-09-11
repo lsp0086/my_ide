@@ -47,7 +47,26 @@
 ## 技术栈
 
 - Flutter / Dart 3（桌面：macOS；Windows / Linux 需在对应系统或 CI 构建）
-- 主要依赖：`re_editor`、`re_highlight`、`http`、`shared_preferences`、`desktop_drop`、`clipboard`、`flutter_markdown`、`crypto`
+- 主要依赖：`re_editor`、`re_highlight`、`http`、`shared_preferences`、`desktop_drop`、`clipboard`（本地 fork：`packages/clipboard`，修复 Windows MSVC C4189）、`flutter_markdown`、`crypto`
+
+## 推荐 Flutter 版本
+
+本地与 CI 统一使用：
+
+| 项目 | 版本 |
+| --- | --- |
+| Flutter | **3.38.6**（stable） |
+| Dart SDK | 3.10.7 |
+| Framework revision | `8b87286849` |
+
+GitHub Actions（`.github/workflows/release-desktop.yml`）已固定 `flutter-version: '3.38.6'`。本机请尽量使用同一版本，避免桌面插件 / MSVC / 引擎差异。
+
+可用以下命令核对：
+
+```bash
+flutter --version
+# 期望包含：Flutter 3.38.6 • channel stable
+```
 
 ## 运行
 
@@ -82,9 +101,12 @@ flutter build windows --release
 | `lib/settings/` | 设置持久化 |
 | `lib/workspace/` | 工作区与文件树 |
 | `scripts/` | 桌面发布脚本 |
+| `packages/clipboard` | 本地 clipboard fork（Windows 编译修复） |
+| `.github/workflows/` | 桌面三端 Release CI |
 
 ## 说明
 
 - 本项目的版本管理是独立的内容寻址快照，**不替代 Git**。
 - AI Agent 的文件与命令操作受工作区门禁与审批策略约束。
 - Windows 桌面包无法在 macOS 本机交叉编译，需 Windows 环境或 CI。
+- `clipboard` 已改为 path 依赖，本地脚本与 GitHub Actions 都只需 `flutter pub get` + `flutter build …`，无需再运行时 patch。

@@ -1,5 +1,7 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_selector/file_selector.dart';
@@ -770,26 +772,29 @@ class _SettingsPanel extends StatelessWidget {
               const _SettingsCard(child: _LanguageServerSettingsCard()),
               const SizedBox(height: 20),
               _SettingsSectionTitle(
-                title: t.clearMemory,
-                desc: t.confirmDelete,
+                title: t.cleanProject,
+                desc: t.cleanProjectDesc,
               ),
               const SizedBox(height: 12),
               _SettingsCard(
-                child: Row(
+                child: Column(
                   children: [
-                    Expanded(
-                      child: Text(
-                        t.clearMemory,
-                        style: TextStyle(
-                          color: colors.textPrimary,
-                          fontSize: 13,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
+                    _CleanProjectActionRow(
+                      title: t.clearChats,
+                      subtitle: t.clearChatsDesc,
+                      buttonLabel: t.clearChats,
+                      onPressed: () => _confirmClearChats(context),
                     ),
-                    FilledButton.tonal(
-                      onPressed: () => _confirmClearMemory(context),
-                      child: Text(t.clearMemory),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                      child: Divider(height: 1, color: colors.border),
+                    ),
+                    _CleanProjectActionRow(
+                      title: t.clearProjectMemory,
+                      subtitle: t.clearProjectMemoryDesc,
+                      buttonLabel: t.clearProjectMemory,
+                      destructive: true,
+                      onPressed: () => _confirmClearProjectMemory(context),
                     ),
                   ],
                 ),
@@ -801,28 +806,87 @@ class _SettingsPanel extends StatelessWidget {
     );
   }
 
-  Future<void> _confirmClearMemory(BuildContext context) async {
-    final chats = ChatScope.of(context);
-    final ok = await showDialog<bool>(
+  Future<void> _confirmClearChats(BuildContext context) async {
+    final t = AppStrings.of(context);
+    final ok = await _showCodexConfirmDialog(
       context: context,
-      builder: (context) => AlertDialog(
-        title: Text(AppStrings.of(context).clearMemory),
-        content: Text(AppStrings.of(context).confirmDelete),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(false),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.of(context).pop(true),
-            child: Text(AppStrings.of(context).clearMemory),
-          ),
-        ],
-      ),
+      title: t.clearChats,
+      message: t.confirmClearChats,
+      confirmLabel: t.clearChats,
     );
-    if (ok == true) {
-      await chats.clearAll();
-    }
+    if (ok != true || !context.mounted) return;
+    await ChatScope.of(context).clearChats();
+  }
+
+  Future<void> _confirmClearProjectMemory(BuildContext context) async {
+    final t = AppStrings.of(context);
+    final ok = await _showCodexConfirmDialog(
+      context: context,
+      title: t.clearProjectMemory,
+      message: t.confirmClearProjectMemory,
+      confirmLabel: t.clearProjectMemory,
+      destructive: true,
+    );
+    if (ok != true || !context.mounted) return;
+    await ChatScope.of(context).clearAll(includeMemory: true);
+    if (!context.mounted) return;
+    await CheckpointScope.of(context).clearAll();
+  }
+}
+
+class _CleanProjectActionRow extends StatelessWidget {
+  const _CleanProjectActionRow({
+    required this.title,
+    required this.subtitle,
+    required this.buttonLabel,
+    required this.onPressed,
+    this.destructive = false,
+  });
+
+  final String title;
+  final String subtitle;
+  final String buttonLabel;
+  final VoidCallback onPressed;
+  final bool destructive;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = IdeColors.of(context);
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                title,
+                style: TextStyle(
+                  color: colors.textPrimary,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                subtitle,
+                style: TextStyle(
+                  color: colors.textMuted,
+                  fontSize: 12,
+                  height: 1.35,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(width: 12),
+        _CodexSoftButton(
+          label: buttonLabel,
+          onTap: onPressed,
+          destructive: destructive,
+        ),
+      ],
+    );
   }
 }
 
@@ -2695,8 +2759,12 @@ class _AiPanelState extends State<_AiPanel> {
   final _focusNode = FocusNode();
   final _chatListKey = GlobalKey();
   AgentRunner? _runner;
-  /// 粘贴的图片（data URL），仅当模型 supportsVision 时发送。
+  /// 粘贴/拖入的图片（data URL），仅当模型 supportsVision 时发送。
   final List<_PendingImage> _images = [];
+  /// 拖入的文件/文件夹引用（显示在图片行下方）。
+  final List<_PendingAttachment> _attachments = [];
+  bool _draggingComposer = false;
+  static const int _inlineTextLimit = 32 * 1024;
 
   @override
   void dispose() {
@@ -2709,6 +2777,175 @@ class _AiPanelState extends State<_AiPanel> {
   bool get _isMac => Platform.isMacOS;
   String get _sendHint => _isMac ? '⌘ + Enter 发送' : 'Ctrl + Enter 发送';
 
+  bool _isImagePath(String path) {
+    final lower = path.toLowerCase();
+    return lower.endsWith('.png') ||
+        lower.endsWith('.jpg') ||
+        lower.endsWith('.jpeg') ||
+        lower.endsWith('.webp') ||
+        lower.endsWith('.gif') ||
+        lower.endsWith('.bmp');
+  }
+
+  String _mimeFromPath(String path) {
+    final lower = path.toLowerCase();
+    if (lower.endsWith('.png')) return 'image/png';
+    if (lower.endsWith('.webp')) return 'image/webp';
+    if (lower.endsWith('.gif')) return 'image/gif';
+    if (lower.endsWith('.bmp')) return 'image/bmp';
+    return 'image/jpeg';
+  }
+
+  String _formatBytes(int n) {
+    if (n < 1024) return '$n B';
+    if (n < 1024 * 1024) return '${(n / 1024).toStringAsFixed(1)} KB';
+    return '${(n / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+
+  String _displayPath(String absPath, String? rootPath) {
+    if (rootPath == null || rootPath.isEmpty) return absPath;
+    final root = p.normalize(rootPath);
+    final abs = p.normalize(absPath);
+    if (abs == root || p.isWithin(root, abs)) {
+      return p.relative(abs, from: root);
+    }
+    return abs;
+  }
+
+  Future<void> _addDroppedPaths(List<String> rawPaths) async {
+    if (rawPaths.isEmpty) return;
+    final rootPath = WorkspaceScope.of(context).rootPath;
+    final nextImages = <_PendingImage>[];
+    final nextAttachments = <_PendingAttachment>[];
+    for (final raw in rawPaths) {
+      final path = raw.trim();
+      if (path.isEmpty) continue;
+      final abs = p.normalize(path);
+      final dir = Directory(abs);
+      final file = File(abs);
+      if (await dir.exists()) {
+        if (_attachments.any((a) => a.path == abs) ||
+            nextAttachments.any((a) => a.path == abs)) {
+          continue;
+        }
+        nextAttachments.add(_PendingAttachment(
+          path: abs,
+          name: p.basename(abs),
+          kind: _AttachmentKind.folder,
+          displayPath: _displayPath(abs, rootPath),
+          insideWorkspace: rootPath != null &&
+              (abs == p.normalize(rootPath) ||
+                  p.isWithin(p.normalize(rootPath), abs)),
+        ));
+        continue;
+      }
+      if (!await file.exists()) continue;
+      if (_isImagePath(abs)) {
+        try {
+          final bytes = await file.readAsBytes();
+          if (bytes.isEmpty || bytes.length > 8 * 1024 * 1024) continue;
+          final mime = _mimeFromPath(abs);
+          nextImages.add(_PendingImage(
+            bytes: Uint8List.fromList(bytes),
+            mime: mime,
+            dataUrl: 'data:$mime;base64,${base64Encode(bytes)}',
+          ));
+        } catch (_) {}
+        continue;
+      }
+      if (_attachments.any((a) => a.path == abs) ||
+          nextAttachments.any((a) => a.path == abs)) {
+        continue;
+      }
+      int? size;
+      try {
+        size = await file.length();
+      } catch (_) {}
+      nextAttachments.add(_PendingAttachment(
+        path: abs,
+        name: p.basename(abs),
+        kind: _AttachmentKind.file,
+        displayPath: _displayPath(abs, rootPath),
+        sizeBytes: size,
+        insideWorkspace: rootPath != null &&
+            p.isWithin(p.normalize(rootPath), abs),
+      ));
+    }
+    if (!mounted) return;
+    if (nextImages.isEmpty && nextAttachments.isEmpty) return;
+    setState(() {
+      _images.addAll(nextImages);
+      _attachments.addAll(nextAttachments);
+    });
+  }
+
+  Future<void> _onComposerDrop(DropDoneDetails details) async {
+    if (!WorkspaceScope.of(context).hasWorkspace) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('请先打开项目后再拖入附件')),
+      );
+      return;
+    }
+    final paths = details.files
+        .map((f) => f.path)
+        .where((path) => path.isNotEmpty)
+        .toList();
+    await _addDroppedPaths(paths);
+  }
+
+  Future<String> _composeAttachmentContext(
+    List<_PendingAttachment> attachments,
+  ) async {
+    if (attachments.isEmpty) return '';
+    final buf = StringBuffer();
+    buf.writeln('【用户附件】');
+    buf.writeln('说明：区内路径用相对路径调用工具；区外路径用绝对路径（read_file/list_files 需审批）。');
+    for (final a in attachments) {
+      final toolPath = a.insideWorkspace ? a.displayPath : a.path;
+      if (a.kind == _AttachmentKind.folder) {
+        buf.writeln('- 文件夹：`$toolPath`');
+        buf.writeln(
+          a.insideWorkspace
+              ? '  请用 list_files / search_text 读取。'
+              : '  位于工作区外，请用绝对路径 list_files（需审批）。',
+        );
+        continue;
+      }
+      buf.writeln(
+        '- 文件：`$toolPath`'
+        '${a.sizeBytes == null ? '' : '（${_formatBytes(a.sizeBytes!)}）'}',
+      );
+      try {
+        final file = File(a.path);
+        if (!await file.exists()) {
+          buf.writeln('  （文件不存在）');
+          continue;
+        }
+        final bytes = await file.readAsBytes();
+        if (bytes.length > _inlineTextLimit) {
+          buf.writeln(
+            a.insideWorkspace
+                ? '  内容过大，未内联；请用 read_file 读取 `$toolPath`。'
+                : '  内容过大，未内联；请用绝对路径 read_file `$toolPath`（需审批）。',
+          );
+          continue;
+        }
+        final text = utf8.decode(bytes, allowMalformed: true);
+        final looksBinary = text.contains('\u0000') ||
+            text.codeUnits.where((c) => c < 9).length > 8;
+        if (looksBinary) {
+          buf.writeln('  疑似二进制，未内联内容。');
+          continue;
+        }
+        buf.writeln('  ```');
+        buf.writeln(text);
+        buf.writeln('  ```');
+      } catch (e) {
+        buf.writeln('  读取失败：$e');
+      }
+    }
+    return buf.toString().trimRight();
+  }
 
   AgentRunner _agentOf(BuildContext context) {
     _runner ??= AgentRunner(
@@ -2773,11 +3010,22 @@ class _AiPanelState extends State<_AiPanel> {
             padding: EdgeInsets.zero,
             children: [
               for (final s in chats.sessions)
-                _SoftMenuItem(
-                  icon: Icons.chat_bubble_outline_rounded,
-                  title: _chatLabel(s),
-                  selected: s.id == chats.active?.id,
-                  onTap: () => select(s.id),
+                GestureDetector(
+                  onSecondaryTapDown: (details) {
+                    // 不关闭对话列表；在其上方再叠一层右键菜单。
+                    _showChatContextMenu(
+                      context: context,
+                      hostContext: ctx,
+                      globalPosition: details.globalPosition,
+                      session: s,
+                    );
+                  },
+                  child: _SoftMenuItem(
+                    icon: Icons.chat_bubble_outline_rounded,
+                    title: _chatLabel(s),
+                    selected: s.id == chats.active?.id,
+                    onTap: () => select(s.id),
+                  ),
                 ),
               if (chats.sessions.isEmpty)
                 Padding(
@@ -2795,28 +3043,90 @@ class _AiPanelState extends State<_AiPanel> {
     if (picked != null) chats.select(picked);
   }
 
-  Future<void> _confirmDelete(String id, String title) async {
+  Future<void> _showChatContextMenu({
+    required BuildContext context,
+    required Offset globalPosition,
+    required ChatSession session,
+    BuildContext? hostContext,
+  }) async {
     final t = AppStrings.of(context);
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text(t.deleteChat),
-        content: Text('$title\n\n${t.confirmDelete}'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(false),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.of(context).pop(true),
-            child: Text(t.deleteChat),
-          ),
-        ],
-      ),
+    // 若从对话列表弹层内右键，用 hostContext 叠在列表上方，不先关掉列表。
+    final menuContext = hostContext ?? context;
+    final action = await _showCodexContextMenu<_ChatDeleteAction>(
+      context: menuContext,
+      globalPosition: globalPosition,
+      width: 220,
+      items: [
+        _CodexContextMenuItem(
+          value: _ChatDeleteAction.deleteOnly,
+          icon: Icons.chat_bubble_outline_rounded,
+          title: t.deleteChat,
+          subtitle: '仅删除对话，保留版本',
+        ),
+        _CodexContextMenuItem(
+          value: _ChatDeleteAction.deleteAndMerge,
+          icon: Icons.merge_type_rounded,
+          title: t.deleteChatAndMergeVersions,
+          subtitle: '删除对话并合并关联版本',
+          destructive: true,
+        ),
+      ],
     );
-    if (ok == true) {
-      await ChatScope.of(context).deleteChat(id);
+    if (action == null || !mounted) return;
+    // 选定操作后再收起对话列表，避免列表项过期。
+    if (hostContext != null &&
+        hostContext.mounted &&
+        Navigator.of(hostContext).canPop()) {
+      Navigator.of(hostContext).pop();
     }
+    if (action == _ChatDeleteAction.deleteOnly) {
+      await _confirmDeleteChat(session, mergeVersions: false);
+    } else {
+      await _confirmDeleteChat(session, mergeVersions: true);
+    }
+  }
+
+  Future<void> _confirmDeleteChat(
+    ChatSession session, {
+    required bool mergeVersions,
+  }) async {
+    final t = AppStrings.of(context);
+    final title = mergeVersions
+        ? t.deleteChatAndMergeVersions
+        : t.deleteChat;
+    final message = mergeVersions
+        ? '${session.title}\n\n${t.confirmDeleteChatAndMerge}'
+        : '${session.title}\n\n${t.confirmDeleteChat}';
+    final ok = await _showCodexConfirmDialog(
+      context: context,
+      title: title,
+      message: message,
+      confirmLabel: title,
+      destructive: mergeVersions,
+    );
+    if (ok != true || !mounted) return;
+
+    final chats = ChatScope.of(context);
+    final checkpoints = CheckpointScope.of(context);
+    if (mergeVersions) {
+      final dropIds = <String>{
+        ...chats.versionIdsOfSession(session.id),
+        ...checkpoints.versionIdsForChat(session.id),
+      };
+      if (dropIds.isNotEmpty) {
+        try {
+          // 只删版本链并重算 diff，不回写工作区源码。
+          await checkpoints.dropVersions(dropIds);
+        } catch (e) {
+          if (!mounted) return;
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('版本合并失败：$e')),
+          );
+          return;
+        }
+      }
+    }
+    await chats.deleteChat(session.id);
   }
 
   @override
@@ -2839,9 +3149,19 @@ class _AiPanelState extends State<_AiPanel> {
             provider == null ? null : _resolveModel(settings, provider);
         final hasProject = workspace.hasWorkspace;
         final canCompose = hasProject && !runner.running;
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
+        return DropTarget(
+          onDragEntered: (_) => setState(() => _draggingComposer = true),
+          onDragExited: (_) => setState(() => _draggingComposer = false),
+          onDragDone: (details) async {
+            setState(() => _draggingComposer = false);
+            if (!canCompose) return;
+            await _onComposerDrop(details);
+          },
+          child: Stack(
+            children: [
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
             _PanelHeader(
               title: t.aiAssistant,
               trailing: Row(
@@ -2931,7 +3251,7 @@ class _AiPanelState extends State<_AiPanel> {
                   ),
                 ),
               ),
-            if (chats.sessions.length > 1)
+            if (chats.sessions.isNotEmpty)
               Container(
                 height: 40,
                 padding: const EdgeInsets.symmetric(horizontal: 10),
@@ -2947,43 +3267,43 @@ class _AiPanelState extends State<_AiPanel> {
                     final selected = s.id == chats.active?.id;
                     return GestureDetector(
                       onTap: () => chats.select(s.id),
-                      child: Container(
-                        alignment: Alignment.center,
-                        margin: const EdgeInsets.symmetric(vertical: 7),
-                        padding: const EdgeInsets.symmetric(horizontal: 10),
-                        decoration: BoxDecoration(
-                          color: selected
-                              ? colors.accentSoft
-                              : colors.panelElevated,
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(
+                      onSecondaryTapDown: (details) {
+                        _showChatContextMenu(
+                          context: context,
+                          globalPosition: details.globalPosition,
+                          session: s,
+                        );
+                      },
+                      child: Tooltip(
+                        message: '右键可删除对话',
+                        waitDuration: const Duration(milliseconds: 600),
+                        child: Container(
+                          alignment: Alignment.center,
+                          margin: const EdgeInsets.symmetric(vertical: 7),
+                          padding: const EdgeInsets.symmetric(horizontal: 10),
+                          decoration: BoxDecoration(
                             color: selected
-                                ? colors.accent
-                                : colors.borderStrong,
+                                ? colors.accentSoft
+                                : colors.panelElevated,
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(
+                              color: selected
+                                  ? colors.accent
+                                  : colors.borderStrong,
+                            ),
                           ),
-                        ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Text(
-                              s.title,
-                              style: TextStyle(
-                                color: selected
-                                    ? colors.textPrimary
-                                    : colors.textSecondary,
-                                fontSize: 12,
-                                fontWeight: selected
-                                    ? FontWeight.w600
-                                    : FontWeight.w400,
-                              ),
+                          child: Text(
+                            s.title,
+                            style: TextStyle(
+                              color: selected
+                                  ? colors.textPrimary
+                                  : colors.textSecondary,
+                              fontSize: 12,
+                              fontWeight: selected
+                                  ? FontWeight.w600
+                                  : FontWeight.w400,
                             ),
-                            const SizedBox(width: 4),
-                            InkWell(
-                              onTap: () => _confirmDelete(s.id, s.title),
-                              child: Icon(Icons.delete_outline_rounded,
-                                  size: 14, color: colors.textMuted),
-                            ),
-                          ],
+                          ),
                         ),
                       ),
                     );
@@ -3087,28 +3407,32 @@ class _AiPanelState extends State<_AiPanel> {
                       },
                     ),
             ),
-        if (runner.pendingApproval != null)
-          _ApprovalCard(
-            approval: runner.pendingApproval!,
-            onDecision: runner.resolveApproval,
-          ),
-        if (runner.pendingQuestion != null)
-          _QuestionCard(
-            question: runner.pendingQuestion!,
-            onAnswer: runner.resolveQuestion,
-          ),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-          child: Container(
-            decoration: BoxDecoration(
-              color: colors.inputFill,
-              borderRadius: BorderRadius.circular(14),
-              border: Border.all(color: colors.borderStrong),
-            ),
-            padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
+            if (runner.pendingApproval != null)
+              _ApprovalCard(
+                approval: runner.pendingApproval!,
+                onDecision: runner.resolveApproval,
+              ),
+            if (runner.pendingQuestion != null)
+              _QuestionCard(
+                question: runner.pendingQuestion!,
+                onAnswer: runner.resolveQuestion,
+              ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
+              child: Container(
+                decoration: BoxDecoration(
+                  color: colors.inputFill,
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(
+                    color: _draggingComposer
+                        ? colors.accent
+                        : colors.borderStrong,
+                  ),
+                ),
+                padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
                 if (_images.isNotEmpty) ...[
                   SizedBox(
                     height: 64,
@@ -3152,6 +3476,24 @@ class _AiPanelState extends State<_AiPanel> {
                         );
                       },
                     ),
+                  ),
+                  const SizedBox(height: 8),
+                ],
+                if (_attachments.isNotEmpty) ...[
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      for (var i = 0; i < _attachments.length; i++)
+                        _ComposerAttachmentChip(
+                          attachment: _attachments[i],
+                          sizeLabel: _attachments[i].sizeBytes == null
+                              ? null
+                              : _formatBytes(_attachments[i].sizeBytes!),
+                          onRemove: () =>
+                              setState(() => _attachments.removeAt(i)),
+                        ),
+                    ],
                   ),
                   const SizedBox(height: 8),
                 ],
@@ -3201,7 +3543,7 @@ class _AiPanelState extends State<_AiPanel> {
                         isDense: true,
                         border: InputBorder.none,
                         hintText: hasProject
-                            ? '描述你想做的改动…（可 Cmd/Ctrl+V 粘贴图片）'
+                            ? '描述你想做的改动…（可拖入图片/文件/文件夹，或粘贴图片）'
                             : '请先打开项目后再对话',
                         hintStyle: TextStyle(
                           color: colors.textMuted,
@@ -3270,11 +3612,43 @@ class _AiPanelState extends State<_AiPanel> {
                     ),
                   ],
                 ),
+                  ],
+                ),
+              ),
+            ),
               ],
             ),
+              if (_draggingComposer)
+                Positioned.fill(
+                  child: IgnorePointer(
+                    child: ColoredBox(
+                      color: colors.accent.withValues(alpha: 0.08),
+                      child: Center(
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 14,
+                            vertical: 8,
+                          ),
+                          decoration: BoxDecoration(
+                            color: colors.panel,
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(color: colors.accent),
+                          ),
+                          child: Text(
+                            '松开以添加图片 / 文件 / 文件夹',
+                            style: TextStyle(
+                              color: colors.textPrimary,
+                              fontSize: 12.5,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+            ],
           ),
-        ),
-          ],
         );
       },
     );
@@ -3343,7 +3717,7 @@ class _AiPanelState extends State<_AiPanel> {
 
   Future<void> _sendMessage() async {
     final text = _controller.text.trim();
-    if (text.isEmpty && _images.isEmpty) return;
+    if (text.isEmpty && _images.isEmpty && _attachments.isEmpty) return;
     final chats = ChatScope.of(context);
     final settings = SettingsScope.of(context);
     final runner = _agentOf(context);
@@ -3387,13 +3761,28 @@ class _AiPanelState extends State<_AiPanel> {
     } catch (_) {}
 
     final images = List<_PendingImage>.from(_images);
+    final attachments = List<_PendingAttachment>.from(_attachments);
+    final attachmentCtx = await _composeAttachmentContext(attachments);
+    final visibleText = text.isEmpty
+        ? (images.isNotEmpty && attachments.isEmpty
+            ? '（见附图）'
+            : (attachments.isNotEmpty ? '（见附件）' : ''))
+        : text;
+    final userText = attachmentCtx.isEmpty
+        ? visibleText
+        : (visibleText.isEmpty
+            ? attachmentCtx
+            : '$visibleText\n\n$attachmentCtx');
     _controller.clear();
-    setState(() => _images.clear());
+    setState(() {
+      _images.clear();
+      _attachments.clear();
+    });
     final sessionId = chats.active!.id;
     final rootPath = WorkspaceScope.of(context).rootPath;
     await runner.run(
       sessionId: sessionId,
-      userText: text.isEmpty ? '（见附图）' : text,
+      userText: userText.isEmpty ? '（见附图）' : userText,
       provider: provider,
       model: model,
       rootPath: rootPath,
@@ -3579,6 +3968,104 @@ class _PendingImage {
   final Uint8List bytes;
   final String mime;
   final String dataUrl;
+}
+
+enum _AttachmentKind { file, folder }
+
+class _PendingAttachment {
+  _PendingAttachment({
+    required this.path,
+    required this.name,
+    required this.kind,
+    required this.displayPath,
+    required this.insideWorkspace,
+    this.sizeBytes,
+  });
+
+  final String path;
+  final String name;
+  final _AttachmentKind kind;
+  final String displayPath;
+  final bool insideWorkspace;
+  final int? sizeBytes;
+}
+
+class _ComposerAttachmentChip extends StatelessWidget {
+  const _ComposerAttachmentChip({
+    required this.attachment,
+    required this.onRemove,
+    this.sizeLabel,
+  });
+
+  final _PendingAttachment attachment;
+  final VoidCallback onRemove;
+  final String? sizeLabel;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = IdeColors.of(context);
+    final isFolder = attachment.kind == _AttachmentKind.folder;
+    return Container(
+      constraints: const BoxConstraints(maxWidth: 260),
+      padding: const EdgeInsets.fromLTRB(8, 6, 4, 6),
+      decoration: BoxDecoration(
+        color: colors.panelElevated,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: colors.borderStrong),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            isFolder ? Icons.folder_outlined : Icons.insert_drive_file_outlined,
+            size: 14,
+            color: colors.textMuted,
+          ),
+          const SizedBox(width: 6),
+          Flexible(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  attachment.name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: colors.textPrimary,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                Text(
+                  [
+                    attachment.displayPath,
+                    if (sizeLabel != null) sizeLabel!,
+                    if (!attachment.insideWorkspace) '区外',
+                  ].join(' · '),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: colors.textMuted,
+                    fontSize: 10.5,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 2),
+          InkWell(
+            onTap: onRemove,
+            borderRadius: BorderRadius.circular(10),
+            child: Padding(
+              padding: const EdgeInsets.all(4),
+              child: Icon(Icons.close_rounded, size: 13, color: colors.textMuted),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 
@@ -4027,6 +4514,241 @@ class _ThinkingBlockState extends State<_ThinkingBlock> {
   }
 }
 
+enum _ChatDeleteAction { deleteOnly, deleteAndMerge }
+
+class _CodexSoftButton extends StatelessWidget {
+  const _CodexSoftButton({
+    required this.label,
+    required this.onTap,
+    this.destructive = false,
+  });
+
+  final String label;
+  final VoidCallback onTap;
+  final bool destructive;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = IdeColors.of(context);
+    final borderColor = destructive
+        ? const Color(0x55E35D6A)
+        : colors.borderStrong;
+    final fg = destructive ? const Color(0xFFE35D6A) : colors.textSecondary;
+    final bg = destructive
+        ? const Color(0x14E35D6A)
+        : colors.panelHover;
+    return Material(
+      color: bg,
+      borderRadius: BorderRadius.circular(10),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(10),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: borderColor),
+          ),
+          child: Text(
+            label,
+            style: TextStyle(
+              color: fg,
+              fontSize: 12.5,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+Future<bool?> _showCodexConfirmDialog({
+  required BuildContext context,
+  required String title,
+  required String message,
+  required String confirmLabel,
+  bool destructive = false,
+}) {
+  final colors = IdeColors.of(context);
+  return showGeneralDialog<bool>(
+    context: context,
+    barrierDismissible: true,
+    barrierLabel: 'dismiss',
+    barrierColor: Colors.black.withValues(alpha: 0.28),
+    transitionDuration: const Duration(milliseconds: 140),
+    pageBuilder: (ctx, _, __) {
+      return Center(
+        child: Material(
+          color: Colors.transparent,
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 420),
+            child: Container(
+              margin: const EdgeInsets.symmetric(horizontal: 24),
+              padding: const EdgeInsets.fromLTRB(18, 16, 18, 14),
+              decoration: BoxDecoration(
+                color: colors.panelElevated,
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: colors.borderStrong),
+                boxShadow: [
+                  BoxShadow(
+                    color: colors.shadow,
+                    blurRadius: 24,
+                    offset: const Offset(0, 10),
+                  ),
+                ],
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text(
+                    title,
+                    style: TextStyle(
+                      color: colors.textPrimary,
+                      fontSize: 15,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    message,
+                    style: TextStyle(
+                      color: colors.textSecondary,
+                      fontSize: 13,
+                      height: 1.45,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      _CodexSoftButton(
+                        label: '取消',
+                        onTap: () => Navigator.of(ctx).pop(false),
+                      ),
+                      const SizedBox(width: 8),
+                      _CodexSoftButton(
+                        label: confirmLabel,
+                        destructive: destructive,
+                        onTap: () => Navigator.of(ctx).pop(true),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    },
+    transitionBuilder: (ctx, anim, _, child) {
+      final curved = CurvedAnimation(parent: anim, curve: Curves.easeOutCubic);
+      return FadeTransition(
+        opacity: curved,
+        child: ScaleTransition(
+          scale: Tween(begin: 0.97, end: 1.0).animate(curved),
+          child: child,
+        ),
+      );
+    },
+  );
+}
+
+class _CodexContextMenuItem<T> {
+  const _CodexContextMenuItem({
+    required this.value,
+    required this.icon,
+    required this.title,
+    this.subtitle,
+    this.destructive = false,
+  });
+
+  final T value;
+  final IconData icon;
+  final String title;
+  final String? subtitle;
+  final bool destructive;
+}
+
+Future<T?> _showCodexContextMenu<T>({
+  required BuildContext context,
+  required Offset globalPosition,
+  required List<_CodexContextMenuItem<T>> items,
+  double width = 220,
+}) {
+  final overlay =
+      Overlay.of(context).context.findRenderObject() as RenderBox?;
+  if (overlay == null) return Future.value(null);
+  final colors = IdeColors.of(context);
+  final left = globalPosition.dx.clamp(8.0, overlay.size.width - width - 8);
+  final top = globalPosition.dy.clamp(8.0, overlay.size.height - 140);
+  return showGeneralDialog<T>(
+    context: context,
+    barrierDismissible: true,
+    barrierLabel: 'dismiss',
+    barrierColor: Colors.transparent,
+    transitionDuration: const Duration(milliseconds: 120),
+    pageBuilder: (_, __, ___) => const SizedBox.shrink(),
+    transitionBuilder: (ctx, anim, _, __) {
+      final curved = CurvedAnimation(parent: anim, curve: Curves.easeOutCubic);
+      return Stack(
+        children: [
+          Positioned.fill(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () => Navigator.of(ctx).pop(),
+            ),
+          ),
+          Positioned(
+            left: left,
+            top: top,
+            width: width,
+            child: FadeTransition(
+              opacity: curved,
+              child: ScaleTransition(
+                scale: Tween(begin: 0.96, end: 1.0).animate(curved),
+                alignment: Alignment.topLeft,
+                child: Material(
+                  color: Colors.transparent,
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: colors.panelElevated,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: colors.borderStrong),
+                      boxShadow: [
+                        BoxShadow(
+                          color: colors.shadow,
+                          blurRadius: 18,
+                          offset: const Offset(0, 6),
+                        ),
+                      ],
+                    ),
+                    padding: const EdgeInsets.symmetric(vertical: 6),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        for (final item in items)
+                          _SoftMenuItem(
+                            icon: item.icon,
+                            title: item.title,
+                            subtitle: item.subtitle,
+                            destructive: item.destructive,
+                            onTap: () => Navigator.of(ctx).pop(item.value),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      );
+    },
+  );
+}
+
 /// Trae/Codex 风格软块弹出层：默认贴按钮上方；[preferBelow] 时贴下方。
 Future<T?> _showSoftMenu<T>({
   required BuildContext context,
@@ -4118,6 +4840,7 @@ class _SoftMenuItem extends StatefulWidget {
     required this.title,
     this.subtitle,
     this.selected = false,
+    this.destructive = false,
     this.onTap,
   });
 
@@ -4125,6 +4848,7 @@ class _SoftMenuItem extends StatefulWidget {
   final String title;
   final String? subtitle;
   final bool selected;
+  final bool destructive;
   final VoidCallback? onTap;
 
   @override
@@ -4157,7 +4881,9 @@ class _SoftMenuItemState extends State<_SoftMenuItem> {
               Icon(
                 widget.icon,
                 size: 15,
-                color: widget.selected ? colors.accent : colors.textMuted,
+                color: widget.destructive
+                    ? const Color(0xFFE35D6A)
+                    : (widget.selected ? colors.accent : colors.textMuted),
               ),
               const SizedBox(width: 8),
               Expanded(
@@ -4172,7 +4898,9 @@ class _SoftMenuItemState extends State<_SoftMenuItem> {
                         fontWeight: widget.selected
                             ? FontWeight.w600
                             : FontWeight.w500,
-                        color: colors.textPrimary,
+                        color: widget.destructive
+                            ? const Color(0xFFE35D6A)
+                            : colors.textPrimary,
                       ),
                     ),
                     if (widget.subtitle != null)

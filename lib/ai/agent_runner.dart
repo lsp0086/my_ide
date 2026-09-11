@@ -154,7 +154,8 @@ class AgentRunner extends ChangeNotifier {
         'type': 'function',
         'function': {
           'name': 'read_file',
-          'description': '读取工作区文件内容。path 为相对路径。',
+          'description':
+              '读取文件内容。工作区内用相对路径；用户附件若给出相对路径可直接读。工作区外用绝对路径（需审批）。',
           'parameters': {
             'type': 'object',
             'properties': {
@@ -170,7 +171,8 @@ class AgentRunner extends ChangeNotifier {
         'type': 'function',
         'function': {
           'name': 'list_files',
-          'description': '列出目录内容。path 为相对路径，默认根目录。',
+          'description':
+              '列出目录内容。工作区内用相对路径（默认根目录）；用户附件文件夹可用其路径，区外绝对路径需审批。',
           'parameters': {
             'type': 'object',
             'properties': {
@@ -669,10 +671,16 @@ class AgentRunner extends ChangeNotifier {
       case 'read_file':
       case 'list_files':
       case 'search_text':
-        // 读操作：区内直放，区外/敏感走审批
+        // 读操作：区内直放，区外/敏感走审批后真实读取
         final readPath = '${args['path'] ?? '.'}';
         final readZone = tools.fs.zoneOf(readPath);
         if (readZone != FsZone.inside) {
+          if (toolName == 'search_text') {
+            return AgentToolResult(
+              ok: false,
+              output: 'search_text 仅支持工作区内；区外请用 read_file / list_files',
+            );
+          }
           final approved = await _askApproval(PendingApproval(
             kind: 'file-read',
             title: readZone == FsZone.sensitive
@@ -683,10 +691,13 @@ class AgentRunner extends ChangeNotifier {
             filePath: readPath,
           ));
           if (!approved || _cancelRequested) return null;
-          return AgentToolResult(
-              ok: true,
-              output: '用户已批准读取 $readPath，但区外仅支持单文件读取，'
-                  '请用绝对路径 read_file 重试');
+          _currentTool = '正在执行 $toolName';
+          notifyListeners();
+          final outsideResult =
+              await tools.executeApprovedRead(toolName, args);
+          _currentTool = null;
+          notifyListeners();
+          return outsideResult;
         }
         _currentTool = '正在执行 $toolName';
         notifyListeners();

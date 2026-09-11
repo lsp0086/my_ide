@@ -45,6 +45,12 @@ class AgentTools {
     return _fs.resolveInside(relPath);
   }
 
+  String _resolveAny(String rawPath) {
+    return p.normalize(
+      p.isAbsolute(rawPath) ? rawPath : p.join(rootPath, rawPath),
+    );
+  }
+
   Future<AgentToolResult> execute(
       String name, Map<String, dynamic> args) async {
     switch (name) {
@@ -74,6 +80,22 @@ class AgentTools {
     }
   }
 
+  /// 审批通过后的区外/敏感只读：仅 read_file / list_files。
+  Future<AgentToolResult> executeApprovedRead(
+      String name, Map<String, dynamic> args) async {
+    switch (name) {
+      case 'read_file':
+        return _read(args, allowOutside: true);
+      case 'list_files':
+        return _list(args, allowOutside: true);
+      default:
+        return AgentToolResult(
+          ok: false,
+          output: '区外/敏感路径审批后仅支持 read_file / list_files',
+        );
+    }
+  }
+
   /// 只做预览不落盘，供审批弹窗展示 Diff。
   Future<AgentToolResult> preview(
       String name, Map<String, dynamic> args) async {
@@ -89,12 +111,16 @@ class AgentTools {
     }
   }
 
-  Future<AgentToolResult> _read(Map<String, dynamic> args) async {
+  Future<AgentToolResult> _read(
+    Map<String, dynamic> args, {
+    bool allowOutside = false,
+  }) async {
     final rel = '${args['path'] ?? ''}';
     final limit = (args['limit'] as num?)?.toInt() ?? 200;
     final offset = (args['offset'] as num?)?.toInt() ?? 0;
     try {
-      final file = File(_resolve(rel));
+      final abs = allowOutside ? _resolveAny(rel) : _resolve(rel);
+      final file = File(abs);
       if (!await file.exists()) {
         return AgentToolResult(ok: false, output: '文件不存在：$rel');
       }
@@ -250,10 +276,14 @@ class AgentTools {
     }
   }
 
-  Future<AgentToolResult> _list(Map<String, dynamic> args) async {
+  Future<AgentToolResult> _list(
+    Map<String, dynamic> args, {
+    bool allowOutside = false,
+  }) async {
     final rel = '${args['path'] ?? '.'}';
     try {
-      final dir = Directory(_resolve(rel));
+      final abs = allowOutside ? _resolveAny(rel) : _resolve(rel);
+      final dir = Directory(abs);
       if (!await dir.exists()) {
         return AgentToolResult(ok: false, output: '目录不存在：$rel');
       }

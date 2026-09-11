@@ -57,9 +57,8 @@ add_subdirectory("runner")
 # them to the application.
 include(flutter/generated_plugins.cmake)
 
-# clipboard 插件自带 CMake 写死了 /W4 /WX，不走 APPLY_STANDARD_SETTINGS。
-# 其源码有未使用变量 headerSize（C4189），在 /WX 下会抬成 C2220 导致 CI 失败。
-# CI workflow 也会直接 patch 插件；这里再兜一层。
+# clipboard 使用 packages/clipboard 本地 fork（已去掉 headerSize，并关闭插件 /WX）。
+# 这里再兜一层，避免将来误切回 hosted 包时 Windows /WX 再次失败。
 if(TARGET clipboard_plugin)
   target_compile_options(clipboard_plugin PRIVATE /wd4189 /WX-)
 endif()

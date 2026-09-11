@@ -935,6 +935,15 @@ class CheckpointStore extends ChangeNotifier {
     }
     await bindProject(_rootPath);
   }
+
+  /// 某对话关联的全部版本节点（含 chatId 匹配）。
+  Set<String> versionIdsForChat(String chatId) {
+    final ids = <String>{};
+    for (final cp in _checkpoints) {
+      if (cp.chatId == chatId) ids.add(cp.id);
+    }
+    return ids;
+  }
 }
 
 class CheckpointScope extends InheritedNotifier<CheckpointStore> {

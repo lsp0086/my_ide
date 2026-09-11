@@ -524,17 +524,50 @@ class ChatStore extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> clearAll() async {
+  /// 仅删除全部对话（含磁盘 chats），保留版本与 memory。
+  Future<void> clearChats() async {
     _sessions.clear();
     _activeId = null;
     final root = _projectRoot;
     if (root != null) {
       final dir = Directory(p.join(root, '.my_ide', 'chats'));
       if (await dir.exists()) await dir.delete(recursive: true);
-      final mem = Directory(p.join(root, '.my_ide', 'memory'));
-      if (await mem.exists()) await mem.delete(recursive: true);
     }
     notifyListeners();
+  }
+
+  /// 清空项目记忆：对话 + 压缩记忆目录。
+  Future<void> clearAll({bool includeMemory = true}) async {
+    _sessions.clear();
+    _activeId = null;
+    final root = _projectRoot;
+    if (root != null) {
+      final dir = Directory(p.join(root, '.my_ide', 'chats'));
+      if (await dir.exists()) await dir.delete(recursive: true);
+      if (includeMemory) {
+        final mem = Directory(p.join(root, '.my_ide', 'memory'));
+        if (await mem.exists()) await mem.delete(recursive: true);
+      }
+    }
+    notifyListeners();
+  }
+
+  /// 收集某会话关联的版本 id（消息上的 before/after + 兼容字段）。
+  Set<String> versionIdsOfSession(String sessionId) {
+    ChatSession? session;
+    for (final s in _sessions) {
+      if (s.id == sessionId) {
+        session = s;
+        break;
+      }
+    }
+    if (session == null) return {};
+    final ids = <String>{};
+    for (final m in session.messages) {
+      if (m.afterVersionId != null) ids.add(m.afterVersionId!);
+      if (m.beforeVersionId != null) ids.add(m.beforeVersionId!);
+    }
+    return ids;
   }
 
   Future<void> _ensureDir(Directory dir) async {
