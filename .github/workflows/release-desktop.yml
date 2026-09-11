@@ -1,0 +1,126 @@
+name: Release Desktop
+
+# 公开仓库使用 GitHub 托管 runner（windows/macos/ubuntu）免费。
+# 用法：
+# 1. 仓库设为 Public
+# 2. Actions 页手动 Run workflow
+# 或推送 tag：git tag v1.0.0 && git push origin v1.0.0
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows
+          - os: ubuntu-latest
+            target: linux
+          - os: macos-latest
+            target: macos
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux desktop deps
+        if: matrix.target == 'linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter config & deps
+        shell: bash
+        run: |
+          flutter config --enable-windows-desktop --enable-linux-desktop --enable-macos-desktop
+          flutter --version
+          flutter pub get
+
+      - name: Build Windows
+        if: matrix.target == 'windows'
+        run: flutter build windows --release
+
+      - name: Package Windows
+        if: matrix.target == 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -E '^version:' pubspec.yaml | head -1 | awk '{print $2}' | cut -d+ -f1)"
+          NAME="$(grep -E '^name:' pubspec.yaml | head -1 | awk '{print $2}')"
+          SRC="build/windows/x64/runner/Release"
+          if [[ ! -d "$SRC" ]]; then
+            SRC="$(find build/windows -type d -path '*/runner/Release' | head -1)"
+          fi
+          mkdir -p dist
+          (
+            cd "$(dirname "$SRC")"
+            powershell.exe -NoProfile -Command "Compress-Archive -Path '$(basename "$SRC")\\*' -DestinationPath '$GITHUB_WORKSPACE\\dist\\${NAME}-${VERSION}-windows-x64.zip' -Force"
+          )
+          ls -lh dist
+
+      - name: Build Linux
+        if: matrix.target == 'linux'
+        run: flutter build linux --release
+
+      - name: Package Linux
+        if: matrix.target == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -E '^version:' pubspec.yaml | head -1 | awk '{print $2}' | cut -d+ -f1)"
+          NAME="$(grep -E '^name:' pubspec.yaml | head -1 | awk '{print $2}')"
+          SRC="build/linux/x64/release/bundle"
+          if [[ ! -d "$SRC" ]]; then
+            SRC="$(find build/linux -type d -path '*/release/bundle' | head -1)"
+          fi
+          mkdir -p dist
+          (
+            cd "$(dirname "$SRC")"
+            zip -qry "$GITHUB_WORKSPACE/dist/${NAME}-${VERSION}-linux-x64.zip" "$(basename "$SRC")"
+          )
+          ls -lh dist
+
+      - name: Build macOS
+        if: matrix.target == 'macos'
+        run: flutter build macos --release
+
+      - name: Package macOS
+        if: matrix.target == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -E '^version:' pubspec.yaml | head -1 | awk '{print $2}' | cut -d+ -f1)"
+          NAME="$(grep -E '^name:' pubspec.yaml | head -1 | awk '{print $2}')"
+          APP="$(find build/macos/Build/Products/Release -maxdepth 1 -name '*.app' | head -1)"
+          test -n "$APP"
+          mkdir -p dist
+          (
+            cd "$(dirname "$APP")"
+            zip -qry "$GITHUB_WORKSPACE/dist/${NAME}-${VERSION}-macos.zip" "$(basename "$APP")"
+          )
+          ls -lh dist
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: my_ide-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
