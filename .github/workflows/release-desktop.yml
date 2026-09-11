@@ -51,7 +51,15 @@ jobs:
         run: |
           flutter config --enable-windows-desktop --enable-linux-desktop --enable-macos-desktop
           flutter --version
-          flutter pub get
+          # 清掉可能残留的错误 pub.dev token，避免 authorization failed
+          dart pub token remove https://pub.dev 2>/dev/null || true
+          dart pub token remove https://pub.dartlang.org 2>/dev/null || true
+          if ! flutter pub get; then
+            echo "pub.dev 拉取失败，改用国内镜像重试..."
+            export PUB_HOSTED_URL=https://pub.flutter-io.cn
+            export FLUTTER_STORAGE_BASE_URL=https://storage.flutter-io.cn
+            flutter pub get
+          fi
 
       - name: Build Windows
         if: matrix.target == 'windows'
