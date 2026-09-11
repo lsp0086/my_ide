@@ -61,6 +61,66 @@ jobs:
             flutter pub get
           fi
 
+      - name: Patch clipboard Windows plugin
+        if: matrix.target == 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # clipboard 3.0.14 Windows 源码有未使用变量 headerSize（C4189），
+          # 插件自身 CMake 又开了 /WX，会抬成 C2220。构建前直接 patch。
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+          from urllib.parse import unquote, urlparse
+          from urllib.request import url2pathname
+
+          cfg = json.loads(Path('.dart_tool/package_config.json').read_text())
+          root = None
+          for pkg in cfg['packages']:
+              if pkg['name'] == 'clipboard':
+                  uri = pkg['rootUri']
+                  if uri.startswith('file:'):
+                      parsed = urlparse(uri)
+                      root = Path(url2pathname(unquote(parsed.path)))
+                      # Some Python builds keep a leading slash before the drive letter.
+                      posix = root.as_posix()
+                      if re.match(r'^/[A-Za-z]:/', posix):
+                          root = Path(posix[1:])
+                  else:
+                      root = (Path('.dart_tool') / uri).resolve()
+                  break
+          if root is None:
+              raise SystemExit('clipboard package not found in package_config.json')
+          root = root.resolve()
+
+          cmake = root / 'windows' / 'CMakeLists.txt'
+          cpp = root / 'windows' / 'clipboard_plugin.cpp'
+          if not cmake.exists() or not cpp.exists():
+              raise SystemExit(f'clipboard windows files missing under {root}')
+
+          cmake_text = cmake.read_text(encoding='utf-8')
+          cmake_new = cmake_text.replace(
+              'target_compile_options(clipboard_plugin PRIVATE /W4 /WX /wd"4100")',
+              'target_compile_options(clipboard_plugin PRIVATE /W4 /WX /wd"4100" /wd"4189")',
+          )
+          if cmake_new == cmake_text:
+              raise SystemExit(f'failed to patch {cmake}')
+          cmake.write_text(cmake_new, encoding='utf-8')
+
+          cpp_text = cpp.read_text(encoding='utf-8')
+          cpp_new, n = re.subn(
+              r'(\s*)DWORD headerSize = \(dibFormat == CF_DIBV5\) \? sizeof\(BITMAPV5HEADER\) : sizeof\(BITMAPINFOHEADER\);',
+              r'\1DWORD headerSize = (dibFormat == CF_DIBV5) ? sizeof(BITMAPV5HEADER) : sizeof(BITMAPINFOHEADER);\n\1(void)headerSize;',
+              cpp_text,
+              count=1,
+          )
+          if n != 1:
+              raise SystemExit(f'failed to patch {cpp}')
+          cpp.write_text(cpp_new, encoding='utf-8')
+          print(f'patched clipboard plugin at {root}')
+          PY
+
       - name: Build Windows
         if: matrix.target == 'windows'
         run: flutter build windows --release

@@ -59,8 +59,9 @@ include(flutter/generated_plugins.cmake)
 
 # clipboard 插件自带 CMake 写死了 /W4 /WX，不走 APPLY_STANDARD_SETTINGS。
 # 其源码有未使用变量 headerSize（C4189），在 /WX 下会抬成 C2220 导致 CI 失败。
+# CI workflow 也会直接 patch 插件；这里再兜一层。
 if(TARGET clipboard_plugin)
-  target_compile_options(clipboard_plugin PRIVATE /wd"4189")
+  target_compile_options(clipboard_plugin PRIVATE /wd4189 /WX-)
 endif()
 
 
