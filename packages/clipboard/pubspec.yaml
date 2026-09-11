@@ -1,0 +1,30 @@
+name: clipboard
+description: Flutter clipboard with text, Rich Text (HTML), and image support.
+version: 3.0.14+local.1
+homepage: https://github.com/samuelezedi/flutter_clipboard
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+  flutter: ">=1.10.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  web: ^1.1.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: net.cubiclab.clipboard
+        pluginClass: ClipboardPlugin
+      ios:
+        pluginClass: ClipboardPlugin
+      macos:
+        pluginClass: ClipboardPlugin
+      windows:
+        pluginClass: ClipboardPlugin
