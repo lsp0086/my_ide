@@ -269,7 +269,7 @@ class WorkspaceController extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// 切回应用时：刷新树，检测已打开且未本地脏写的文件是否被外部覆盖。
+  /// 切回应用时：刷新树，检测已打开且未本地脏写的文件是否被外部覆盖/删除。
   /// 返回发生外部改动的绝对路径（可用于记版本）。
   Future<List<String>> scanExternalChangesOnResume() async {
     if (!_hasWorkspaceSafe || _scanningExternal) return const [];
@@ -277,11 +277,19 @@ class WorkspaceController extends ChangeNotifier {
     try {
       await loadTree();
       final changed = <String>[];
+      final deleted = <String>[];
       for (final tab in List<OpenEditorTab>.from(_tabs)) {
         final path = tab.path;
         if (_dirtyPaths.contains(path)) continue;
         final now = _currentMtimeMs(path);
-        if (now == null) continue;
+        // 文件已不存在：视为外部删除，需要记变更。
+        if (now == null) {
+          if (_diskMtimeMs.containsKey(path) || File(path).existsSync() == false) {
+            deleted.add(path);
+            _diskMtimeMs.remove(path);
+          }
+          continue;
+        }
         final known = _diskMtimeMs[path];
         if (known == null) {
           _diskMtimeMs[path] = now;
@@ -292,16 +300,63 @@ class WorkspaceController extends ChangeNotifier {
           _diskMtimeMs[path] = now;
         }
       }
-      if (changed.isNotEmpty) {
-        await notifyExternalChanges(changed);
-        for (final path in changed) {
-          rememberDiskStamp(path);
+      final all = [...changed, ...deleted];
+      if (all.isNotEmpty) {
+        // 先关已删标签，再刷新其余内容。
+        for (final path in deleted) {
+          closeTab(path);
+        }
+        if (changed.isNotEmpty) {
+          await notifyExternalChanges(changed);
+          for (final path in changed) {
+            rememberDiskStamp(path);
+          }
+        } else if (deleted.isNotEmpty) {
+          await loadTree();
         }
       }
-      return changed;
+      return all;
     } finally {
       _scanningExternal = false;
     }
+  }
+
+  /// 删除工作区内文件/文件夹，并关闭相关标签。返回相对路径列表。
+  Future<List<String>> deletePaths(List<String> absolutePaths) async {
+    final root = _rootPath;
+    if (root == null || absolutePaths.isEmpty) return const [];
+    final deletedRel = <String>[];
+    for (final raw in absolutePaths) {
+      final abs = p.normalize(raw);
+      if (!p.isWithin(root, abs) && abs != root) continue;
+      // 禁止直接删项目根
+      if (abs == p.normalize(root)) continue;
+      try {
+        final type = FileSystemEntity.typeSync(abs, followLinks: false);
+        if (type == FileSystemEntityType.directory) {
+          await Directory(abs).delete(recursive: true);
+        } else if (type == FileSystemEntityType.file) {
+          await File(abs).delete();
+        } else {
+          continue;
+        }
+        deletedRel.add(p.relative(abs, from: root));
+        // 关掉该路径及其子路径标签
+        final toClose = _tabs
+            .where((t) => t.path == abs || p.isWithin(abs, t.path))
+            .map((t) => t.path)
+            .toList();
+        for (final path in toClose) {
+          closeTab(path);
+        }
+        _diskMtimeMs.remove(abs);
+        _dirtyPaths.remove(abs);
+      } catch (_) {}
+    }
+    if (deletedRel.isNotEmpty) {
+      await loadTree();
+    }
+    return deletedRel;
   }
 
   bool get _hasWorkspaceSafe => _rootPath != null;

@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:path/path.dart' as p;
@@ -15,7 +16,9 @@ import 'clipboard_image.dart';
 import '../ai/agent_runner.dart';
 import '../ai/chat_store.dart';
 import '../ai/provider_config.dart';
+import '../diagnostics/diagnostics_store.dart';
 import '../i18n/app_strings.dart';
+import '../lsp/bundled_language_servers.dart';
 import '../lsp/language_servers.dart';
 import '../lsp/symbol_index.dart';
 import '../settings/settings_store.dart';
@@ -30,6 +33,7 @@ import 'code_editor.dart';
 import 'code_highlight.dart';
 import 'file_preview.dart';
 import 'diff_view.dart';
+import 'problems_panel.dart';
 import 'provider_settings_card.dart';
 import 'version_panel.dart';
 import 'webdav_panel.dart';
@@ -38,7 +42,7 @@ class _SaveFileIntent extends Intent {
   const _SaveFileIntent();
 }
 
-enum ActivityItem { explorer, search, git, webdav, settings }
+enum ActivityItem { explorer, search, problems, git, webdav, settings }
 
 class IdeShell extends StatefulWidget {
   const IdeShell({super.key});
@@ -93,9 +97,15 @@ class _IdeShellState extends State<IdeShell> with WidgetsBindingObserver {
     final changed = await _workspace.scanExternalChangesOnResume();
     if (!mounted || changed.isEmpty) return;
     try {
+      final names = changed.map(p.basename).take(3).join(', ');
+      final deletedCount = changed.where((path) => !File(path).existsSync()).length;
+      final prefix = deletedCount == changed.length
+          ? '外部删除'
+          : deletedCount > 0
+              ? '外部修改/删除'
+              : '外部修改';
       await CheckpointScope.of(context).checkpoint(
-        message: '外部修改 ${changed.map(p.basename).take(3).join(', ')}'
-            '${changed.length > 3 ? ' 等' : ''}',
+        message: '$prefix $names${changed.length > 3 ? ' 等' : ''}',
         kind: 'user-edit',
       );
     } catch (_) {}
@@ -118,6 +128,7 @@ class _IdeShellState extends State<IdeShell> with WidgetsBindingObserver {
     CheckpointScope.of(context).bindProject(root);
     // 打开/切换项目后后台建符号索引（内置多语言跳转）
     SymbolIndex.instance.bindProject(root);
+    DiagnosticsScope.maybeOf(context)?.clearAll();
     if (root != null) {
       SettingsStore.instance.addRecentProject(root);
     }
@@ -154,7 +165,9 @@ class _IdeShellState extends State<IdeShell> with WidgetsBindingObserver {
 
   void _onActivityTap(ActivityItem item) {
     setState(() {
-      if (item == ActivityItem.explorer || item == ActivityItem.search) {
+      if (item == ActivityItem.explorer ||
+          item == ActivityItem.search ||
+          item == ActivityItem.problems) {
         if (_active == item && _showExplorer) {
           _showExplorer = false;
         } else {
@@ -174,7 +187,9 @@ class _IdeShellState extends State<IdeShell> with WidgetsBindingObserver {
 
   bool get _sidePanelVisible =>
       _showExplorer &&
-      (_active == ActivityItem.explorer || _active == ActivityItem.search);
+      (_active == ActivityItem.explorer ||
+          _active == ActivityItem.search ||
+          _active == ActivityItem.problems);
 
   @override
   Widget build(BuildContext context) {
@@ -222,109 +237,124 @@ class _IdeShellState extends State<IdeShell> with WidgetsBindingObserver {
                           ),
                           const SizedBox(width: _gap),
                           Expanded(
-                            child: _active == ActivityItem.settings
-                                ? _Panel(
-                                    child: _SettingsPanel(
-                                      onClose: _closeOverlayPanel,
-                                    ),
-                                  )
-                                : _active == ActivityItem.git
-                                    ? _Panel(
-                                        child: VersionPanel(
-                                          onClose: _closeOverlayPanel,
-                                        ),
-                                      )
-                                    : _active == ActivityItem.webdav
-                                        ? _Panel(
-                                            child: WebDavPanel(
-                                              onClose: _closeOverlayPanel,
-                                            ),
-                                          )
-                                    : LayoutBuilder(
-                                    builder: (context, constraints) {
-                                      final total = constraints.maxWidth;
-                                      final sideVisible = _sidePanelVisible;
-                                      final explorerW = sideVisible
-                                          ? _explorerWidth.clamp(
-                                              _minExplorer, total * 0.4)
-                                          : 0.0;
-                                      final aiW =
-                                          _aiWidth.clamp(_minAi, total * 0.45);
-                                      final used = (sideVisible
-                                              ? explorerW + _gap + 4
-                                              : 0) +
-                                          aiW +
-                                          _gap +
-                                          4;
-                                      final editorW = (total - used)
-                                          .clamp(_minEditor, double.infinity);
+                            // 主工作区（编辑器 + AI）始终挂载；设置/版本/WebDAV 用叠层，
+                            // 避免切换活动栏时卸载 _AiPanel，导致 Agent 工作流丢失。
+                            child: Stack(
+                              children: [
+                                LayoutBuilder(
+                                  builder: (context, constraints) {
+                                    final total = constraints.maxWidth;
+                                    final sideVisible = _sidePanelVisible;
+                                    final explorerW = sideVisible
+                                        ? _explorerWidth.clamp(
+                                            _minExplorer, total * 0.4)
+                                        : 0.0;
+                                    final aiW =
+                                        _aiWidth.clamp(_minAi, total * 0.45);
+                                    final used = (sideVisible
+                                            ? explorerW + _gap + 4
+                                            : 0) +
+                                        aiW +
+                                        _gap +
+                                        4;
+                                    final editorW = (total - used)
+                                        .clamp(_minEditor, double.infinity);
+                                    // 侧栏在 search/problems 时仍切换内容；explorer 才显示文件树。
+                                    final sideChild = _active ==
+                                            ActivityItem.search
+                                        ? _SearchPanel(workspace: _workspace)
+                                        : _active == ActivityItem.problems
+                                            ? ProblemsPanel(
+                                                diagnostics:
+                                                    DiagnosticsScope.of(
+                                                        context),
+                                                workspace: _workspace,
+                                              )
+                                            : _FileExplorerPanel(
+                                                workspace: _workspace,
+                                              );
 
-                                      return Row(
-                                        children: [
-                                          if (sideVisible) ...[
-                                            SizedBox(
-                                              width: explorerW,
-                                              child: _Panel(
-                                                child: _active ==
-                                                        ActivityItem.search
-                                                    ? _SearchPanel(
-                                                        workspace: _workspace,
-                                                      )
-                                                    : _FileExplorerPanel(
-                                                        workspace: _workspace,
-                                                      ),
-                                              ),
-                                            ),
-                                            _ResizeHandle(
-                                              onDrag: (dx) {
-                                                setState(() {
-                                                  _explorerWidth =
-                                                      (_explorerWidth + dx)
-                                                          .clamp(
-                                                    _minExplorer,
-                                                    total * 0.45,
-                                                  );
-                                                });
-                                              },
-                                            ),
-                                          ],
-                                          Expanded(
-                                            child: SizedBox(
-                                              width: editorW,
-                                              child: _Panel(
-                                                child: _DropImportHost(
-                                                  workspace: _workspace,
-                                                  child: _EditorPanel(
-                                                    workspace: _workspace,
-                                                    editorKey: _editorKey,
-                                                  ),
-                                                ),
-                                              ),
-                                            ),
+                                    return Row(
+                                      children: [
+                                        if (sideVisible) ...[
+                                          SizedBox(
+                                            width: explorerW,
+                                            child: _Panel(child: sideChild),
                                           ),
                                           _ResizeHandle(
                                             onDrag: (dx) {
                                               setState(() {
-                                                _aiWidth = (_aiWidth - dx)
-                                                    .clamp(
-                                                        _minAi, total * 0.5);
+                                                _explorerWidth =
+                                                    (_explorerWidth + dx).clamp(
+                                                  _minExplorer,
+                                                  total * 0.45,
+                                                );
                                               });
                                             },
                                           ),
-                                          SizedBox(
-                                            width: aiW,
+                                        ],
+                                        Expanded(
+                                          child: SizedBox(
+                                            width: editorW,
                                             child: _Panel(
-                                              child: _AiPanel(
-                                                onOpenSettings: () =>
-                                                    _onActivityTap(
-                                                        ActivityItem.settings),
+                                              child: _DropImportHost(
+                                                workspace: _workspace,
+                                                child: _EditorPanel(
+                                                  workspace: _workspace,
+                                                  editorKey: _editorKey,
+                                                ),
                                               ),
                                             ),
                                           ),
-                                        ],
-                                      );
-                                    },
+                                        ),
+                                        _ResizeHandle(
+                                          onDrag: (dx) {
+                                            setState(() {
+                                              _aiWidth = (_aiWidth - dx)
+                                                  .clamp(_minAi, total * 0.5);
+                                            });
+                                          },
+                                        ),
+                                        SizedBox(
+                                          width: aiW,
+                                          child: _Panel(
+                                            child: _AiPanel(
+                                              onOpenSettings: () =>
+                                                  _onActivityTap(
+                                                      ActivityItem.settings),
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    );
+                                  },
+                                ),
+                                if (_active == ActivityItem.settings)
+                                  Positioned.fill(
+                                    child: _Panel(
+                                      child: _SettingsPanel(
+                                        onClose: _closeOverlayPanel,
+                                      ),
+                                    ),
                                   ),
+                                if (_active == ActivityItem.git)
+                                  Positioned.fill(
+                                    child: _Panel(
+                                      child: VersionPanel(
+                                        onClose: _closeOverlayPanel,
+                                      ),
+                                    ),
+                                  ),
+                                if (_active == ActivityItem.webdav)
+                                  Positioned.fill(
+                                    child: _Panel(
+                                      child: WebDavPanel(
+                                        onClose: _closeOverlayPanel,
+                                      ),
+                                    ),
+                                  ),
+                              ],
+                            ),
                           ),
                         ],
                       ),
@@ -444,6 +474,13 @@ class _ActivityBar extends StatelessWidget {
             selected: active == ActivityItem.search,
             tooltip: '搜索',
             onTap: () => onTap(ActivityItem.search),
+          ),
+          const SizedBox(height: 4),
+          _ActivityIcon(
+            icon: Icons.error_outline,
+            selected: active == ActivityItem.problems,
+            tooltip: '问题',
+            onTap: () => onTap(ActivityItem.problems),
           ),
           const SizedBox(height: 4),
           _ActivityIcon(
@@ -568,10 +605,111 @@ class _PanelHeader extends StatelessWidget {
   }
 }
 
-class _SettingsPanel extends StatelessWidget {
+/// 设置页左侧导航项；新增设置区块时在 [_SettingsPanelState._navItems] 追加即可。
+class _SettingsNavItem {
+  const _SettingsNavItem({
+    required this.id,
+    required this.label,
+    required this.icon,
+  });
+
+  final String id;
+  final String label;
+  final IconData icon;
+}
+
+class _SettingsPanel extends StatefulWidget {
   const _SettingsPanel({this.onClose});
 
   final VoidCallback? onClose;
+
+  @override
+  State<_SettingsPanel> createState() => _SettingsPanelState();
+}
+
+class _SettingsPanelState extends State<_SettingsPanel> {
+  final ScrollController _scrollController = ScrollController();
+  final Map<String, GlobalKey> _sectionKeys = {};
+  String _activeSectionId = 'language';
+
+  List<_SettingsNavItem> _navItems(AppStrings t) => [
+        _SettingsNavItem(
+          id: 'language',
+          label: t.language,
+          icon: Icons.translate_rounded,
+        ),
+        _SettingsNavItem(
+          id: 'appearance',
+          label: t.appearance,
+          icon: Icons.palette_outlined,
+        ),
+        _SettingsNavItem(
+          id: 'highlight',
+          label: t.codeHighlight,
+          icon: Icons.code_rounded,
+        ),
+        _SettingsNavItem(
+          id: 'providers',
+          label: t.providers,
+          icon: Icons.cloud_outlined,
+        ),
+        const _SettingsNavItem(
+          id: 'agent',
+          label: 'Agent',
+          icon: Icons.smart_toy_outlined,
+        ),
+        const _SettingsNavItem(
+          id: 'lsp',
+          label: '语言服务器',
+          icon: Icons.hub_outlined,
+        ),
+        _SettingsNavItem(
+          id: 'clean',
+          label: t.cleanProject,
+          icon: Icons.cleaning_services_outlined,
+        ),
+      ];
+
+  GlobalKey _keyFor(String id) =>
+      _sectionKeys.putIfAbsent(id, GlobalKey.new);
+
+  void _scrollToSection(String id) {
+    setState(() => _activeSectionId = id);
+    // 等布局稳定后再算偏移，避免点相邻项时拿到旧坐标
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_scrollController.hasClients) return;
+      final ctx = _keyFor(id).currentContext;
+      final object = ctx?.findRenderObject();
+      if (object == null) return;
+
+      final position = _scrollController.position;
+      double target;
+      try {
+        // 略低于顶部，留出一点呼吸感，避免标题贴死视口上沿
+        final revealed =
+            RenderAbstractViewport.of(object).getOffsetToReveal(object, 0.0);
+        target = revealed.offset - 16;
+      } catch (_) {
+        return;
+      }
+      target = target.clamp(
+        position.minScrollExtent,
+        position.maxScrollExtent,
+      );
+      if ((target - position.pixels).abs() < 0.5) return;
+      _scrollController.animateTo(
+        target,
+        duration: const Duration(milliseconds: 280),
+        curve: Curves.easeOutCubic,
+      );
+    });
+  }
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -583,220 +721,314 @@ class _SettingsPanel extends StatelessWidget {
     final styles = ThemeController.preferredStyles
         .where((item) => item.isDark == isDark)
         .toList(growable: false);
+    final navItems = _navItems(t);
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         _PanelHeader(
           title: t.settings,
-          trailing: onClose == null
+          trailing: widget.onClose == null
               ? null
               : IconButton(
                   tooltip: '关闭',
                   visualDensity: VisualDensity.compact,
-                  onPressed: onClose,
+                  onPressed: widget.onClose,
                   icon: Icon(Icons.close_rounded,
                       size: 16, color: colors.textMuted),
                 ),
         ),
         Expanded(
-          child: ListView(
-            padding: const EdgeInsets.fromLTRB(24, 20, 24, 24),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              AnimatedBuilder(
-                animation: settings,
-                builder: (context, _) {
-                  return Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      _SettingsSectionTitle(
-                        title: t.language,
-                        desc: t.languageDesc,
-                      ),
-                      const SizedBox(height: 12),
-                      _SettingsCard(
-                        child: Row(
+              _SettingsNavRail(
+                items: navItems,
+                activeId: _activeSectionId,
+                onSelect: _scrollToSection,
+              ),
+              VerticalDivider(width: 1, color: colors.border),
+              Expanded(
+                child: LayoutBuilder(
+                  builder: (context, constraints) {
+                    // 底部留出接近一整屏，保证最后一项也能尽量顶对齐
+                    final bottomSpacer =
+                        (constraints.maxHeight - 48).clamp(120.0, 900.0);
+                    // 用 Column 一次性构建全部区块，避免 ListView 懒加载导致 key 尚未挂载
+                    return SingleChildScrollView(
+                      controller: _scrollController,
+                      padding: const EdgeInsets.fromLTRB(24, 20, 24, 24),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                    AnimatedBuilder(
+                      animation: settings,
+                      builder: (context, _) {
+                        return Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: [
-                            Expanded(
-                              child: _LanguageChoice(
-                                label: '中文',
-                                selected: settings.localeCode == 'zh',
-                                onTap: () => settings.setLocaleCode('zh'),
+                            KeyedSubtree(
+                              key: _keyFor('language'),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                  _SettingsSectionTitle(
+                                    title: t.language,
+                                    desc: t.languageDesc,
+                                  ),
+                                  const SizedBox(height: 12),
+                                  _SettingsCard(
+                                    child: Row(
+                                      children: [
+                                        Expanded(
+                                          child: _LanguageChoice(
+                                            label: '中文',
+                                            selected:
+                                                settings.localeCode == 'zh',
+                                            onTap: () =>
+                                                settings.setLocaleCode('zh'),
+                                          ),
+                                        ),
+                                        const SizedBox(width: 10),
+                                        Expanded(
+                                          child: _LanguageChoice(
+                                            label: 'English',
+                                            selected:
+                                                settings.localeCode == 'en',
+                                            onTap: () =>
+                                                settings.setLocaleCode('en'),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ],
                               ),
                             ),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: _LanguageChoice(
-                                label: 'English',
-                                selected: settings.localeCode == 'en',
-                                onTap: () => settings.setLocaleCode('en'),
+                            const SizedBox(height: 20),
+                            KeyedSubtree(
+                              key: _keyFor('appearance'),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                  _SettingsSectionTitle(
+                                    title: t.appearance,
+                                    desc: t.appearanceDesc,
+                                  ),
+                                  const SizedBox(height: 12),
+                                  Container(
+                                    padding: const EdgeInsets.all(16),
+                                    decoration: BoxDecoration(
+                                      color: colors.panelElevated,
+                                      borderRadius: BorderRadius.circular(14),
+                                      border: Border.all(color: colors.border),
+                                    ),
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          '界面风格',
+                                          style: TextStyle(
+                                            color: colors.textPrimary,
+                                            fontSize: 14,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 14),
+                                        Row(
+                                          children: [
+                                            Expanded(
+                                              child: _ThemeChoiceCard(
+                                                title: '亮色',
+                                                subtitle: 'Trae Light',
+                                                selected: !isDark,
+                                                preview: const _ThemePreview(
+                                                    dark: false),
+                                                onTap: () => themeController
+                                                    .setMode(ThemeMode.light),
+                                              ),
+                                            ),
+                                            const SizedBox(width: 12),
+                                            Expanded(
+                                              child: _ThemeChoiceCard(
+                                                title: '暗色',
+                                                subtitle: 'Trae Dark',
+                                                selected: isDark,
+                                                preview: const _ThemePreview(
+                                                    dark: true),
+                                                onTap: () => themeController
+                                                    .setMode(ThemeMode.dark),
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const SizedBox(height: 20),
+                            KeyedSubtree(
+                              key: _keyFor('highlight'),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                  Text(
+                                    '代码高亮',
+                                    style: TextStyle(
+                                      color: colors.textPrimary,
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 6),
+                                  Text(
+                                    '基于 re_highlight 主题，按当前界面亮暗筛选可用风格',
+                                    style: TextStyle(
+                                      color: colors.textMuted,
+                                      fontSize: 13,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 18),
+                                  Container(
+                                    padding: const EdgeInsets.all(16),
+                                    decoration: BoxDecoration(
+                                      color: colors.panelElevated,
+                                      borderRadius: BorderRadius.circular(14),
+                                      border: Border.all(color: colors.border),
+                                    ),
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          '高亮风格',
+                                          style: TextStyle(
+                                            color: colors.textPrimary,
+                                            fontSize: 14,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 14),
+                                        Wrap(
+                                          spacing: 10,
+                                          runSpacing: 10,
+                                          children: [
+                                            for (final style in styles)
+                                              _HighlightStyleChip(
+                                                label: style.label,
+                                                selected: themeController
+                                                        .highlightStyleId ==
+                                                    style.id,
+                                                onTap: () => themeController
+                                                    .setHighlightStyle(
+                                                        style.id),
+                                              ),
+                                          ],
+                                        ),
+                                        const SizedBox(height: 16),
+                                        _HighlightPreviewCard(
+                                          theme:
+                                              themeController.highlightTheme,
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ],
                               ),
                             ),
                           ],
-                        ),
+                        );
+                      },
+                    ),
+                    const SizedBox(height: 20),
+                    KeyedSubtree(
+                      key: _keyFor('providers'),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          _SettingsSectionTitle(
+                            title: t.providers,
+                            desc: t.providersDesc,
+                          ),
+                          const SizedBox(height: 12),
+                          // 供应商编辑独立于 settings 监听，避免 Token 被冲掉
+                          const _SettingsCard(
+                            child: ProviderSettingsCard(),
+                          ),
+                        ],
                       ),
-                      const SizedBox(height: 20),
-                      _SettingsSectionTitle(
-                        title: t.appearance,
-                        desc: t.appearanceDesc,
+                    ),
+                    const SizedBox(height: 20),
+                    KeyedSubtree(
+                      key: _keyFor('agent'),
+                      child: const _AgentSettingsCard(),
+                    ),
+                    const SizedBox(height: 20),
+                    KeyedSubtree(
+                      key: _keyFor('lsp'),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          _SettingsSectionTitle(
+                            title: '语言服务器与符号索引',
+                            desc:
+                                'Ctrl/Cmd+点击：优先 LSP → 内置多语言符号索引（ctags 风格）→ 当前文件规则。'
+                                '打开项目会自动建索引；也可在下方配置外部语言服务器路径。',
+                          ),
+                          const SizedBox(height: 12),
+                          const _SettingsCard(
+                              child: _LanguageServerSettingsCard()),
+                        ],
                       ),
-                      const SizedBox(height: 12),
-                      Container(
-                        padding: const EdgeInsets.all(16),
-                        decoration: BoxDecoration(
-                          color: colors.panelElevated,
-                          borderRadius: BorderRadius.circular(14),
-                          border: Border.all(color: colors.border),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              '界面风格',
-                              style: TextStyle(
-                                color: colors.textPrimary,
-                                fontSize: 14,
-                                fontWeight: FontWeight.w600,
-                              ),
-                            ),
-                            const SizedBox(height: 14),
-                            Row(
+                    ),
+                    const SizedBox(height: 20),
+                    KeyedSubtree(
+                      key: _keyFor('clean'),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          _SettingsSectionTitle(
+                            title: t.cleanProject,
+                            desc: t.cleanProjectDesc,
+                          ),
+                          const SizedBox(height: 12),
+                          _SettingsCard(
+                            child: Column(
                               children: [
-                                Expanded(
-                                  child: _ThemeChoiceCard(
-                                    title: '亮色',
-                                    subtitle: 'Trae Light',
-                                    selected: !isDark,
-                                    preview: const _ThemePreview(dark: false),
-                                    onTap: () => themeController
-                                        .setMode(ThemeMode.light),
-                                  ),
+                                _CleanProjectActionRow(
+                                  title: t.clearChats,
+                                  subtitle: t.clearChatsDesc,
+                                  buttonLabel: t.clearChats,
+                                  onPressed: () => _confirmClearChats(context),
                                 ),
-                                const SizedBox(width: 12),
-                                Expanded(
-                                  child: _ThemeChoiceCard(
-                                    title: '暗色',
-                                    subtitle: 'Trae Dark',
-                                    selected: isDark,
-                                    preview: const _ThemePreview(dark: true),
-                                    onTap: () =>
-                                        themeController.setMode(ThemeMode.dark),
-                                  ),
+                                Padding(
+                                  padding:
+                                      const EdgeInsets.symmetric(vertical: 12),
+                                  child:
+                                      Divider(height: 1, color: colors.border),
+                                ),
+                                _CleanProjectActionRow(
+                                  title: t.clearProjectMemory,
+                                  subtitle: t.clearProjectMemoryDesc,
+                                  buttonLabel: t.clearProjectMemory,
+                                  destructive: true,
+                                  onPressed: () =>
+                                      _confirmClearProjectMemory(context),
                                 ),
                               ],
                             ),
-                          ],
-                        ),
+                          ),
+                        ],
                       ),
-                      const SizedBox(height: 20),
-                      Text(
-                        '代码高亮',
-                        style: TextStyle(
-                          color: colors.textPrimary,
-                          fontSize: 16,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                      const SizedBox(height: 6),
-                      Text(
-                        '基于 re_highlight 主题，按当前界面亮暗筛选可用风格',
-                        style: TextStyle(
-                          color: colors.textMuted,
-                          fontSize: 13,
-                        ),
-                      ),
-                      const SizedBox(height: 18),
-                      Container(
-                        padding: const EdgeInsets.all(16),
-                        decoration: BoxDecoration(
-                          color: colors.panelElevated,
-                          borderRadius: BorderRadius.circular(14),
-                          border: Border.all(color: colors.border),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              '高亮风格',
-                              style: TextStyle(
-                                color: colors.textPrimary,
-                                fontSize: 14,
-                                fontWeight: FontWeight.w600,
-                              ),
-                            ),
-                            const SizedBox(height: 14),
-                            Wrap(
-                              spacing: 10,
-                              runSpacing: 10,
-                              children: [
-                                for (final style in styles)
-                                  _HighlightStyleChip(
-                                    label: style.label,
-                                    selected: themeController.highlightStyleId ==
-                                        style.id,
-                                    onTap: () => themeController
-                                        .setHighlightStyle(style.id),
-                                  ),
-                              ],
-                            ),
-                            const SizedBox(height: 16),
-                            _HighlightPreviewCard(
-                              theme: themeController.highlightTheme,
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  );
-                },
-              ),
-              const SizedBox(height: 20),
-              _SettingsSectionTitle(
-                title: t.providers,
-                desc: t.providersDesc,
-              ),
-              const SizedBox(height: 12),
-              // 供应商编辑独立于 settings 监听，避免 Token 被冲掉
-              const _SettingsCard(
-                child: ProviderSettingsCard(),
-              ),
-              const SizedBox(height: 20),
-              const _AgentSettingsCard(),
-              const SizedBox(height: 20),
-              _SettingsSectionTitle(
-                title: '语言服务器与符号索引',
-                desc: 'Ctrl/Cmd+点击：优先 LSP → 内置多语言符号索引（ctags 风格）→ 当前文件规则。'
-                    '打开项目会自动建索引；也可在下方配置外部语言服务器路径。',
-              ),
-              const SizedBox(height: 12),
-              const _SettingsCard(child: _LanguageServerSettingsCard()),
-              const SizedBox(height: 20),
-              _SettingsSectionTitle(
-                title: t.cleanProject,
-                desc: t.cleanProjectDesc,
-              ),
-              const SizedBox(height: 12),
-              _SettingsCard(
-                child: Column(
-                  children: [
-                    _CleanProjectActionRow(
-                      title: t.clearChats,
-                      subtitle: t.clearChatsDesc,
-                      buttonLabel: t.clearChats,
-                      onPressed: () => _confirmClearChats(context),
                     ),
-                    Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 12),
-                      child: Divider(height: 1, color: colors.border),
-                    ),
-                    _CleanProjectActionRow(
-                      title: t.clearProjectMemory,
-                      subtitle: t.clearProjectMemoryDesc,
-                      buttonLabel: t.clearProjectMemory,
-                      destructive: true,
-                      onPressed: () => _confirmClearProjectMemory(context),
-                    ),
-                  ],
+                    SizedBox(height: bottomSpacer),
+                        ],
+                      ),
+                    );
+                  },
                 ),
               ),
             ],
@@ -831,6 +1063,107 @@ class _SettingsPanel extends StatelessWidget {
     await ChatScope.of(context).clearAll(includeMemory: true);
     if (!context.mounted) return;
     await CheckpointScope.of(context).clearAll();
+  }
+}
+
+class _SettingsNavRail extends StatelessWidget {
+  const _SettingsNavRail({
+    required this.items,
+    required this.activeId,
+    required this.onSelect,
+  });
+
+  final List<_SettingsNavItem> items;
+  final String activeId;
+  final ValueChanged<String> onSelect;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = IdeColors.of(context);
+    return Container(
+      width: 148,
+      color: colors.panel,
+      child: ListView(
+        padding: const EdgeInsets.fromLTRB(8, 12, 8, 12),
+        children: [
+          for (final item in items)
+            _SettingsNavTile(
+              item: item,
+              selected: item.id == activeId,
+              onTap: () => onSelect(item.id),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SettingsNavTile extends StatefulWidget {
+  const _SettingsNavTile({
+    required this.item,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final _SettingsNavItem item;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  State<_SettingsNavTile> createState() => _SettingsNavTileState();
+}
+
+class _SettingsNavTileState extends State<_SettingsNavTile> {
+  bool _hover = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = IdeColors.of(context);
+    final selected = widget.selected;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: MouseRegion(
+        onEnter: (_) => setState(() => _hover = true),
+        onExit: (_) => setState(() => _hover = false),
+        child: Material(
+          color: selected
+              ? colors.accentSoft
+              : (_hover ? colors.panelHover : Colors.transparent),
+          borderRadius: BorderRadius.circular(10),
+          child: InkWell(
+            onTap: widget.onTap,
+            borderRadius: BorderRadius.circular(10),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
+              child: Row(
+                children: [
+                  Icon(
+                    widget.item.icon,
+                    size: 15,
+                    color: selected ? colors.accent : colors.textMuted,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      widget.item.label,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: selected
+                            ? colors.textPrimary
+                            : colors.textSecondary,
+                        fontSize: 12.5,
+                        fontWeight:
+                            selected ? FontWeight.w700 : FontWeight.w500,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }
 
@@ -932,10 +1265,21 @@ class _LanguageServerSettingsCardState
     for (final spec in kLanguageServerSpecs) {
       final override = settings.languageServerCommand(spec.id) ??
           _controllers[spec.id]?.text;
-      next[spec.id] = await DefinitionService.instance.isAvailable(
-        spec,
-        commandOverride: override,
-      );
+      // 状态检测不强制下发；有应用目录二进制或 PATH 即视为可用。
+      // 加超时，避免某一项卡住导致按钮一直「检测中」。
+      try {
+        next[spec.id] = await DefinitionService.instance
+            .isAvailable(
+              spec,
+              commandOverride: (override != null && override.trim().isNotEmpty)
+                  ? override
+                  : null,
+              ensureBundled: false,
+            )
+            .timeout(const Duration(seconds: 3), onTimeout: () => false);
+      } catch (_) {
+        next[spec.id] = false;
+      }
     }
     if (!mounted) return;
     setState(() {
@@ -958,6 +1302,39 @@ class _LanguageServerSettingsCardState
   Future<void> _rebuildIndex() async {
     await SymbolIndex.instance.rebuild();
     if (mounted) setState(() {});
+  }
+
+  final Set<String> _installingIds = {};
+  final Map<String, String> _installMsgs = {};
+
+  Future<void> _installBundled(String id) async {
+    setState(() {
+      _installingIds.add(id);
+      _installMsgs[id] = '正在下载到应用支持目录…';
+    });
+    final consentId = id == 'html-via-ts' ? 'typescript' : id;
+    await SettingsStore.instance.setLanguagePackConsent(consentId, true);
+    final path =
+        await BundledLanguageServers.instance.ensureInstalled(id, force: true);
+    DefinitionService.instance.invalidateAvailabilityCache();
+    String extra = '';
+    if (path != null && (id == 'typescript' || id == 'html-via-ts')) {
+      final tss =
+          await BundledLanguageServers.instance.tsserverJsPath();
+      if (tss == null) {
+        extra = '\n警告：缺少 tsserver.js（不要用 typescript@7）';
+      } else {
+        extra = '\ntsserver: $tss';
+      }
+    }
+    if (!mounted) return;
+    setState(() {
+      _installingIds.remove(id);
+      _installMsgs[id] = path != null
+          ? '已安装：$path$extra'
+          : (BundledLanguageServers.instance.lastErrorFor(id) ?? '安装失败');
+    });
+    await _refreshStatus();
   }
 
   @override
@@ -1005,11 +1382,58 @@ class _LanguageServerSettingsCardState
             ],
           ),
         ),
+        Container(
+          padding: const EdgeInsets.all(12),
+          margin: const EdgeInsets.only(bottom: 12),
+          decoration: BoxDecoration(
+            color: colors.panelHover.withValues(alpha: 0.35),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: colors.border),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                '语言服务（按需下载）',
+                style: TextStyle(
+                  color: colors.textPrimary,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                '安装包不预置语言服务。首次打开 JS/TS · Python · Go · Rust · C/C++ 文件时会询问是否下载到应用支持目录。\n'
+                '也可在下方各条目手动「安装到应用目录」。不写系统全局，不改项目 jsconfig/tsconfig。\n'
+                'JS 语义检查走 VS Code 同款 implicitProjectConfig（默认开启）。',
+                style: TextStyle(color: colors.textMuted, fontSize: 11.5),
+              ),
+              const SizedBox(height: 10),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                dense: true,
+                title: Text(
+                  '无配置 JS 启用 checkJs',
+                  style: TextStyle(color: colors.textPrimary, fontSize: 13),
+                ),
+                subtitle: Text(
+                  '不写 jsconfig；对散落 .js 文件检查未定义标识符等',
+                  style: TextStyle(color: colors.textMuted, fontSize: 11),
+                ),
+                value: SettingsStore.instance.jsImplicitCheckJs,
+                onChanged: (v) async {
+                  await SettingsStore.instance.setJsImplicitCheckJs(v);
+                  if (mounted) setState(() {});
+                },
+              ),
+            ],
+          ),
+        ),
         Row(
           children: [
             Expanded(
               child: Text(
-                '外部 LSP（可选，精确度更高）',
+                '语言服务器状态',
                 style: TextStyle(color: colors.textMuted, fontSize: 12),
               ),
             ),
@@ -1069,6 +1493,17 @@ class _LanguageServerSettingsCardState
                   '默认命令：${spec.command} ${spec.args.join(' ')}\n${spec.installHint}',
                   style: TextStyle(color: colors.textMuted, fontSize: 11.5),
                 ),
+                if (_installMsgs[spec.id] != null) ...[
+                  const SizedBox(height: 6),
+                  Text(
+                    _installMsgs[spec.id]!,
+                    style: TextStyle(
+                      color: colors.textSecondary,
+                      fontSize: 11,
+                      fontFamily: 'Menlo',
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 8),
                 Row(
                   children: [
@@ -1104,6 +1539,17 @@ class _LanguageServerSettingsCardState
                       ),
                     ),
                     const SizedBox(width: 8),
+                    if (spec.autoInstall) ...[
+                      TextButton(
+                        onPressed: _installingIds.contains(spec.id)
+                            ? null
+                            : () => _installBundled(spec.id),
+                        child: Text(
+                          _installingIds.contains(spec.id) ? '安装中…' : '安装到应用目录',
+                        ),
+                      ),
+                      const SizedBox(width: 4),
+                    ],
                     FilledButton.tonal(
                       onPressed: () => _save(spec.id),
                       child: const Text('保存'),
@@ -2360,17 +2806,45 @@ class _FileExplorerPanel extends StatelessWidget {
       );
     }
 
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(8, 8, 8, 12),
-      children: [
-        for (final node in workspace.tree)
-          _FileTreeItem(
-            node: node,
-            depth: 0,
-            selectedPath: workspace.selectedPath,
-            onSelect: workspace.selectInTree,
-          ),
-      ],
+    return Builder(
+      builder: (context) {
+        return ListView(
+          padding: const EdgeInsets.fromLTRB(8, 8, 8, 12),
+          children: [
+            for (final node in workspace.tree)
+              _FileTreeItem(
+                node: node,
+                depth: 0,
+                selectedPath: workspace.selectedPath,
+                onSelect: workspace.selectInTree,
+                onDelete: (target) async {
+                  final messenger = ScaffoldMessenger.of(context);
+                  final checkpoints = CheckpointScope.of(context);
+                  final deleted =
+                      await workspace.deletePaths([target.path]);
+                  if (deleted.isEmpty) {
+                    messenger.showSnackBar(
+                      const SnackBar(content: Text('删除失败或目标不存在')),
+                    );
+                    return;
+                  }
+                  try {
+                    await checkpoints.checkpoint(
+                      message:
+                          '删除 ${deleted.take(3).join(', ')}${deleted.length > 3 ? ' 等' : ''}',
+                      kind: 'user-edit',
+                    );
+                  } catch (_) {}
+                  messenger.showSnackBar(
+                    SnackBar(
+                      content: Text('已删除 ${deleted.length} 项并记录版本'),
+                    ),
+                  );
+                },
+              ),
+          ],
+        );
+      },
     );
   }
 }
@@ -2424,12 +2898,14 @@ class _FileTreeItem extends StatefulWidget {
     required this.depth,
     required this.selectedPath,
     required this.onSelect,
+    required this.onDelete,
   });
 
   final WorkspaceFile node;
   final int depth;
   final String? selectedPath;
   final void Function(String path, {required bool isDirectory}) onSelect;
+  final Future<void> Function(WorkspaceFile node) onDelete;
 
   @override
   State<_FileTreeItem> createState() => _FileTreeItemState();
@@ -2438,6 +2914,40 @@ class _FileTreeItem extends StatefulWidget {
 class _FileTreeItemState extends State<_FileTreeItem> {
   late bool _expanded = widget.depth < 2;
   bool _hover = false;
+
+  Future<void> _confirmAndDelete() async {
+    final node = widget.node;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) {
+        final colors = IdeColors.of(ctx);
+        return AlertDialog(
+          backgroundColor: colors.panel,
+          title: Text('删除${node.isDirectory ? '文件夹' : '文件'}？',
+              style: TextStyle(color: colors.textPrimary)),
+          content: Text(
+            node.isDirectory
+                ? '将删除「${node.name}」及其全部内容，并记入版本变更。'
+                : '将删除「${node.name}」，并记入版本变更。',
+            style: TextStyle(color: colors.textMuted, fontSize: 13),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('删除'),
+            ),
+          ],
+        );
+      },
+    );
+    if (ok == true) {
+      await widget.onDelete(node);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -2457,6 +2967,23 @@ class _FileTreeItemState extends State<_FileTreeItem> {
                 setState(() => _expanded = !_expanded);
               }
               widget.onSelect(node.path, isDirectory: node.isDirectory);
+            },
+            onSecondaryTapDown: (details) async {
+              final action = await _showCodexContextMenu<_FileTreeAction>(
+                context: context,
+                globalPosition: details.globalPosition,
+                items: [
+                  _CodexContextMenuItem(
+                    value: _FileTreeAction.delete,
+                    icon: Icons.delete_outline_rounded,
+                    title: node.isDirectory ? '删除文件夹' : '删除文件',
+                    subtitle: '删除后记入版本变更',
+                  ),
+                ],
+              );
+              if (action == _FileTreeAction.delete) {
+                await _confirmAndDelete();
+              }
             },
             child: AnimatedContainer(
               duration: const Duration(milliseconds: 100),
@@ -2522,6 +3049,7 @@ class _FileTreeItemState extends State<_FileTreeItem> {
               depth: widget.depth + 1,
               selectedPath: widget.selectedPath,
               onSelect: widget.onSelect,
+              onDelete: widget.onDelete,
             ),
       ],
     );
@@ -2638,6 +3166,13 @@ class _EditorPanel extends StatelessWidget {
                   style: TextStyle(color: colors.textMuted, fontSize: 11),
                 ),
               ),
+              _ProblemsStatusChip(
+                onOpenProblems: () {
+                  final shell = context.findAncestorStateOfType<_IdeShellState>();
+                  shell?._onActivityTap(ActivityItem.problems);
+                },
+              ),
+              const SizedBox(width: 10),
               Text(
                 active == null ? '' : _statusLabel(active),
                 style: TextStyle(color: colors.textMuted, fontSize: 11),
@@ -2662,6 +3197,44 @@ class _EditorPanel extends StatelessWidget {
       case FileKind.unsupported:
         return 'Binary';
     }
+  }
+}
+
+class _ProblemsStatusChip extends StatelessWidget {
+  const _ProblemsStatusChip({required this.onOpenProblems});
+
+  final VoidCallback onOpenProblems;
+
+  @override
+  Widget build(BuildContext context) {
+    final store = DiagnosticsScope.maybeOf(context);
+    if (store == null) return const SizedBox.shrink();
+    return AnimatedBuilder(
+      animation: store,
+      builder: (context, _) {
+        final errors = store.errorCount;
+        final warnings = store.warningCount;
+        final label = (errors == 0 && warnings == 0)
+            ? 'No problems'
+            : '✕$errors  ⚠$warnings';
+        final color = errors > 0
+            ? const Color(0xFFE35D6A)
+            : warnings > 0
+                ? const Color(0xFFE3A008)
+                : IdeColors.of(context).textMuted;
+        return InkWell(
+          onTap: onOpenProblems,
+          borderRadius: BorderRadius.circular(4),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+            child: Text(
+              label,
+              style: TextStyle(color: color, fontSize: 11),
+            ),
+          ),
+        );
+      },
+    );
   }
 }
 
@@ -2793,7 +3366,9 @@ class _AiPanelState extends State<_AiPanel> {
   void dispose() {
     _controller.dispose();
     _focusNode.dispose();
-    _runner?.dispose();
+    // 切页已改为叠层保活，正常不会走到这里。
+    // 若极端情况下面板被卸载：不要 cancel/dispose runner，
+    // 让进行中的写盘与版本记录跑完，避免“UI 丢了但文件已创建”。
     super.dispose();
   }
 
@@ -4182,11 +4757,12 @@ class _ChatBubble extends StatelessWidget {
         constraints: const BoxConstraints(maxWidth: 420),
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
         decoration: BoxDecoration(
-          color: isUser ? colors.accentSoft : colors.panelElevated,
+          // 用户消息保留底色；助手回复透明，便于区分输入与机器回复
+          color: isUser ? colors.accentSoft : Colors.transparent,
           borderRadius: BorderRadius.circular(12),
-          border: Border.all(
-            color: isUser ? colors.userBubbleBorder : colors.border,
-          ),
+          border: isUser
+              ? Border.all(color: colors.userBubbleBorder)
+              : null,
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -4538,6 +5114,8 @@ class _ThinkingBlockState extends State<_ThinkingBlock> {
 }
 
 enum _ChatDeleteAction { deleteOnly, deleteAndMerge }
+
+enum _FileTreeAction { delete }
 
 class _CodexSoftButton extends StatelessWidget {
   const _CodexSoftButton({
@@ -5720,10 +6298,9 @@ class _StreamingBlock extends StatelessWidget {
         constraints: const BoxConstraints(maxWidth: 420),
         padding:
             const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-        decoration: BoxDecoration(
-          color: colors.panelElevated,
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: colors.border),
+        decoration: const BoxDecoration(
+          color: Colors.transparent,
+          borderRadius: BorderRadius.all(Radius.circular(12)),
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,

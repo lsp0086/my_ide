@@ -658,31 +658,24 @@ class _ModelCapabilityEditorState extends State<_ModelCapabilityEditor> {
   late final TextEditingController _display;
   late final TextEditingController _customContext;
   late bool _contextCustom;
-  final _contextKey = GlobalKey();
 
   static String _fmtContext(int n) => AiModelOption.formatContext(n);
 
   Future<void> _pickContext(AiModelOption m) async {
     const customSentinel = -1;
-    final picked = await _showSettingsSoftMenu<int>(
+    final picked = await _showSettingsSelectPanel<int>(
       context: context,
-      anchorKey: _contextKey,
-      width: 180,
-      builder: (ctx, select) {
-        return Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            for (final n in AiModelOption.contextPresets)
-              _SettingsSoftItem(
-                title: n == null ? '自定义' : _fmtContext(n),
-                selected: n == null
-                    ? _contextCustom
-                    : (!_contextCustom && m.contextLength == n),
-                onTap: () => select(n ?? customSentinel),
-              ),
-          ],
-        );
-      },
+      title: '选择上下文长度',
+      options: [
+        for (final n in AiModelOption.contextPresets)
+          (
+            value: n ?? customSentinel,
+            label: n == null ? '自定义' : _fmtContext(n),
+            selected: n == null
+                ? _contextCustom
+                : (!_contextCustom && m.contextLength == n),
+          ),
+      ],
     );
     if (picked == null || !mounted) return;
     setState(() {
@@ -844,7 +837,6 @@ class _ModelCapabilityEditorState extends State<_ModelCapabilityEditor> {
                       ),
                       const SizedBox(width: 8),
                       SizedBox(
-                        key: _contextKey,
                         width: 130,
                         child: Material(
                           color: colors.inputFill,
@@ -1105,68 +1097,80 @@ class _SoftActionButton extends StatelessWidget {
   }
 }
 
-Future<T?> _showSettingsSoftMenu<T>({
+Future<T?> _showSettingsSelectPanel<T>({
   required BuildContext context,
-  required GlobalKey anchorKey,
-  required double width,
-  required Widget Function(BuildContext, void Function(T)) builder,
+  required String title,
+  required List<({T value, String label, bool selected})> options,
 }) {
-  final box = anchorKey.currentContext?.findRenderObject() as RenderBox?;
-  final overlay =
-      Overlay.of(context).context.findRenderObject() as RenderBox?;
-  if (box == null || overlay == null) return Future.value(null);
-  final offset = box.localToGlobal(Offset.zero, ancestor: overlay);
   final colors = IdeColors.of(context);
-  final left = offset.dx.clamp(8.0, overlay.size.width - width - 8);
-  return showGeneralDialog<T>(
+  return showDialog<T>(
     context: context,
     barrierDismissible: true,
-    barrierLabel: 'dismiss',
-    barrierColor: Colors.transparent,
-    transitionDuration: const Duration(milliseconds: 120),
-    pageBuilder: (_, __, ___) => const SizedBox.shrink(),
-    transitionBuilder: (ctx, anim, _, __) {
-      final curved = CurvedAnimation(parent: anim, curve: Curves.easeOutCubic);
-      return Stack(
-        children: [
-          Positioned.fill(
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTap: () => Navigator.of(ctx).pop(),
-            ),
-          ),
-          Positioned(
-            left: left,
-            top: offset.dy + box.size.height + 6,
-            width: width,
-            child: FadeTransition(
-              opacity: curved,
-              child: ScaleTransition(
-                scale: Tween(begin: 0.96, end: 1.0).animate(curved),
-                alignment: Alignment.topLeft,
-                child: Material(
-                  color: Colors.transparent,
-                  child: Container(
-                    decoration: BoxDecoration(
-                      color: colors.panelElevated,
-                      borderRadius: BorderRadius.circular(12),
-                      border: Border.all(color: colors.borderStrong),
-                      boxShadow: [
-                        BoxShadow(
-                          color: colors.shadow,
-                          blurRadius: 18,
-                          offset: const Offset(0, 6),
+    builder: (ctx) {
+      return Dialog(
+        backgroundColor: colors.panelElevated,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(14),
+          side: BorderSide(color: colors.borderStrong),
+        ),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 360, maxHeight: 460),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 14, 8, 8),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        title,
+                        style: TextStyle(
+                          color: colors.textPrimary,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
                         ),
-                      ],
+                      ),
                     ),
-                    padding: const EdgeInsets.symmetric(vertical: 6),
-                    child: builder(ctx, (value) => Navigator.of(ctx).pop(value)),
+                    IconButton(
+                      tooltip: '关闭',
+                      visualDensity: VisualDensity.compact,
+                      onPressed: () => Navigator.of(ctx).pop(),
+                      icon: Icon(Icons.close, size: 18, color: colors.textMuted),
+                    ),
+                  ],
+                ),
+              ),
+              Divider(height: 1, color: colors.divider),
+              Flexible(
+                child: ListView.builder(
+                  shrinkWrap: true,
+                  padding: const EdgeInsets.symmetric(vertical: 6),
+                  itemCount: options.length,
+                  itemBuilder: (context, index) {
+                    final opt = options[index];
+                    return _SettingsSoftItem(
+                      title: opt.label,
+                      selected: opt.selected,
+                      onTap: () => Navigator.of(ctx).pop(opt.value),
+                    );
+                  },
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
+                child: Align(
+                  alignment: Alignment.centerRight,
+                  child: TextButton(
+                    onPressed: () => Navigator.of(ctx).pop(),
+                    child: const Text('取消'),
                   ),
                 ),
               ),
-            ),
+            ],
           ),
-        ],
+        ),
       );
     },
   );

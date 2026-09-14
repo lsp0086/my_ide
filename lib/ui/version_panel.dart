@@ -72,7 +72,7 @@ class VersionPanel extends StatelessWidget {
     if (store.rootPath == null) {
       return Center(
         child: Text(
-          '先打开项目后启用版本管理',
+          '先打开项目后启用节点查看',
           style: TextStyle(color: colors.textMuted, fontSize: 12.5),
         ),
       );

@@ -55,6 +55,16 @@ zip_dir() {
   echo "    已生成: $dest_zip"
 }
 
+strip_language_bundles() {
+  # Zed 式：安装包不预置语言服务，首次打开再询问下载。
+  local root="$1"
+  rm -rf "$root/language_archives" "$root/languages" \
+         "$root/Contents/Resources/language_archives" \
+         "$root/Contents/Resources/languages" \
+         "$root/data/language_archives" \
+         "$root/data/languages" 2>/dev/null || true
+}
+
 build_macos() {
   local app_path zip_path
   echo "--> 构建 macOS Release..."
@@ -68,12 +78,9 @@ build_macos() {
     echo "    找不到 .app 产物" >&2
     return 1
   fi
+  strip_language_bundles "$ROOT/$app_path"
   zip_path="$OUT_DIR/${APP_NAME}-${VERSION}-macos-${ARCH}.zip"
   zip_dir "$ROOT/$app_path" "$zip_path"
-  # 同时复制一份未压缩 app 方便本机直接跑（可选）
-  # rm -rf "$OUT_DIR/${APP_NAME}-${VERSION}-macos-${ARCH}.app"
-  # cp -R "$ROOT/$app_path" "$OUT_DIR/${APP_NAME}-${VERSION}-macos-${ARCH}.app"
-  # echo "    已复制: $OUT_DIR/${APP_NAME}-${VERSION}-macos-${ARCH}.app"
 }
 
 build_linux() {
@@ -87,6 +94,7 @@ build_linux() {
     echo "    找不到 linux bundle" >&2
     return 1
   fi
+  strip_language_bundles "$ROOT/$bundle"
   local zip_path="$OUT_DIR/${APP_NAME}-${VERSION}-linux-x64.zip"
   zip_dir "$ROOT/$bundle" "$zip_path"
 }
@@ -102,6 +110,7 @@ build_windows() {
     echo "    找不到 windows Release 目录" >&2
     return 1
   fi
+  strip_language_bundles "$ROOT/$runner"
   local zip_path="$OUT_DIR/${APP_NAME}-${VERSION}-windows-x64.zip"
   zip_dir "$ROOT/$runner" "$zip_path"
 }

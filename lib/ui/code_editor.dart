@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
@@ -9,7 +10,12 @@ import 'package:re_editor/re_editor.dart';
 import 'package:re_highlight/languages/all.dart';
 import 'package:re_highlight/re_highlight.dart';
 
+import '../diagnostics/diagnostics_store.dart';
+import '../diagnostics/ide_diagnostic.dart';
+import '../diagnostics/local_integrity_checker.dart';
+import '../diagnostics/local_tsc_checker.dart';
 import '../lsp/builtin_definition.dart';
+import '../lsp/bundled_language_servers.dart';
 import '../lsp/language_servers.dart';
 import '../lsp/lsp_client.dart';
 import '../lsp/symbol_index.dart';
@@ -55,8 +61,12 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
   int? _gotoEnd;
   int _seenContentEpoch = 0;
   WorkspaceController? _workspace;
+  DiagnosticsStore? _diagnostics;
+  Timer? _localCheckTimer;
+  int _docVersion = 0;
   Map<String, CodeHighlightThemeMode>? _cachedHighlightLanguages;
   String? _cachedHighlightLanguageId;
+  final Set<String> _promptingPackIds = {};
 
   bool get isDirty => _dirty;
   bool get isSaving => _saving;
@@ -99,6 +109,7 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
     } else {
       _syncExternalContent();
     }
+    _diagnostics = DiagnosticsScope.maybeOf(context);
   }
 
   void _onWorkspaceChanged() {
@@ -120,9 +131,12 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
   void didUpdateWidget(covariant CodeEditorPane oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.path != widget.path) {
+      _localCheckTimer?.cancel();
+      _diagnostics?.clearFile(oldWidget.path);
       _language = CodeLanguage.fromFileName(p.basename(widget.path));
       _languageMode = builtinAllLanguages[_language.id];
       _seenContentEpoch = _workspace?.contentEpochOf(widget.path) ?? 0;
+      _docVersion = 0;
       _load();
     }
   }
@@ -420,32 +434,33 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
           .specForExtension(p.extension(widget.path).toLowerCase());
       if (spec != null) {
         final overrideCmd = settings.languageServerCommand(spec.id);
-        final available = await DefinitionService.instance.isAvailable(
-          spec,
+        final client = await DefinitionService.instance.clientFor(
+          rootPath: root,
+          spec: spec,
           commandOverride: overrideCmd,
         );
-        if (available) {
-          final client = await DefinitionService.instance.clientFor(
-            rootPath: root,
-            spec: spec,
-            commandOverride: overrideCmd,
+        if (client != null) {
+          final lspLang = spec.languageIds.contains(_language.id)
+              ? _language.id
+              : (spec.languageIds.isNotEmpty
+                  ? spec.languageIds.first
+                  : _language.id);
+          client.didChange(
+            widget.path,
+            _controller.text,
+            version: (_diagnostics ?? DiagnosticsScope.maybeOf(context))
+                    ?.contentVersionOf(widget.path) ??
+                1,
+            languageId: lspLang,
           );
-          if (client != null) {
-            final lspLang = spec.languageIds.contains(_language.id)
-                ? _language.id
-                : (spec.languageIds.isNotEmpty
-                    ? spec.languageIds.first
-                    : _language.id);
-            client.didOpen(widget.path, lspLang, _controller.text);
-            final locations = await client.definition(
-              filePath: widget.path,
-              line: useLine,
-              character: useChar,
-            );
-            if (locations.isNotEmpty) {
-              loc = locations.first;
-              via = spec.label;
-            }
+          final locations = await client.definition(
+            filePath: widget.path,
+            line: useLine,
+            character: useChar,
+          );
+          if (locations.isNotEmpty) {
+            loc = locations.first;
+            via = spec.label;
           }
         }
       }
@@ -517,6 +532,8 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
 
   @override
   void dispose() {
+    _localCheckTimer?.cancel();
+    _diagnostics?.clearFile(widget.path);
     _workspace?.removeListener(_onWorkspaceChanged);
     HardwareKeyboard.instance.removeHandler(_onHardwareKey);
     _controller.removeListener(_onChanged);
@@ -536,6 +553,278 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
     if (_gotoModifier) {
       _updateGotoTargetFromSelection();
     }
+    _scheduleLocalIntegrityCheck();
+  }
+
+  void _scheduleLocalIntegrityCheck({bool immediate = false}) {
+    _localCheckTimer?.cancel();
+    if (immediate) {
+      _runLocalIntegrityCheck();
+      return;
+    }
+    _localCheckTimer = Timer(const Duration(milliseconds: 400), () {
+      if (!mounted) return;
+      _runLocalIntegrityCheck();
+    });
+  }
+
+  void _runLocalIntegrityCheck() {
+    final store = _diagnostics ?? DiagnosticsScope.maybeOf(context);
+    if (store == null) return;
+    final version = store.bumpContentVersion(widget.path);
+    _docVersion = version;
+    final text = _controller.text;
+    final issues = LocalIntegrityChecker.analyze(
+      filePath: widget.path,
+      text: text,
+      languageId: _language.id,
+      contentVersion: version,
+    );
+    store.setForFileSource(
+      path: widget.path,
+      source: LocalIntegrityChecker.source,
+      diagnostics: issues,
+      contentVersion: version,
+    );
+    // JS/TS：用已下载的 tsc 做语义检查（consle 等），不依赖 LSP checkJs 通道。
+    _runLocalTscCheck(version: version, text: text);
+    _syncLspDocument(version: version);
+  }
+
+  Future<void> _runLocalTscCheck({
+    required int version,
+    required String text,
+  }) async {
+    if (!LocalTscChecker.supports(_language.id, widget.path)) return;
+    final store = _diagnostics ?? DiagnosticsScope.maybeOf(context);
+    if (store == null) return;
+    final issues = await LocalTscChecker.analyze(
+      filePath: widget.path,
+      text: text,
+      languageId: _language.id,
+      contentVersion: version,
+    );
+    if (!mounted) return;
+    // 文档已继续编辑则丢弃过期结果。
+    if (store.contentVersionOf(widget.path) != version) return;
+    store.setForFileSource(
+      path: widget.path,
+      source: LocalTscChecker.source,
+      diagnostics: issues,
+      contentVersion: version,
+    );
+  }
+
+  Future<bool> _ensureLanguagePackConsent(LanguageServerSpec spec) async {
+    final service = DefinitionService.instance;
+    if (!spec.autoInstall) return true;
+    // 已有二进制 / PATH 覆盖：无需询问。
+    final settings = SettingsStore.instance;
+    final overrideCmd = settings.languageServerCommand(spec.id);
+    if (overrideCmd != null && overrideCmd.trim().isNotEmpty) return true;
+    final present =
+        await BundledLanguageServers.instance.binaryPathIfPresent(spec.id);
+    if (present != null) return true;
+    // PATH 上已有命令也视为可用，不再下载。
+    final onPath = await service.isAvailable(
+      spec,
+      ensureBundled: false,
+    );
+    if (onPath) return true;
+
+    final consent = service.packConsent(spec);
+    if (consent == true) return true;
+    if (consent == false) return false;
+    if (!mounted) return false;
+
+    final consentId =
+        spec.id == 'html-via-ts' ? 'typescript' : spec.id;
+    if (_promptingPackIds.contains(consentId)) return false;
+    _promptingPackIds.add(consentId);
+    try {
+      final ok = await showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) {
+          final colors = IdeColors.of(ctx);
+          return AlertDialog(
+            backgroundColor: colors.panel,
+            title: Text(
+              '下载语言包？',
+              style: TextStyle(color: colors.textPrimary),
+            ),
+            content: Text(
+              '检测到 ${spec.label} 尚未安装。\n'
+              '下载后将保存到应用支持目录，用于代码诊断与跳转。\n'
+              '不会修改你的项目文件（不写 jsconfig/tsconfig）。\n\n'
+              '${spec.installHint}',
+              style: TextStyle(color: colors.textMuted, fontSize: 13),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(false),
+                child: const Text('暂不下载'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.of(ctx).pop(true),
+                child: const Text('下载'),
+              ),
+            ],
+          );
+        },
+      );
+      await service.setPackConsent(spec, ok == true);
+      if (ok == true && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('正在下载 ${spec.label}…')),
+        );
+        final path = await BundledLanguageServers.instance
+            .ensureInstalled(consentId, force: false);
+        if (!mounted) return path != null;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              path != null
+                  ? '${spec.label} 已就绪'
+                  : (BundledLanguageServers.instance.lastErrorFor(consentId) ??
+                      '下载失败'),
+            ),
+          ),
+        );
+        // 下载完成后立刻补跑本地 tsc（首次打开时语言包可能尚未就绪）。
+        if (path != null) {
+          final store = _diagnostics ?? DiagnosticsScope.maybeOf(context);
+          final version = store?.contentVersionOf(widget.path) ?? _docVersion;
+          _runLocalTscCheck(version: version <= 0 ? 1 : version, text: _controller.text);
+        }
+        return path != null;
+      }
+      return false;
+    } finally {
+      _promptingPackIds.remove(consentId);
+    }
+  }
+
+  Future<void> _syncLspDocument({required int version}) async {
+    final root = _workspace?.rootPath;
+    if (root == null) return;
+    final settings = SettingsStore.instance;
+    final spec = DefinitionService.instance
+        .specForExtension(p.extension(widget.path).toLowerCase());
+    if (spec == null) return;
+    final overrideCmd = settings.languageServerCommand(spec.id);
+    // 首次打开：弹窗询问是否下载语言包（Zed 式按需，不预置进安装包）。
+    final allowed = await _ensureLanguagePackConsent(spec);
+    if (!mounted) return;
+    if (!allowed) {
+      final consent = DefinitionService.instance.packConsent(spec);
+      if (consent == false) {
+        final store = _diagnostics ?? DiagnosticsScope.maybeOf(context);
+        store?.setForFileSource(
+          path: widget.path,
+          source: 'lsp:${spec.id}',
+          diagnostics: [
+            IdeDiagnostic(
+              filePath: widget.path,
+              startLine: 0,
+              startChar: 0,
+              endLine: 0,
+              endChar: 1,
+              severity: DiagnosticSeverity.info,
+              message: '已跳过 ${spec.label} 语言包；可在设置中重新下载',
+              source: 'lsp:${spec.id}',
+            ),
+          ],
+          contentVersion: store.contentVersionOf(widget.path),
+        );
+      }
+      return;
+    }
+    final client = await DefinitionService.instance.clientFor(
+      rootPath: root,
+      spec: spec,
+      commandOverride: overrideCmd,
+    );
+    if (client == null || !mounted) {
+      final err = DefinitionService.instance.lastStartError;
+      if (err != null && err.isNotEmpty) {
+        // 写一条可见诊断，避免「装了但完全没反馈」。
+        final store = _diagnostics ?? DiagnosticsScope.maybeOf(context);
+        store?.setForFileSource(
+          path: widget.path,
+          source: 'lsp:${spec.id}',
+          diagnostics: [
+            IdeDiagnostic(
+              filePath: widget.path,
+              startLine: 0,
+              startChar: 0,
+              endLine: 0,
+              endChar: 1,
+              severity: DiagnosticSeverity.warning,
+              message: '语言服务未启动：$err',
+              source: 'lsp:${spec.id}',
+            ),
+          ],
+          contentVersion: store.contentVersionOf(widget.path),
+        );
+      }
+      return;
+    }
+    final lspLang = spec.languageIds.contains(_language.id)
+        ? _language.id
+        : (spec.languageIds.isNotEmpty ? spec.languageIds.first : _language.id);
+    client.ensureDiagnosticsHandler((path, diagnostics) {
+      final store = _diagnostics ?? DiagnosticsScope.maybeOf(context);
+      if (store == null) return;
+      // 当前文件：用到达时的 contentVersion 写入，避免异步诊断被后续编辑误丢。
+      final versionNow = store.contentVersionOf(path);
+      final clamped = diagnostics
+          .map((d) => _clampDiagnostic(
+                d,
+                path == widget.path ? _controller.text : null,
+              ))
+          .toList(growable: false);
+      store.setForFileSource(
+        path: path,
+        source: 'lsp:${spec.id}',
+        diagnostics: clamped,
+        contentVersion: versionNow,
+      );
+    });
+    // 同步最新文本；若上面安装较慢，用当前文档版本。
+    final latestVersion =
+        (_diagnostics ?? DiagnosticsScope.maybeOf(context))
+                ?.contentVersionOf(widget.path) ??
+            version;
+    client.didChange(
+      widget.path,
+      _controller.text,
+      version: latestVersion <= 0 ? 1 : latestVersion,
+      languageId: lspLang,
+    );
+  }
+
+  IdeDiagnostic _clampDiagnostic(IdeDiagnostic d, String? text) {
+    if (text == null || text.isEmpty) return d;
+    final lines = text.split('\n');
+    final maxLine = (lines.length - 1).clamp(0, 1 << 30);
+    final startLine = d.startLine.clamp(0, maxLine);
+    final endLine = d.endLine.clamp(0, maxLine);
+    final startChar =
+        d.startChar.clamp(0, lines[startLine].length);
+    final endChar = d.endChar.clamp(0, lines[endLine].length);
+    if (startLine == d.startLine &&
+        endLine == d.endLine &&
+        startChar == d.startChar &&
+        endChar == d.endChar) {
+      return d;
+    }
+    return d.copyWith(
+      startLine: startLine,
+      startChar: startChar,
+      endLine: endLine,
+      endChar: endChar,
+    );
   }
 
   Future<void> _applyRevealIfAny() async {
@@ -581,6 +870,7 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
       final workspace = WorkspaceScope.maybeOf(context);
       workspace?.setDirty(widget.path, false);
       workspace?.rememberDiskStamp(widget.path);
+      _scheduleLocalIntegrityCheck(immediate: true);
       await _applyRevealIfAny();
     } catch (error) {
       if (!mounted) return;
@@ -780,11 +1070,42 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
                       chunkController,
                       notifier,
                     ) {
+                      final store =
+                          _diagnostics ?? DiagnosticsScope.maybeOf(context);
                       return Container(
                         color: colors.panel,
-                        child: DefaultCodeLineNumber(
-                          controller: editingController,
-                          notifier: notifier,
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            DefaultCodeLineNumber(
+                              controller: editingController,
+                              notifier: notifier,
+                            ),
+                            SizedBox(
+                              width: 10,
+                              child: AnimatedBuilder(
+                                animation: Listenable.merge([
+                                  notifier,
+                                  if (store != null) store,
+                                ]),
+                                builder: (context, _) {
+                                  final map = store
+                                          ?.severitiesByLine(widget.path) ??
+                                      const <int, DiagnosticSeverity>{};
+                                  return CustomPaint(
+                                    size: Size(
+                                      10,
+                                      MediaQuery.sizeOf(context).height,
+                                    ),
+                                    painter: _DiagnosticGutterPainter(
+                                      notifier: notifier,
+                                      severities: map,
+                                    ),
+                                  );
+                                },
+                              ),
+                            ),
+                          ],
                         ),
                       );
                     },
@@ -840,4 +1161,47 @@ String _decodeUtf16(List<int> bytes, {required bool littleEndian}) {
     codeUnits.add(unit);
   }
   return String.fromCharCodes(codeUnits);
+}
+
+class _DiagnosticGutterPainter extends CustomPainter {
+  _DiagnosticGutterPainter({
+    required this.notifier,
+    required this.severities,
+  });
+
+  final ValueNotifier<CodeIndicatorValue?> notifier;
+  final Map<int, DiagnosticSeverity> severities;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final value = notifier.value;
+    if (value == null || severities.isEmpty) return;
+    final paint = Paint()..style = PaintingStyle.fill;
+    for (final para in value.paragraphs) {
+      final severity = severities[para.index];
+      if (severity == null) continue;
+      paint.color = _colorOf(severity);
+      final cy = para.top + para.height / 2;
+      canvas.drawCircle(Offset(size.width / 2, cy), 3, paint);
+    }
+  }
+
+  Color _colorOf(DiagnosticSeverity severity) {
+    switch (severity) {
+      case DiagnosticSeverity.error:
+        return const Color(0xFFE35D6A);
+      case DiagnosticSeverity.warning:
+        return const Color(0xFFE3A008);
+      case DiagnosticSeverity.info:
+        return const Color(0xFF6C8CFF);
+      case DiagnosticSeverity.hint:
+        return const Color(0xFF9A9AA0);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _DiagnosticGutterPainter oldDelegate) {
+    return oldDelegate.notifier != notifier ||
+        !mapEquals(oldDelegate.severities, severities);
+  }
 }

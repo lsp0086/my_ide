@@ -92,6 +92,36 @@ class SettingsStore extends ChangeNotifier {
 
   String? getString(String key) => _prefs.getString(key);
   int? getInt(String key) => _prefs.getInt(key);
+  bool? getBool(String key) => _prefs.getBool(key);
+
+  Future<void> setBool(String key, bool value) async {
+    await _prefs.setBool(key, value);
+    notifyListeners();
+  }
+
+  /// 无 jsconfig/tsconfig 时，是否对 JS 开启 checkJs（VS Code implicitProjectConfig）。
+  bool get jsImplicitCheckJs =>
+      _prefs.getBool('lsp.js.implicitCheckJs') ?? true;
+
+  Future<void> setJsImplicitCheckJs(bool value) =>
+      setBool('lsp.js.implicitCheckJs', value);
+
+  /// 语言包下载同意：null=未询问，true=允许，false=拒绝。
+  bool? languagePackConsent(String serverId) {
+    final key = 'lsp.pack.consent.$serverId';
+    if (!_prefs.containsKey(key)) return null;
+    return _prefs.getBool(key);
+  }
+
+  Future<void> setLanguagePackConsent(String serverId, bool? value) async {
+    final key = 'lsp.pack.consent.$serverId';
+    if (value == null) {
+      await _prefs.remove(key);
+    } else {
+      await _prefs.setBool(key, value);
+    }
+    notifyListeners();
+  }
 
   /// 最近打开的项目目录（最多 12 条，新的在前）。
   List<String> get recentProjects {

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import 'ai/chat_store.dart';
+import 'diagnostics/diagnostics_store.dart';
 import 'i18n/app_strings.dart';
 import 'settings/settings_store.dart';
 import 'theme/app_colors.dart';
@@ -27,6 +28,7 @@ class _MyIdeAppState extends State<MyIdeApp> {
   late final ShortcutController _shortcutController;
   late final ChatStore _chatStore;
   late final CheckpointStore _checkpointStore;
+  late final DiagnosticsStore _diagnosticsStore;
 
   @override
   void initState() {
@@ -39,6 +41,7 @@ class _MyIdeAppState extends State<MyIdeApp> {
     _shortcutController = ShortcutController();
     _chatStore = ChatStore();
     _checkpointStore = CheckpointStore();
+    _diagnosticsStore = DiagnosticsStore();
     _themeController.addListener(_persistTheme);
     settings.addListener(_syncFromSettings);
   }
@@ -72,6 +75,7 @@ class _MyIdeAppState extends State<MyIdeApp> {
     _shortcutController.dispose();
     _chatStore.dispose();
     _checkpointStore.dispose();
+    _diagnosticsStore.dispose();
     super.dispose();
   }
 
@@ -93,19 +97,22 @@ class _MyIdeAppState extends State<MyIdeApp> {
                   store: _chatStore,
                   child: CheckpointScope(
                     store: _checkpointStore,
-                    child: AnimatedBuilder(
-                      animation: Listenable.merge(
-                          [_themeController, _shortcutController]),
-                      builder: (context, _) {
-                        return MaterialApp(
-                          title: 'My IDE',
-                          debugShowCheckedModeBanner: false,
-                          theme: buildIdeTheme(Brightness.light),
-                          darkTheme: buildIdeTheme(Brightness.dark),
-                          themeMode: _themeController.mode,
-                          home: const IdeShell(),
-                        );
-                      },
+                    child: DiagnosticsScope(
+                      store: _diagnosticsStore,
+                      child: AnimatedBuilder(
+                        animation: Listenable.merge(
+                            [_themeController, _shortcutController]),
+                        builder: (context, _) {
+                          return MaterialApp(
+                            title: 'My IDE',
+                            debugShowCheckedModeBanner: false,
+                            theme: buildIdeTheme(Brightness.light),
+                            darkTheme: buildIdeTheme(Brightness.dark),
+                            themeMode: _themeController.mode,
+                            home: const IdeShell(),
+                          );
+                        },
+                      ),
                     ),
                   ),
                 ),

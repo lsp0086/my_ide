@@ -78,6 +78,8 @@ jobs:
           if [[ ! -d "$SRC" ]]; then
             SRC="$(find build/windows -type d -path '*/runner/Release' | head -1)"
           fi
+          # 不预置语言包；清理可能残留目录
+          rm -rf "$SRC/language_archives" "$SRC/languages" || true
           mkdir -p dist
           (
             cd "$(dirname "$SRC")"
@@ -100,6 +102,7 @@ jobs:
           if [[ ! -d "$SRC" ]]; then
             SRC="$(find build/linux -type d -path '*/release/bundle' | head -1)"
           fi
+          rm -rf "$SRC/data/language_archives" "$SRC/data/languages" || true
           mkdir -p dist
           (
             cd "$(dirname "$SRC")"
@@ -120,6 +123,8 @@ jobs:
           NAME="$(grep -E '^name:' pubspec.yaml | head -1 | awk '{print $2}')"
           APP="$(find build/macos/Build/Products/Release -maxdepth 1 -name '*.app' | head -1)"
           test -n "$APP"
+          rm -rf "$APP/Contents/Resources/language_archives" \
+                 "$APP/Contents/Resources/languages" || true
           mkdir -p dist
           (
             cd "$(dirname "$APP")"
