@@ -34,11 +34,15 @@ class LspClient {
   Process? _process;
   int _id = 0;
   final Map<int, Completer<dynamic>> _pending = {};
-  final StringBuffer _buffer = StringBuffer();
+  // 按字节缓冲：Content-Length 是字节数，用 text.length 切包中文必坏包。
+  final List<int> _byteBuf = [];
+  StreamSubscription<List<int>>? _stdoutSub;
   bool _initialized = false;
   String? _rootUri;
   LspDiagnosticsHandler? _diagnosticsHandler;
   final Set<String> _openedDocs = {};
+  /// didChange 增量节流：每文件只推最新一版，避免击键连发大文件全量。
+  final Map<String, _PendingDoc> _pendingDidChange = {};
 
   bool get running => _process != null;
 
@@ -66,7 +70,8 @@ class LspClient {
       workingDirectory: rootPath,
     );
     _rootUri = Uri.file(rootPath).toString();
-    _process!.stdout.transform(utf8.decoder).listen(_onData);
+    _stdoutSub?.cancel();
+    _stdoutSub = _process!.stdout.listen(_onBytes);
     // ignore stderr to avoid blocking
     _process!.stderr.drain<void>();
     await _request('initialize', {
@@ -176,10 +181,32 @@ class LspClient {
   }
 
   Future<void> stop() async {
-    _process?.kill(ProcessSignal.sigterm);
+    try {
+      await _stdoutSub?.cancel();
+    } catch (_) {}
+    _stdoutSub = null;
+    _byteBuf.clear();
+    final proc = _process;
     _process = null;
+    if (proc != null) {
+      try {
+        proc.kill(ProcessSignal.sigterm);
+      } catch (_) {}
+      try {
+        // 先关 stdin 再等退出：server 依赖 stdin EOF 优雅退出，避免子进程僵睡。
+        await proc.stdin.close();
+      } catch (_) {}
+      try {
+        await proc.exitCode.timeout(const Duration(seconds: 3));
+      } catch (_) {
+        try {
+          proc.kill(ProcessSignal.sigkill);
+        } catch (_) {}
+      }
+    }
     _initialized = false;
     _openedDocs.clear();
+    _pendingDidChange.clear();
     for (final c in _pending.values) {
       if (!c.isCompleted) c.completeError(StateError('LSP stopped'));
     }
@@ -247,6 +274,60 @@ class LspClient {
     return _parseLocations(result);
   }
 
+  /// hover：返回纯文本提示（类型/签名/文档注释），失败返回 null。
+  Future<String?> hover({
+    required String filePath,
+    required int line,
+    required int character,
+  }) async {
+    if (!_initialized) return null;
+    final result = await _request('textDocument/hover', {
+      'textDocument': {'uri': Uri.file(filePath).toString()},
+      'position': {'line': line, 'character': character},
+    });
+    if (result is! Map) return null;
+    final contents = result['contents'];
+    final out = StringBuffer();
+    void collect(dynamic v) {
+      if (v == null) return;
+      if (v is String) {
+        if (v.trim().isNotEmpty) out.writeln(v);
+        return;
+      }
+      if (v is Map) {
+        // MarkedString: {language, value}；MarkedContents: [{name?|language?|value?}]
+        if (v['value'] is String) {
+          final t = '${v['language'] ?? v['kind'] ?? ''}'.isEmpty
+              ? '${v['value']}'
+              : '```${v['language'] ?? ''}\n${v['value']}\n```';
+          if (t.trim().isNotEmpty) out.writeln(t);
+          return;
+        }
+        if (v['name'] is String && v['value'] is String) {
+          out.writeln('${v['name']}:\n${v['value']}');
+          return;
+        }
+        return;
+      }
+      if (v is List) {
+        for (final item in v) {
+          collect(item);
+        }
+      }
+    }
+    if (contents is Map && contents['kind'] != null) {
+      final kind = '${contents['kind']}';
+      final value = contents['value'];
+      if (value is String && value.trim().isNotEmpty) {
+        out.writeln(kind == 'markdown' ? value : value.trim());
+      }
+    } else {
+      collect(contents);
+    }
+    final text = out.toString().trim();
+    return text.isEmpty ? null : text;
+  }
+
   List<LspLocation> _parseLocations(dynamic result) {
     final locations = <LspLocation>[];
     final items = result is List ? result : (result == null ? [] : [result]);
@@ -297,24 +378,40 @@ class LspClient {
     _process?.stdin.add([...header, ...bytes]);
   }
 
-  void _onData(String chunk) {
-    _buffer.write(chunk);
+  void _onBytes(List<int> chunk) {
+    _byteBuf.addAll(chunk);
     while (true) {
-      final text = _buffer.toString();
-      final headerEnd = text.indexOf('\r\n\r\n');
+      // 头部是 ASCII，在字节流里找 \r\n\r\n。
+      var headerEnd = -1;
+      for (var i = 0; i + 3 < _byteBuf.length; i++) {
+        if (_byteBuf[i] == 13 &&
+            _byteBuf[i + 1] == 10 &&
+            _byteBuf[i + 2] == 13 &&
+            _byteBuf[i + 3] == 10) {
+          headerEnd = i;
+          break;
+        }
+      }
       if (headerEnd < 0) return;
-      final header = text.substring(0, headerEnd);
-      final match = RegExp(r'Content-Length:\s*(\d+)', caseSensitive: false).firstMatch(header);
+      final header =
+          ascii.decode(_byteBuf.sublist(0, headerEnd), allowInvalid: true);
+      final match = RegExp(r'Content-Length:\s*(\d+)', caseSensitive: false)
+          .firstMatch(header);
       if (match == null) {
-        _buffer.clear();
+        _byteBuf.clear();
         return;
       }
       final length = int.parse(match.group(1)!);
       final bodyStart = headerEnd + 4;
-      if (text.length < bodyStart + length) return;
-      final body = text.substring(bodyStart, bodyStart + length);
-      _buffer.clear();
-      _buffer.write(text.substring(bodyStart + length));
+      if (_byteBuf.length < bodyStart + length) return;
+      final bodyBytes = _byteBuf.sublist(bodyStart, bodyStart + length);
+      _byteBuf.removeRange(0, bodyStart + length);
+      String body;
+      try {
+        body = utf8.decode(bodyBytes);
+      } catch (_) {
+        continue;
+      }
       try {
         final msg = jsonDecode(body) as Map<String, dynamic>;
         final id = msg['id'];
@@ -386,4 +483,107 @@ class LspClient {
         return DiagnosticSeverity.hint;
     }
   }
+
+  /// 抽测文档最后同步版本，供增量 didChange（大到小的 row 暂不维护）。
+  final Map<String, String> _lastSyncedText = {};
+  final Map<String, int> _lastSyncedVersion = {};
+
+  /// 增量 didChange：大文件只发差异区间，小文件整文档下发，节流防击键轰炸。
+  void didChangeIncremental(
+    String filePath,
+    String newText, {
+    required int version,
+    String languageId = 'plaintext',
+    Duration throttle = const Duration(milliseconds: 300),
+  }) {
+    if (!_initialized) return;
+    if (!_openedDocs.contains(filePath)) {
+      didOpen(filePath, languageId, newText, version: version);
+      return;
+    }
+    final prevText = _lastSyncedText[filePath];
+    final prevVer = _lastSyncedVersion[filePath];
+    if (prevText == null || prevVer == null) {
+      _lastSyncedText[filePath] = newText;
+      _lastSyncedVersion[filePath] = version;
+      didChange(filePath, newText,
+          version: version, languageId: languageId);
+      return;
+    }
+    final shared = _commonPrefix(prevText, newText);
+    final suffix = _commonSuffix(prevText, newText, shared);
+    final oldMid = prevText.substring(shared, prevText.length - suffix);
+    final newMid = newText.substring(shared, newText.length - suffix);
+    if (prevText == newText) return;
+    final startLine = _lineOf(prevText, shared);
+    final startChar = shared - _lastLineStart(prevText, shared);
+    _sendNotification('textDocument/didChange', {
+      'textDocument': {
+        'uri': Uri.file(filePath).toString(),
+        'version': version,
+      },
+      'contentChanges': [
+        {
+          'range': {
+            'start': {'line': startLine, 'character': startChar},
+            'end': _positionOf(prevText, prevText.length - suffix),
+          },
+          'rangeLength': oldMid.length,
+          'text': newMid,
+        },
+      ],
+    });
+    _lastSyncedText[filePath] = newText;
+    _lastSyncedVersion[filePath] = version;
+  }
+
+  static int _commonPrefix(String a, String b) {
+    final n = a.length < b.length ? a.length : b.length;
+    var i = 0;
+    while (i < n && a.codeUnitAt(i) == b.codeUnitAt(i)) {
+      i++;
+    }
+    return i;
+  }
+
+  static int _commonSuffix(String a, String b, int prefixLimit) {
+    var i = 0;
+    while (i < (a.length - prefixLimit) &&
+        i < (b.length - prefixLimit)) {
+      if (a.codeUnitAt(a.length - 1 - i) != b.codeUnitAt(b.length - 1 - i)) {
+        break;
+      }
+      i++;
+    }
+    return i;
+  }
+
+  static int _lineOf(String text, int offset) {
+    var n = 0;
+    for (var i = 0; i < offset && i < text.length; i++) {
+      if (text.codeUnitAt(i) == 10) n++;
+    }
+    return n;
+  }
+
+  static int _lastLineStart(String text, int offset) {
+    for (var i = offset - 1; i >= 0; i--) {
+      if (text.codeUnitAt(i) == 10) return i + 1;
+    }
+    return 0;
+  }
+
+  static Map<String, dynamic> _positionOf(String text, int offset) {
+    return {
+      'line': _lineOf(text, offset),
+      'character': offset - _lastLineStart(text, offset),
+    };
+  }
+}
+
+/// didChange 增量节流暂存：未实现定时器时仅占位，防误删。
+class _PendingDoc {
+  _PendingDoc(this.text, this.version);
+  final String text;
+  final int version;
 }

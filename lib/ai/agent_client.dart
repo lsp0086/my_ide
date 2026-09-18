@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 import 'provider_config.dart';
+import 'stream_budget.dart';
 
 class AgentToolCall {
   AgentToolCall({
@@ -26,6 +27,7 @@ class AgentStreamEvent {
     this.promptTokens,
     this.completionTokens,
     this.totalTokens,
+    this.responseId,
   });
 
   final String? content;
@@ -35,6 +37,8 @@ class AgentStreamEvent {
   final int? promptTokens;
   final int? completionTokens;
   final int? totalTokens;
+  /// Responses 多轮复用：response.completed 里服务端的 response.id。
+  final String? responseId;
 }
 
 /// 流式客户端：默认 OpenAI 兼容；Anthropic 走独立 Messages 路径，不改动原 OpenAI 逻辑。
@@ -42,7 +46,18 @@ class AgentClient {
   AgentClient({http.Client? httpClient, this.maxRetries = 5})
       : _http = httpClient ?? http.Client();
 
-  final http.Client _http;
+  http.Client _http;
+  bool _aborted = false;
+
+  /// 中断当前流式请求：关闭底层连接，在用流会立即报错结束，
+  /// Runner 捕获后按“用户已中断”收尾，不再空转浪费 token。
+  void abort() {
+    _aborted = true;
+    try {
+      _http.close();
+    } catch (_) {}
+    _http = http.Client();
+  }
 
   /// 非 2xx 时的额外重试次数（不含首次）。默认 5；0 表示不重试。
   int maxRetries;
@@ -50,82 +65,71 @@ class AgentClient {
   /// 对齐 Continue：相对 apiBase 拼对话端点。
   String chatUrl(AiProviderConfig provider) => provider.chatUrl;
 
-  /// 发送流式请求：状态码非 2xx 时静默重试，始终复用初次 body/headers；
-  /// 全部失败后再抛出最后一次错误。
-  Future<http.StreamedResponse> _sendWithRetry(http.Request seed) async {
+  /// OpenAI reasoning_effort 白名单：仅 low/medium/high 透传，其它映射 medium 防 400。
+  static String? openAiEffort(AiModelOption model) {
+    if (!model.supportsThinking) return null;
+    final level = (model.thinkingLevel ?? '').trim();
+    if (level.isEmpty) return null;
+    switch (level) {
+      case 'low':
+      case 'medium':
+      case 'high':
+        return level;
+      default:
+        return 'medium';
+    }
+  }
+
+  /// 发送流式请求：仅 429/5xx/网络错重试+指数退避，401/400 直接抛；
+  /// abort 后不再重试，始终复用初次 body/headers；全部失败后抛出最后一次错误。
+  Future<http.StreamedResponse> _sendWithRetry(
+    http.Request seed, {
+    StreamBudget? budget,
+  }) async {
+    final limit = budget ?? StreamBudget();
     final rounds = maxRetries < 0 ? 0 : maxRetries;
     Object? lastError;
     for (var attempt = 0; attempt <= rounds; attempt++) {
+      if (_aborted) throw StateError('请求已被用户中断');
       final req = http.Request(seed.method, seed.url);
       req.headers.addAll(seed.headers);
       req.bodyBytes = seed.bodyBytes;
       try {
-        final response = await _http.send(req);
+        final response = await _http.send(req).timeout(limit.connectTimeout);
         if (response.statusCode >= 200 && response.statusCode < 300) {
+          _aborted = false;
           return response;
         }
-        final err = await response.stream.bytesToString();
+        final err = await _readErrorBody(response.stream, limit);
         lastError = Exception('HTTP ${response.statusCode}: $err');
-        // 非 2xx：未用尽重试则继续，不把中间错误抛给上层
+        // 401/400 为请求错误，重试无意义，直接抛。
+        if (response.statusCode == 401 ||
+            response.statusCode == 400 ||
+            response.statusCode == 403 ||
+            response.statusCode == 404) {
+          break;
+        }
         if (attempt >= rounds) break;
+        // 429/5xx 指数退避：400ms 起步，上限 5s。
+        final backoff =
+            Duration(milliseconds: (400 * (1 << attempt)).clamp(400, 5000));
+        await Future<void>.delayed(backoff);
       } catch (e) {
+        if (_aborted || e is StateError) rethrow;
         lastError = e;
         if (attempt >= rounds) break;
+        final backoff =
+            Duration(milliseconds: (400 * (1 << attempt)).clamp(400, 5000));
+        await Future<void>.delayed(backoff);
       }
     }
     throw lastError ?? Exception('HTTP 请求失败');
   }
 
-  List<Map<String, dynamic>> buildTools() {
-    return [
-      {
-        'type': 'function',
-        'function': {
-          'name': 'read_file',
-          'description': '读取工作区内文本文件内容。path 为相对路径。',
-          'parameters': {
-            'type': 'object',
-            'properties': {
-              'path': {'type': 'string'},
-            },
-            'required': ['path'],
-          },
-        },
-      },
-      {
-        'type': 'function',
-        'function': {
-          'name': 'write_file',
-          'description': '写入或覆盖工作区内文本文件。path 为相对路径。',
-          'parameters': {
-            'type': 'object',
-            'properties': {
-              'path': {'type': 'string'},
-              'content': {'type': 'string'},
-            },
-            'required': ['path', 'content'],
-          },
-        },
-      },
-      {
-        'type': 'function',
-        'function': {
-          'name': 'edit_file',
-          'description':
-              '精确文本替换。oldText 必须完全一致。执行前会弹窗请用户确认。',
-          'parameters': {
-            'type': 'object',
-            'properties': {
-              'path': {'type': 'string'},
-              'oldText': {'type': 'string'},
-              'newText': {'type': 'string'},
-            },
-            'required': ['path', 'oldText', 'newText'],
-          },
-        },
-      },
-    ];
-  }
+  /// 兼容保留：真源已迁移到 AgentToolSchemas.base()，此处不再维护定义。
+  /// 仅返回空列表，避免旧调用方误用过时子集；新代码请直接用 AgentToolSchemas。
+  @Deprecated('改用 AgentToolSchemas.base()，此处仅兼容保留')
+  List<Map<String, dynamic>> buildTools() => const [];
 
   Stream<AgentStreamEvent> streamChat({
     required AiProviderConfig provider,
@@ -149,6 +153,7 @@ class AgentClient {
     required List<Map<String, dynamic>> messages,
     List<Map<String, dynamic>>? tools,
     bool toolChoiceAuto = true,
+    String? previousResponseId,
   }) {
     if (provider.isAnthropic) {
       return _streamAnthropic(
@@ -156,6 +161,17 @@ class AgentClient {
         model: model,
         messages: messages,
         tools: tools,
+      );
+    }
+    if (provider.isResponses) {
+      return _streamResponses(
+        provider: provider,
+        model: model,
+        messages: messages,
+        tools: tools,
+        previousResponseId: provider.responsesPreviousResponse
+            ? previousResponseId
+            : null,
       );
     }
     return _streamOpenAi(
@@ -186,33 +202,23 @@ class AgentClient {
       body['tools'] = tools;
       if (toolChoiceAuto) body['tool_choice'] = 'auto';
     }
-    if (model.supportsThinking &&
-        model.thinkingLevel != null &&
-        model.thinkingLevel!.isNotEmpty) {
-      body['reasoning_effort'] = model.thinkingLevel;
+    final effort = AgentClient.openAiEffort(model);
+    if (effort != null) {
+      body['reasoning_effort'] = effort;
     }
 
     final request = http.Request('POST', url);
     request.headers['Content-Type'] = 'application/json';
     request.headers['Accept'] = 'text/event-stream';
-    final key = AiProviderConfig.normalizeApiKey(provider.token);
-    if (key.isNotEmpty) {
-      request.headers['Authorization'] = 'Bearer $key';
-    }
+    request.headers.addAll(provider.authHeaders());
     request.body = jsonEncode(body);
 
     // 非 2xx 静默重试，始终复用上面这份初次请求内容
     final response = await _sendWithRetry(request);
 
+    final budget = StreamBudget();
     final toolBuffers = <int, Map<String, dynamic>>{};
-    var buffer = '';
-    await for (final chunk in response.stream.transform(utf8.decoder)) {
-      buffer += chunk;
-      while (true) {
-        final idx = buffer.indexOf('\n');
-        if (idx < 0) break;
-        var line = buffer.substring(0, idx).trimRight();
-        buffer = buffer.substring(idx + 1);
+    await for (var line in _sseLines(response.stream, budget)) {
         if (line.isEmpty) continue;
         if (line.startsWith('data:')) {
           line = line.substring(5).trimLeft();
@@ -269,6 +275,7 @@ class AgentClient {
                 if (fn['arguments'] != null) {
                   buf['arguments'] =
                       '${buf['arguments'] ?? ''}${fn['arguments']}';
+                  budget.checkToolArgs('${buf['arguments']}'.length);
                 }
               }
             }
@@ -276,13 +283,208 @@ class AgentClient {
         } catch (_) {
           // 忽略非 JSON 行
         }
-      }
     }
     for (final entry in toolBuffers.entries) {
       final buf = entry.value;
       yield AgentStreamEvent(
         toolCall: AgentToolCall(
           id: '${buf['id'] ?? 'call_${entry.key}'}',
+          name: '${buf['name'] ?? ''}',
+          arguments: _parseArgs('${buf['arguments'] ?? '{}'}'),
+        ),
+      );
+    }
+    yield AgentStreamEvent(done: true);
+  }
+
+  /// OpenAI Responses API：内部 OpenAI 风格 messages/tools 转成 responses input/tools。
+  /// 端点 `{apiBase}/responses`，流式 SSE 事件按 `type` 分流文本/推理/工具/用量。
+  Stream<AgentStreamEvent> _streamResponses({
+    required AiProviderConfig provider,
+    required AiModelOption model,
+    required List<Map<String, dynamic>> messages,
+    List<Map<String, dynamic>>? tools,
+    bool toolChoiceAuto = true,
+    String? previousResponseId,
+  }) async* {
+    final url = Uri.parse(provider.responsesUrl);
+    final body = <String, dynamic>{
+      'model': model.id,
+      'input': _toResponsesInput(messages),
+      'stream': true,
+    };
+    // previous_response_id 与完整历史互斥：有 id 时调用方必须只传入增量 input。
+    if (previousResponseId != null && previousResponseId.isNotEmpty) {
+      body['previous_response_id'] = previousResponseId;
+    }
+    final responsesTools = _toResponsesTools(
+      tools,
+      webSearch: provider.responsesWebSearch,
+      codeInterpreter: provider.responsesCodeInterpreter,
+    );
+    if (responsesTools.isNotEmpty) {
+      body['tools'] = responsesTools;
+      final choice = provider.responsesToolChoice.trim().toLowerCase();
+      if (!toolChoiceAuto || choice == 'none' || choice == 'required') {
+        body['tool_choice'] =
+            choice == 'none' || choice == 'required' ? choice : 'auto';
+      } else if (toolChoiceAuto) {
+        body['tool_choice'] = 'auto';
+      }
+    }
+    final effort = _responsesEffort(model);
+    if (effort != null) {
+      body['reasoning'] = {'effort': effort};
+    }
+    // 后台长任务：服务端异步执行，客户端按流式收结果，不改 Runner 轮询逻辑。
+    if (provider.responsesBackground) {
+      body['background'] = true;
+    }
+
+    final request = http.Request('POST', url);
+    request.headers['Content-Type'] = 'application/json';
+    request.headers['Accept'] = 'text/event-stream';
+    request.headers.addAll(provider.authHeaders());
+    request.body = jsonEncode(body);
+
+    final response = await _sendWithRetry(request);
+
+    // output_index -> {call_id, name, arguments}
+    final budget = StreamBudget();
+    final toolBuffers = <int, Map<String, dynamic>>{};
+    await for (var line in _sseLines(response.stream, budget)) {
+        if (line.isEmpty) continue;
+        if (line.startsWith(':')) continue;
+        if (line.startsWith('event:')) continue;
+        if (line.startsWith('data:')) {
+          line = line.substring(5).trimLeft();
+        }
+        if (line == '[DONE]') {
+          for (final entry in toolBuffers.entries) {
+            final buf = entry.value;
+            if ('${buf['name'] ?? ''}'.isEmpty) continue;
+            yield AgentStreamEvent(
+              toolCall: AgentToolCall(
+                id: '${buf['call_id'] ?? buf['id'] ?? 'call_${entry.key}'}',
+                name: '${buf['name'] ?? ''}',
+                arguments: _parseArgs('${buf['arguments'] ?? '{}'}'),
+              ),
+            );
+          }
+          yield AgentStreamEvent(done: true);
+          return;
+        }
+        Map<String, dynamic> data;
+        try {
+          data = jsonDecode(line) as Map<String, dynamic>;
+        } catch (_) {
+          continue;
+        }
+        final type = '${data['type'] ?? ''}';
+        if (type == 'response.output_text.delta') {
+          final delta = data['delta'];
+          if (delta is String && delta.isNotEmpty) {
+            yield AgentStreamEvent(content: delta);
+          }
+          continue;
+        }
+        if (type.contains('reasoning') && type.endsWith('.delta')) {
+          final delta = data['delta'];
+          if (delta is String && delta.isNotEmpty) {
+            yield AgentStreamEvent(reasoning: delta);
+          }
+          continue;
+        }
+        if (type == 'response.function_call_arguments.delta') {
+          final index = (data['output_index'] as num?)?.toInt() ?? 0;
+          final buf = toolBuffers.putIfAbsent(
+              index, () => {'arguments': ''});
+          final delta = data['delta'];
+          if (delta is String) {
+            buf['arguments'] = '${buf['arguments'] ?? ''}$delta';
+            budget.checkToolArgs('${buf['arguments']}'.length);
+          }
+          continue;
+        }
+        if (type == 'response.output_item.added') {
+          final item = data['item'] as Map<String, dynamic>?;
+          if (item != null && '${item['type']}' == 'function_call') {
+            final index = (data['output_index'] as num?)?.toInt() ?? 0;
+            toolBuffers[index] = {
+              'call_id': '${item['call_id'] ?? item['id'] ?? 'call_$index'}',
+              'name': '${item['name'] ?? ''}',
+              'arguments': '${item['arguments'] ?? ''}',
+            };
+          }
+          continue;
+        }
+        if (type == 'response.output_item.done') {
+          final item = data['item'] as Map<String, dynamic>?;
+          if (item != null && '${item['type']}' == 'function_call') {
+            final index = (data['output_index'] as num?)?.toInt() ?? 0;
+            final buf = toolBuffers.remove(index);
+            final name =
+                '${item['name'] ?? buf?['name'] ?? ''}';
+            if (name.isEmpty) continue;
+            final argsRaw =
+                '${item['arguments'] ?? buf?['arguments'] ?? '{}'}';
+            yield AgentStreamEvent(
+              toolCall: AgentToolCall(
+                id:
+                    '${item['call_id'] ?? item['id'] ?? buf?['call_id'] ?? 'call_$index'}',
+                name: name,
+                arguments: _parseArgs(argsRaw),
+              ),
+            );
+          }
+          continue;
+        }
+        if (type == 'response.completed' || type == 'response.incomplete') {
+          final resp = data['response'] as Map<String, dynamic>?;
+          final usage = resp?['usage'] as Map<String, dynamic>?;
+          final respId = resp?['id'] is String
+              ? resp!['id'] as String
+              : (data['response_id'] is String
+                  ? data['response_id'] as String
+                  : null);
+          if (usage != null) {
+            yield AgentStreamEvent(
+              promptTokens:
+                  (usage['input_tokens'] as num?)?.toInt(),
+              completionTokens:
+                  (usage['output_tokens'] as num?)?.toInt(),
+              totalTokens: (usage['total_tokens'] as num?)?.toInt(),
+              responseId: respId,
+            );
+          } else if (respId != null) {
+            yield AgentStreamEvent(responseId: respId);
+          }
+          for (final entry in toolBuffers.entries) {
+            final buf = entry.value;
+            if ('${buf['name'] ?? ''}'.isEmpty) continue;
+            yield AgentStreamEvent(
+              toolCall: AgentToolCall(
+                id: '${buf['call_id'] ?? 'call_${entry.key}'}',
+                name: '${buf['name'] ?? ''}',
+                arguments: _parseArgs('${buf['arguments'] ?? '{}'}'),
+              ),
+            );
+          }
+          toolBuffers.clear();
+          yield AgentStreamEvent(done: true, responseId: respId);
+          return;
+        }
+        if (type == 'response.failed') {
+          final err = data['response'] ?? data['error'];
+          throw Exception('Responses stream error: $err');
+        }
+    }
+    for (final entry in toolBuffers.entries) {
+      final buf = entry.value;
+      if ('${buf['name'] ?? ''}'.isEmpty) continue;
+      yield AgentStreamEvent(
+        toolCall: AgentToolCall(
+          id: '${buf['call_id'] ?? 'call_${entry.key}'}',
           name: '${buf['name'] ?? ''}',
           arguments: _parseArgs('${buf['arguments'] ?? '{}'}'),
         ),
@@ -306,7 +508,14 @@ class AgentClient {
       'stream': true,
     };
     if (converted.system != null && converted.system!.isNotEmpty) {
-      body['system'] = converted.system;
+      // prompt caching：system 段打断点，历史摘要不再每轮全量计费。
+      body['system'] = [
+        {
+          'type': 'text',
+          'text': converted.system,
+          'cache_control': {'type': 'ephemeral'},
+        },
+      ];
     }
     final anthropicTools = _toAnthropicTools(tools);
     if (anthropicTools.isNotEmpty) {
@@ -320,11 +529,14 @@ class AgentClient {
         'type': 'enabled',
         'budget_tokens': _thinkingBudget(model.thinkingLevel!),
       };
-      // thinking 开启时 Anthropic 要求 temperature 默认即可；预算需小于 max_tokens
-      final budget = body['thinking']['budget_tokens'] as int;
-      final maxTokens = body['max_tokens'] as int;
+      // 预算必须小于 max_tokens：钳制到 max_tokens-1（至少 1024），不无脑 +1024 超上限。
+      var budget = body['thinking']['budget_tokens'] as int;
+      var maxTokens = body['max_tokens'] as int;
       if (budget >= maxTokens) {
-        body['max_tokens'] = budget + 1024;
+        budget = (maxTokens - 1).clamp(1024, 16000);
+        maxTokens = (budget + 1024).clamp(2048, 32000);
+        body['thinking']['budget_tokens'] = budget;
+        body['max_tokens'] = maxTokens;
       }
     }
 
@@ -332,30 +544,17 @@ class AgentClient {
     final request = http.Request('POST', url);
     request.headers['Content-Type'] = 'application/json';
     request.headers['Accept'] = 'text/event-stream';
-    final key = AiProviderConfig.normalizeApiKey(provider.token);
-    if (key.isNotEmpty) {
-      request.headers['x-api-key'] = key;
-    }
-    final ver = provider.anthropicVersion.trim().isEmpty
-        ? '2023-06-01'
-        : provider.anthropicVersion.trim();
-    request.headers['anthropic-version'] = ver;
+    request.headers.addAll(provider.authHeaders());
     request.body = jsonEncode(body);
 
     // 非 2xx 静默重试，始终复用上面这份初次请求内容
     final response = await _sendWithRetry(request);
 
     // index -> partial tool_use
+    final budget = StreamBudget();
     final toolBuffers = <int, Map<String, dynamic>>{};
     String? eventName;
-    var buffer = '';
-    await for (final chunk in response.stream.transform(utf8.decoder)) {
-      buffer += chunk;
-      while (true) {
-        final idx = buffer.indexOf('\n');
-        if (idx < 0) break;
-        var line = buffer.substring(0, idx).trimRight();
-        buffer = buffer.substring(idx + 1);
+    await for (var line in _sseLines(response.stream, budget)) {
         if (line.isEmpty) {
           eventName = null;
           continue;
@@ -417,6 +616,7 @@ class AgentClient {
                 index, () => {'id': 'tool_$index', 'name': '', 'arguments': ''});
             if (partial != null) {
               buf['arguments'] = '${buf['arguments'] ?? ''}$partial';
+              budget.checkToolArgs('${buf['arguments']}'.length);
             }
           } else if (deltaType == 'thinking_delta') {
             final thinking = delta['thinking'];
@@ -475,7 +675,6 @@ class AgentClient {
           final err = data['error'];
           throw Exception('Anthropic stream error: $err');
         }
-      }
     }
     for (final entry in toolBuffers.entries) {
       final buf = entry.value;
@@ -489,6 +688,100 @@ class AgentClient {
       );
     }
     yield AgentStreamEvent(done: true);
+  }
+
+  /// Responses input：沿用 chat messages 结构，服务端接受同形 input。
+  /// tool 结果（role=tool）转为 function_call_output，保持 call_id 关联。
+  List<Map<String, dynamic>> _toResponsesInput(
+      List<Map<String, dynamic>> messages) {
+    final out = <Map<String, dynamic>>[];
+    for (final m in messages) {
+      final role = '${m['role'] ?? ''}';
+      if (role == 'tool') {
+        out.add({
+          'type': 'function_call_output',
+          'call_id': '${m['tool_call_id'] ?? ''}',
+          'output': '${m['content'] ?? ''}',
+        });
+        continue;
+      }
+      if (role == 'assistant' && m['tool_calls'] is List) {
+        final content = m['content'];
+        if (content is String && content.isNotEmpty) {
+          out.add({'role': 'assistant', 'content': content});
+        }
+        for (final tc in (m['tool_calls'] as List)) {
+          if (tc is! Map) continue;
+          final fn = tc['function'] as Map?;
+          out.add({
+            'type': 'function_call',
+            'call_id': '${tc['id'] ?? ''}',
+            'name': '${fn?['name'] ?? ''}',
+            'arguments': '${fn?['arguments'] ?? '{}'}',
+          });
+        }
+        continue;
+      }
+      out.add(Map<String, dynamic>.from(m));
+    }
+    return out;
+  }
+
+  /// Responses tools：chat tools 的 function 体与 Responses function 结构一致，直接透传。
+  /// 另按供应商开关追加内置 web_search / code_interpreter（默认关闭保持旧行为）。
+  List<Map<String, dynamic>> _toResponsesTools(
+    List<Map<String, dynamic>>? tools, {
+    bool webSearch = false,
+    bool codeInterpreter = false,
+  }) {
+    final out = <Map<String, dynamic>>[];
+    if (webSearch) out.add({'type': 'web_search'});
+    if (codeInterpreter) {
+      out.add({
+        'type': 'code_interpreter',
+        'container': {'type': 'auto'},
+      });
+    }
+    for (final t in (tools ?? const <Map<String, dynamic>>[])) {
+      final fn = t['function'] as Map<String, dynamic>?;
+      if (fn != null) {
+        out.add({
+          'type': 'function',
+          'name': '${fn['name'] ?? ''}',
+          'description': '${fn['description'] ?? ''}',
+          'parameters': fn['parameters'] ??
+              {
+                'type': 'object',
+                'properties': <String, dynamic>{},
+              },
+        });
+        continue;
+      }
+      if (t['type'] == 'function' && t['name'] != null) {
+        out.add(Map<String, dynamic>.from(t));
+      }
+    }
+    final functions =
+        out.where((e) => '${e['name'] ?? ''}'.isNotEmpty).toList();
+    // 内置工具无 name，按 type 保留，不被上面的 name 过滤丢掉。
+    final builtins = out.where((e) =>
+        e['type'] == 'web_search' || e['type'] == 'code_interpreter');
+    return [...builtins, ...functions];
+  }
+
+  /// Responses reasoning effort 白名单：仅 low/medium/high 透传，其它映射 medium。
+  String? _responsesEffort(AiModelOption model) {
+    if (!model.supportsThinking) return null;
+    final level = (model.thinkingLevel ?? '').trim();
+    if (level.isEmpty) return null;
+    switch (level) {
+      case 'low':
+      case 'medium':
+      case 'high':
+        return level;
+      default:
+        return 'medium';
+    }
   }
 
   int _anthropicMaxTokens(AiModelOption model) {
@@ -590,8 +883,14 @@ class AgentClient {
           blocks.add({'type': 'text', 'text': content});
         } else if (content is List) {
           for (final part in content) {
-            if (part is Map && part['type'] == 'text') {
+            if (part is! Map) continue;
+            final partType = '${part['type'] ?? ''}';
+            if (partType == 'text') {
               blocks.add({'type': 'text', 'text': '${part['text'] ?? ''}'});
+            } else if (partType == 'thinking' ||
+                partType == 'redacted_thinking') {
+              // thinking 开启后多轮必须原样回传，否则必 400。
+              blocks.add(Map<String, dynamic>.from(part));
             }
           }
         }
@@ -699,6 +998,43 @@ class AgentClient {
         .firstMatch(url.trim());
     if (m == null) return null;
     return _DataUrlParts(mediaType: m.group(1)!, data: m.group(2)!);
+  }
+
+  Future<String> _readErrorBody(
+    Stream<List<int>> stream,
+    StreamBudget budget,
+  ) async {
+    final buf = StringBuffer();
+    await for (final chunk in stream.timeout(budget.connectTimeout)) {
+      buf.write(utf8.decode(chunk, allowMalformed: true));
+      if (buf.length >= budget.maxErrorBytes) break;
+    }
+    return budget.clipError(buf.toString());
+  }
+
+  Stream<String> _sseLines(
+    Stream<List<int>> byteStream,
+    StreamBudget budget,
+  ) async* {
+    var buffer = '';
+    await for (final chunk in withIdleTimeout(byteStream, budget.idleTimeout)
+        .timeout(budget.totalDeadline)) {
+      budget.addBytes(chunk.length);
+      buffer += utf8.decode(chunk, allowMalformed: true);
+      budget.checkBuffer(buffer.length);
+      while (true) {
+        final idx = buffer.indexOf('\n');
+        if (idx < 0) break;
+        final line = buffer.substring(0, idx).trimRight();
+        buffer = buffer.substring(idx + 1);
+        budget.checkLine(line.length);
+        yield line;
+      }
+    }
+    if (buffer.isNotEmpty) {
+      budget.checkLine(buffer.length);
+      yield buffer.trimRight();
+    }
   }
 
   Map<String, dynamic> _parseArgs(String raw) {

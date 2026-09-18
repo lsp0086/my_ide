@@ -9,7 +9,75 @@ import 'package:path_provider/path_provider.dart';
 
 
 
-/// Zed 式：把语言服务下发到应用支持目录，不污染系统全局。
+/// 跨平台解压：不依赖 unzip/gzip 命令。
+class ArchiveExtract {
+  static Future<void> gzipFile(String gzPath, String outPath) =>
+      _extractGzip(gzPath, outPath);
+
+  static Future<void> zipFile(String zipPath, String destDir) =>
+      _extractZip(zipPath, destDir);
+}
+
+Future<void> _extractGzip(String gzPath, String outPath) async {
+  final bytes = await File(gzPath).readAsBytes();
+  final decoded = gzip.decode(bytes);
+  await File(outPath).writeAsBytes(decoded, flush: true);
+}
+
+Future<void> _extractZip(String zipPath, String destDir) async {
+  final bytes = await File(zipPath).readAsBytes();
+  if (bytes.length < 22) throw StateError('zip 过小');
+  var eocd = bytes.length - 22;
+  while (eocd >= 0) {
+    if (bytes[eocd] == 0x50 &&
+        bytes[eocd + 1] == 0x4b &&
+        bytes[eocd + 2] == 0x05 &&
+        bytes[eocd + 3] == 0x06) {
+      break;
+    }
+    eocd--;
+  }
+  if (eocd < 0) throw StateError('找不到 zip 目录');
+  final count = bytes[eocd + 10] | (bytes[eocd + 11] << 8);
+  var offset = bytes[eocd + 16] |
+      (bytes[eocd + 17] << 8) |
+      (bytes[eocd + 18] << 16) |
+      (bytes[eocd + 19] << 24);
+  for (var i = 0; i < count; i++) {
+    if (offset + 46 > bytes.length) break;
+    if (bytes[offset] != 0x50 || bytes[offset + 1] != 0x4b) break;
+    final method = bytes[offset + 10] | (bytes[offset + 11] << 8);
+    final comp = bytes[offset + 20] |
+        (bytes[offset + 21] << 8) |
+        (bytes[offset + 22] << 16) |
+        (bytes[offset + 23] << 24);
+    final nameLen = bytes[offset + 28] | (bytes[offset + 29] << 8);
+    final extraLen = bytes[offset + 30] | (bytes[offset + 31] << 8);
+    final commentLen = bytes[offset + 32] | (bytes[offset + 33] << 8);
+    final localOff = bytes[offset + 42] |
+        (bytes[offset + 43] << 8) |
+        (bytes[offset + 44] << 16) |
+        (bytes[offset + 45] << 24);
+    final name = utf8.decode(bytes.sublist(offset + 46, offset + 46 + nameLen));
+    offset += 46 + nameLen + extraLen + commentLen;
+    if (name.endsWith('/')) continue;
+    final localExtra = bytes[localOff + 28] | (bytes[localOff + 29] << 8);
+    final dataStart = localOff + 30 + nameLen + localExtra;
+    final payload = bytes.sublist(dataStart, dataStart + comp);
+    final List<int> out;
+    if (method == 0) {
+      out = payload;
+    } else if (method == 8) {
+      out = ZLibDecoder(raw: true).convert(payload);
+    } else {
+      throw StateError('不支持的 zip 压缩方法 $method');
+    }
+    final dest = File(p.join(destDir, name));
+    await dest.parent.create(recursive: true);
+    await dest.writeAsBytes(out, flush: true);
+  }
+}
+
 class BundledLanguageServers {
   BundledLanguageServers._();
   static final BundledLanguageServers instance = BundledLanguageServers._();
@@ -539,18 +607,12 @@ class BundledLanguageServers {
     );
 
     if (assetFileName.endsWith('.zip')) {
-      final unzip = await Process.run(
-        'unzip',
-        ['-o', downloadPath, '-d', dir.path],
-        workingDirectory: dir.path,
-      );
-      if (unzip.exitCode != 0) {
-        _lastError[id] = _stderrOf(unzip).isEmpty
-            ? 'unzip 失败（exit ${unzip.exitCode}）'
-            : _stderrOf(unzip);
+      try {
+        await _extractZip(downloadPath, dir.path);
+      } catch (e) {
+        _lastError[id] = '解压 zip 失败：$e';
         return null;
       }
-      // 从解压结果里找同名二进制
       final found = dir
           .listSync(recursive: true)
           .whereType<File>()
@@ -566,12 +628,10 @@ class BundledLanguageServers {
       }
       await File(found.first).copy(outPath);
     } else {
-      // .gz 单文件
-      final tmpGz = '$outPath.gz';
-      await File(downloadPath).copy(tmpGz);
-      final d = await Process.run('gzip', ['-df', tmpGz]);
-      if (d.exitCode != 0 || !File(outPath).existsSync()) {
-        _lastError[id] = '解压失败：${_stderrOf(d)}';
+      try {
+        await _extractGzip(downloadPath, outPath);
+      } catch (e) {
+        _lastError[id] = '解压 gzip 失败：$e';
         return null;
       }
     }
@@ -731,14 +791,16 @@ class BundledLanguageServers {
         '${Platform.environment['HOME']}/go/bin',
       ],
     ];
-    final current = (env['PATH'] ?? '').split(':').where((e) => e.isNotEmpty);
+    final current = (env['PATH'] ?? '')
+        .split(Platform.isWindows ? ';' : ':')
+        .where((e) => e.isNotEmpty);
     final merged = <String>[
       ...extras.where((e) => e.isNotEmpty && Directory(e).existsSync()),
       ...current,
     ];
     // 去重保序
     final seen = <String>{};
-    env['PATH'] = merged.where((e) => seen.add(e)).join(':');
+    env['PATH'] = merged.where((e) => seen.add(e)).join(Platform.isWindows ? ';' : ':');
     return env;
   }
 
@@ -791,7 +853,7 @@ class BundledLanguageServers {
     final env = _toolEnv();
     for (final name in names) {
       // 先扫补齐后的 PATH 绝对路径，避免依赖 which 的环境。
-      for (final dir in (env['PATH'] ?? '').split(':')) {
+      for (final dir in (env['PATH'] ?? '').split(Platform.isWindows ? ';' : ':')) {
         if (dir.isEmpty) continue;
         final candidate = p.join(dir, name);
         if (File(candidate).existsSync()) return candidate;

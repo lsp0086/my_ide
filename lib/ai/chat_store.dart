@@ -40,6 +40,7 @@ class ChatRevertPlan {
 }
 
 /// 对话落盘：gzip 压缩 JSON，读取时自动解压（兼容旧明文 .json）。
+/// 写盘原子化：tmp 写盘 + flush + rename，避免崩溃写坏对话文件。
 class _ChatCodec {
   static const gzipMagic0 = 0x1f;
   static const gzipMagic1 = 0x8b;
@@ -47,7 +48,17 @@ class _ChatCodec {
   static Future<void> writeJsonFile(File file, Map<String, dynamic> json) async {
     final raw = utf8.encode(jsonEncode(json));
     final compressed = gzip.encode(raw);
-    await file.writeAsBytes(compressed, flush: true);
+    final tmp = File('${file.path}.tmp');
+    await tmp.writeAsBytes(compressed, flush: true);
+    try {
+      await tmp.rename(file.path);
+    } catch (_) {
+      // rename 跨盘失败时回退直接覆盖
+      await file.writeAsBytes(compressed, flush: true);
+      try {
+        await tmp.delete();
+      } catch (_) {}
+    }
   }
 
   static Future<Map<String, dynamic>?> readJsonFile(File file) async {
@@ -83,6 +94,11 @@ class ChatMessage {
     this.completionTokens,
     this.contextUsed,
     this.contextLimit,
+    this.durationMs,
+    this.stopReason,
+    this.images = const [],
+    this.responsesResponseId,
+    this.userEditedFiles = const [],
   }) : id = id ?? DateTime.now().millisecondsSinceEpoch.toString();
 
   final String id;
@@ -98,6 +114,16 @@ class ChatMessage {
   /// 本轮结束时上下文占用（估算或服务端 prompt_tokens）
   final int? contextUsed;
   final int? contextLimit;
+  /// 本轮耗时毫秒（从用户发送到助手落盘）
+  final int? durationMs;
+  /// 本轮终止原因：完成 / 用户中断 / 达到最大步数 / 请求失败 / 被拒绝跳过
+  final String? stopReason;
+  /// 用户上传图片 dataUrl 列表：多轮历史重建时保留，不再丢失。
+  final List<String> images;
+  /// Responses 多轮复用：上一轮 response.id，落盘后下轮直透 previous_response_id。
+  final String? responsesResponseId;
+  /// 用户在编辑器中手动保存的文件，独立于 AI 工具改动 files。
+  final List<String> userEditedFiles;
 
   int? get totalTokens {
     if (promptTokens == null && completionTokens == null) return null;
@@ -124,6 +150,12 @@ class ChatMessage {
         if (completionTokens != null) 'completionTokens': completionTokens,
         if (contextUsed != null) 'contextUsed': contextUsed,
         if (contextLimit != null) 'contextLimit': contextLimit,
+        if (durationMs != null) 'durationMs': durationMs,
+        if (stopReason != null) 'stopReason': stopReason,
+        if (images.isNotEmpty) 'images': images,
+        if (responsesResponseId != null)
+          'responsesResponseId': responsesResponseId,
+        if (userEditedFiles.isNotEmpty) 'userEditedFiles': userEditedFiles,
       };
 
   static ChatMessage fromJson(Map<String, dynamic> j) => ChatMessage(
@@ -139,6 +171,13 @@ class ChatMessage {
         completionTokens: (j['completionTokens'] as num?)?.toInt(),
         contextUsed: (j['contextUsed'] as num?)?.toInt(),
         contextLimit: (j['contextLimit'] as num?)?.toInt(),
+        durationMs: (j['durationMs'] as num?)?.toInt(),
+        stopReason: j['stopReason'] as String?,
+        images: ((j['images'] as List?) ?? []).map((e) => '$e').toList(),
+        responsesResponseId: j['responsesResponseId'] as String?,
+        userEditedFiles: ((j['userEditedFiles'] as List?) ?? [])
+            .map((e) => '$e')
+            .toList(),
       );
 
   ChatMessage copyWith({
@@ -148,6 +187,11 @@ class ChatMessage {
     String? beforeVersionId,
     String? afterVersionId,
     bool clearAfterVersionId = false,
+    int? durationMs,
+    String? stopReason,
+    List<String>? images,
+    String? responsesResponseId,
+    List<String>? userEditedFiles,
   }) {
     return ChatMessage(
       id: id,
@@ -164,6 +208,11 @@ class ChatMessage {
       completionTokens: completionTokens,
       contextUsed: contextUsed,
       contextLimit: contextLimit,
+      durationMs: durationMs ?? this.durationMs,
+      stopReason: stopReason ?? this.stopReason,
+      images: images ?? this.images,
+      responsesResponseId: responsesResponseId ?? this.responsesResponseId,
+      userEditedFiles: userEditedFiles ?? this.userEditedFiles,
     );
   }
 }
@@ -174,6 +223,7 @@ class ChatSession {
     required this.title,
     List<ChatMessage>? messages,
     this.compactionSummary,
+    this.compactionUntilMessageId,
     this.compactedAt,
     this.compactedDropped = 0,
   }) : messages = messages ?? [];
@@ -184,6 +234,8 @@ class ChatSession {
 
   /// 压缩过的记忆文本：旧消息的摘要，新对话可继承
   String? compactionSummary;
+  /// 摘要已覆盖到的最后一条消息 id；之后、最近窗口之前的消息下次滚动压缩。
+  String? compactionUntilMessageId;
   DateTime? compactedAt;
   int compactedDropped;
 
@@ -193,6 +245,8 @@ class ChatSession {
         'messages': messages.map((e) => e.toJson()).toList(),
         if (compactionSummary != null)
           'compactionSummary': compactionSummary,
+        if (compactionUntilMessageId != null)
+          'compactionUntilMessageId': compactionUntilMessageId,
         if (compactedAt != null)
           'compactedAt': compactedAt!.toIso8601String(),
         'compactedDropped': compactedDropped,
@@ -206,6 +260,7 @@ class ChatSession {
             .map((e) => ChatMessage.fromJson(Map<String, dynamic>.from(e)))
             .toList(),
         compactionSummary: j['compactionSummary'] as String?,
+        compactionUntilMessageId: j['compactionUntilMessageId'] as String?,
         compactedAt:
             DateTime.tryParse('${j['compactedAt'] ?? ''}'),
         compactedDropped:
@@ -230,8 +285,14 @@ class ChatStore extends ChangeNotifier {
   String? _activeId;
   String? _projectRoot;
   int _loadGeneration = 0;
+  String? _lastSaveError;
+  bool _dirty = false;
+  int _saveRetries = 0;
 
   List<ChatSession> get sessions => List.unmodifiable(_sessions);
+  String? get lastSaveError => _lastSaveError;
+  bool get dirty => _dirty;
+  int get saveRetries => _saveRetries;
   ChatSession? get active {
     for (final s in _sessions) {
       if (s.id == _activeId) return s;
@@ -297,13 +358,10 @@ class ChatStore extends ChangeNotifier {
     _activeId = id;
     // 作废进行中的 loadForProject，避免异步读盘结果冲掉刚建的会话。
     _loadGeneration++;
-    // 先刷新 UI，再落盘；避免 _save 抛错导致对话页不显示。
     notifyListeners();
     try {
       await _save(session);
-    } catch (_) {
-      // 内存会话已可用；落盘失败不阻塞对话页。
-    }
+    } catch (_) {}
   }
 
   void select(String id) {
@@ -314,6 +372,23 @@ class ChatStore extends ChangeNotifier {
   Future<void> addMessage(ChatMessage msg) async {
     final s = active;
     if (s == null) return;
+    await addMessageTo(sessionId: s.id, msg: msg);
+  }
+
+  /// 按 sessionId 写入，避免运行中切换 active 会话导致消息错位。
+  /// AgentRunner 必须使用此方法，而不是依赖 active。
+  Future<void> addMessageTo({
+    required String sessionId,
+    required ChatMessage msg,
+  }) async {
+    ChatSession? s;
+    for (final e in _sessions) {
+      if (e.id == sessionId) {
+        s = e;
+        break;
+      }
+    }
+    if (s == null) return;
     s.messages.add(msg);
     if (s.messages.length == 1 && msg.role == 'user') {
       s.title = msg.text.length > 18 ? '${msg.text.substring(0, 18)}…' : msg.text;
@@ -322,6 +397,48 @@ class ChatStore extends ChangeNotifier {
     try {
       await _save(s);
     } catch (_) {}
+  }
+
+  ChatSession? sessionById(String sessionId) {
+    for (final s in _sessions) {
+      if (s.id == sessionId) return s;
+    }
+    return null;
+  }
+
+  /// 把用户手动保存的文件附着到当前对话最后一个气泡。
+  /// 当前会话为空时回退到最近一个有消息的会话；没有任何消息则跳过，
+  /// 避免为了文件改动伪造一条用户/助手对话。
+  Future<bool> attachUserEditedFile(String absolutePath) async {
+    final root = _projectRoot;
+    if (root == null || absolutePath.trim().isEmpty) return false;
+    var relativePath = p.normalize(p.relative(absolutePath, from: root));
+    if (relativePath == '.' || relativePath.startsWith('..')) return false;
+    relativePath = relativePath.replaceAll('\\', '/');
+
+    ChatSession? target = active;
+    if (target == null || target.messages.isEmpty) {
+      target = null;
+      for (final session in _sessions) {
+        if (session.messages.isNotEmpty) {
+          target = session;
+          break;
+        }
+      }
+    }
+    if (target == null || target.messages.isEmpty) return false;
+
+    final index = target.messages.length - 1;
+    final message = target.messages[index];
+    if (message.userEditedFiles.contains(relativePath)) return true;
+    target.messages[index] = message.copyWith(
+      userEditedFiles: [...message.userEditedFiles, relativePath],
+    );
+    notifyListeners();
+    try {
+      await _save(target);
+    } catch (_) {}
+    return true;
   }
 
   /// 规划回退：只作用于本会话轮次；版本节点由调用方按 versionIdsToDrop 合并删除。
@@ -452,6 +569,7 @@ class ChatStore extends ChangeNotifier {
     required String sessionId,
     required String summary,
     required int droppedCount,
+    String? untilMessageId,
   }) async {
     ChatSession? session;
     for (final s in _sessions) {
@@ -462,6 +580,9 @@ class ChatStore extends ChangeNotifier {
     }
     if (session == null) return;
     session.compactionSummary = summary;
+    if (untilMessageId != null) {
+      session.compactionUntilMessageId = untilMessageId;
+    }
     session.compactedAt = DateTime.now();
     session.compactedDropped = droppedCount;
     await _save(session);
@@ -476,6 +597,7 @@ class ChatStore extends ChangeNotifier {
             'chatId': sessionId,
             'summary': summary,
             'droppedCount': droppedCount,
+            if (untilMessageId != null) 'untilMessageId': untilMessageId,
             'updatedAt': DateTime.now().toIso8601String(),
           }),
         );
@@ -497,31 +619,51 @@ class ChatStore extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// 单文件回退后：从消息的 files 列表去掉该路径；若版本节点已删则清 afterVersionId。
-  Future<void> removeFileFromMessage({
+  /// 单文件/单块回退后：从消息的 files 列表去掉该路径；若版本节点已删则清 afterVersionId。
+  /// 若该轮因此没有文件改动，则同时删除该轮对话（含提问）。
+  /// 返回 true 表示该轮对话已被删除。
+  Future<bool> removeFileFromMessage({
     required String sessionId,
     required String messageId,
     required String relativePath,
     bool versionRemoved = false,
   }) async {
     final si = _sessions.indexWhere((e) => e.id == sessionId);
-    if (si < 0) return;
+    if (si < 0) return false;
     final session = _sessions[si];
     final mi = session.messages.indexWhere((e) => e.id == messageId);
-    if (mi < 0) return;
+    if (mi < 0) return false;
     final msg = session.messages[mi];
-    final nextFiles =
-        msg.files.where((f) => f != relativePath && !f.endsWith('/$relativePath')).toList();
-    // 兼容相对路径直接相等
+    final nextFiles = msg.files
+        .where((f) => f != relativePath && !f.endsWith('/$relativePath'))
+        .toList();
     final cleaned = nextFiles
-        .where((f) => f != relativePath)
+        .where((f) => f != relativePath && !f.endsWith('.DS_Store'))
         .toList(growable: false);
+    if (cleaned.isEmpty) {
+      var turnStart = mi;
+      while (turnStart > 0 && session.messages[turnStart - 1].role != 'user') {
+        turnStart--;
+      }
+      if (turnStart > 0 && session.messages[turnStart - 1].role == 'user') {
+        turnStart--;
+      }
+      session.messages.removeRange(turnStart, mi + 1);
+      if (session.messages.isEmpty) {
+        await deleteChat(session.id);
+      } else {
+        await _save(session);
+        notifyListeners();
+      }
+      return true;
+    }
     session.messages[mi] = msg.copyWith(
       files: cleaned,
-      clearAfterVersionId: versionRemoved || cleaned.isEmpty,
+      clearAfterVersionId: versionRemoved,
     );
     await _save(session);
     notifyListeners();
+    return false;
   }
 
   /// 仅删除全部对话（含磁盘 chats），保留版本与 memory。
@@ -583,16 +725,42 @@ class ChatStore extends ChangeNotifier {
 
   Future<void> _save(ChatSession s) async {
     final root = _projectRoot;
-    if (root == null) return;
-    try {
-      final dir = Directory(p.join(root, '.my_ide', 'chats'));
-      await _ensureDir(dir);
-      await _ChatCodec.writeJsonFile(
-        File(p.join(dir.path, '${s.id}.json')),
-        s.toJson(),
-      );
-    } catch (_) {
-      // 项目目录权限不足时静默忽略，内存会话仍可用。
+    if (root == null) {
+      _dirty = true;
+      _lastSaveError = '未打开项目，对话未落盘';
+      notifyListeners();
+      throw StateError(_lastSaveError!);
+    }
+    Object? lastError;
+    for (var attempt = 0; attempt < 3; attempt++) {
+      try {
+        final dir = Directory(p.join(root, '.my_ide', 'chats'));
+        await _ensureDir(dir);
+        await _ChatCodec.writeJsonFile(
+          File(p.join(dir.path, '${s.id}.json')),
+          s.toJson(),
+        );
+        _dirty = false;
+        _lastSaveError = null;
+        _saveRetries = 0;
+        notifyListeners();
+        return;
+      } catch (e) {
+        lastError = e;
+        _saveRetries = attempt + 1;
+        await Future<void>.delayed(Duration(milliseconds: 40 * (attempt + 1)));
+      }
+    }
+    _dirty = true;
+    _lastSaveError = '对话未落盘：$lastError';
+    notifyListeners();
+    throw StateError(_lastSaveError!);
+  }
+
+  Future<void> flushUnsaved() async {
+    if (!_dirty) return;
+    for (final s in _sessions) {
+      await _save(s);
     }
   }
 
@@ -612,6 +780,12 @@ class ChatStore extends ChangeNotifier {
       if (m.files.isNotEmpty) {
         buf.writeln('\n操作文件：');
         for (final f in m.files) {
+          buf.writeln('- $f');
+        }
+      }
+      if (m.userEditedFiles.isNotEmpty) {
+        buf.writeln('\n用户改动：');
+        for (final f in m.userEditedFiles) {
           buf.writeln('- $f');
         }
       }

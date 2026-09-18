@@ -2,11 +2,11 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
+import 'dart:ui' show AppExitResponse;
 
 import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:path/path.dart' as p;
@@ -17,16 +17,19 @@ import '../ai/agent_runner.dart';
 import '../ai/chat_store.dart';
 import '../ai/provider_config.dart';
 import '../diagnostics/diagnostics_store.dart';
+import '../diagnostics/ide_diagnostic.dart';
 import '../i18n/app_strings.dart';
 import '../lsp/bundled_language_servers.dart';
 import '../lsp/language_servers.dart';
 import '../lsp/symbol_index.dart';
 import '../settings/settings_store.dart';
+import '../skills/skill_manager.dart';
 import '../theme/app_colors.dart';
 import '../theme/shortcut_controller.dart';
 import '../theme/theme_controller.dart';
 import '../version/checkpoint_store.dart';
 import '../workspace/code_language.dart';
+import '../workspace/window_launcher.dart';
 import '../workspace/workspace_controller.dart';
 import '../workspace/workspace_search.dart';
 import 'code_editor.dart';
@@ -34,7 +37,10 @@ import 'code_highlight.dart';
 import 'file_preview.dart';
 import 'diff_view.dart';
 import 'problems_panel.dart';
+import 'mcp_settings_panel.dart';
 import 'provider_settings_card.dart';
+import 'skills_settings_panel.dart';
+import 'stats_panel.dart';
 import 'version_panel.dart';
 import 'webdav_panel.dart';
 
@@ -42,7 +48,7 @@ class _SaveFileIntent extends Intent {
   const _SaveFileIntent();
 }
 
-enum ActivityItem { explorer, search, problems, git, webdav, settings }
+enum ActivityItem { explorer, search, problems, git, stats, webdav, settings }
 
 class IdeShell extends StatefulWidget {
   const IdeShell({super.key});
@@ -69,20 +75,49 @@ class _IdeShellState extends State<IdeShell> with WidgetsBindingObserver {
       _showExplorer = true;
     });
   }
+
   double _explorerWidth = 240;
   double _aiWidth = 360;
   bool _showExplorer = true;
 
+  /// Problems 面板“AI 修复”下发的指令，由 _AiPanel 消费后自动发送。
+  String? _aiFixPrompt;
+  int _aiFixNonce = 0;
+
   String? _lastChatRoot;
   int _lastSyncedOpenGeneration = -1;
+  VoidCallback? _cancelWindowReady;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _workspace = WorkspaceController();
+    _workspace.onExternalConflict = _promptExternalConflicts;
     _workspace.loadTree();
     _workspace.addListener(_syncChatsWithWorkspace);
+    // 新进程直达项目（新窗口打开）：首帧打开，命中项目锁则提示“该项目已经打开”。
+    final initial = InitialOpenPath.value;
+    if (initial != null && initial.isNotEmpty) {
+      InitialOpenPath.value = null;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _openFolderGuarded(initial);
+      });
+    }
+    // 原生多窗口直达：新窗口 ready 后经通道拉取 pendingOpenPath。
+    // 同进程第二 Engine 不重跑 main，main(args) 不可靠，必须走这条。
+    _cancelWindowReady = WindowLauncher.onWindowReady((path) async {
+      if (!mounted) return;
+      await _openFolderGuarded(path);
+    });
+    // 通道注册可能晚于原生 windowReady 推送，首帧再主动拉一次兜底。
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      final pending = await WindowLauncher.takePendingOpenPath();
+      if (!mounted || pending == null || pending.isEmpty) return;
+      await _openFolderGuarded(pending);
+    });
   }
 
   @override
@@ -92,22 +127,181 @@ class _IdeShellState extends State<IdeShell> with WidgetsBindingObserver {
     }
   }
 
+  /// 关闭窗口拦截：对话进行中弹确认框，避免“UI 丢了但对话逻辑被杀掉”。
+  /// 用户确认后才放行退出，否则取消关闭，对话在后台继续跑。
+  @override
+  Future<AppExitResponse> didRequestAppExit() async {
+    if (!_aiRunning) return AppExitResponse.exit;
+    if (!mounted) return AppExitResponse.cancel;
+    final exitNow = await _showCodexConfirmDialog(
+      context: context,
+      title: '对话进行中',
+      message: '当前有 AI 对话正在运行。关闭窗口会中断对话逻辑。\n\n确定仍要关闭吗？',
+      confirmLabel: '仍要关闭',
+      destructive: true,
+    );
+    if (exitNow == true) {
+      try {
+        await ChatScope.of(context).flushUnsaved();
+      } catch (_) {}
+      return AppExitResponse.exit;
+    }
+    if (mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('已取消关闭，对话继续进行中')));
+    }
+    return AppExitResponse.cancel;
+  }
+
+  /// AI 是否正在跑：_AiPanel 的 Runner 状态，跨面板共享判断。
+  bool get _aiRunning => _aiRunnerRunning;
+
+  static bool _aiRunnerRunning = false;
+
+  static void _setAiRunnerRunning(bool value) {
+    _aiRunnerRunning = value;
+  }
+
+  /// 对话进行中禁止切换/关闭项目：UI 可丢，对话逻辑不能丢。
+  static bool guardAiRunning(BuildContext context, {String? message}) {
+    if (!_aiRunnerRunning) return false;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message ?? '对话进行中，完成后才能继续操作')));
+    return true;
+  }
+
+  Future<void> _openFolderGuarded(String path) async {
+    if (guardAiRunning(context, message: '对话进行中，完成后才能切换项目')) {
+      return;
+    }
+    final err = await _workspace.openFolder(path);
+    if (!mounted) return;
+    if (err != null && err.isNotEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(err)));
+    }
+  }
+
+  Future<void> _pickAndOpenFolderGuarded() async {
+    if (guardAiRunning(context, message: '对话进行中，完成后才能切换项目')) {
+      return;
+    }
+    final err = await _workspace.pickAndOpenFolder();
+    if (!mounted) return;
+    if (err != null && err.isNotEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(err)));
+    }
+  }
+
+  Future<void> _closeWorkspaceGuarded() async {
+    if (guardAiRunning(context, message: '对话进行中，完成后才能关闭项目')) {
+      return;
+    }
+    await _workspace.closeWorkspace();
+    if (!mounted) return;
+    ChatScope.of(context).loadForProject(null);
+    CheckpointScope.of(context).bindProject(null);
+  }
+
+  /// 新窗口打开：另起进程（各系统通用），不抢当前窗口的项目锁。
+  /// 目标项目若已被其它窗口锁定，新窗口内会提示“该项目已经打开”。
+  Future<void> _openInNewWindowGuarded() async {
+    if (guardAiRunning(context, message: '对话进行中，完成后才能开新窗口')) {
+      return;
+    }
+    final ok = await WindowLauncher.pickAndOpenInNewWindow();
+    if (!mounted || ok) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          '打开新窗口失败${WindowLauncher.lastError == null ? '' : '：${WindowLauncher.lastError}'}',
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openRecentInNewWindowGuarded(String path) async {
+    if (guardAiRunning(context, message: '对话进行中，完成后才能开新窗口')) {
+      return;
+    }
+    final ok = await WindowLauncher.openNewWindow(path);
+    if (!mounted || ok) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          '打开新窗口失败${WindowLauncher.lastError == null ? '' : '：${WindowLauncher.lastError}'}',
+        ),
+      ),
+    );
+  }
+
   Future<void> _onAppResumed() async {
     if (!_workspace.hasWorkspace) return;
     final changed = await _workspace.scanExternalChangesOnResume();
     if (!mounted || changed.isEmpty) return;
+    // 脏冲突只弹提示，由用户逐个抉择；干净改动才记版本。
+    final clean = changed
+        .where((path) => !_workspace.hasConflict(path))
+        .toList();
+    if (clean.isEmpty) return;
     try {
-      final names = changed.map(p.basename).take(3).join(', ');
-      final deletedCount = changed.where((path) => !File(path).existsSync()).length;
-      final prefix = deletedCount == changed.length
+      final names = clean.map(p.basename).take(3).join(', ');
+      final deletedCount = clean
+          .where((path) => !File(path).existsSync())
+          .length;
+      final prefix = deletedCount == clean.length
           ? '外部删除'
           : deletedCount > 0
-              ? '外部修改/删除'
-              : '外部修改';
+          ? '外部修改/删除'
+          : '外部修改';
       await CheckpointScope.of(context).checkpoint(
-        message: '$prefix $names${changed.length > 3 ? ' 等' : ''}',
+        message: '$prefix $names${clean.length > 3 ? ' 等' : ''}',
         kind: 'user-edit',
       );
+    } catch (_) {}
+  }
+
+  bool _promptingConflict = false;
+
+  /// 脏冲突提示：磁盘已变但本地有未保存缓冲，三选一：合并/保留本地/载入磁盘。
+  /// 合并=未改行用磁盘+改过行保留本地；绝不静默覆盖丢编辑。
+  Future<void> _promptExternalConflicts(List<String> conflicts) async {
+    if (!mounted || conflicts.isEmpty || _promptingConflict) return;
+    _promptingConflict = true;
+    try {
+      for (final path in List<String>.from(conflicts)) {
+        if (!mounted || !_workspace.hasConflict(path)) continue;
+        final name = p.basename(path);
+        final choice = await _showConflictChoiceDialog(
+          context: context,
+          title: '外部修改冲突',
+          message:
+              '「$name」在外部被修改，但你有未保存的编辑。\n\n合并：未改动行用磁盘，改过行保留本地并插冲突标记；\n保留本地：下次保存覆盖磁盘；\n载入磁盘：丢弃本地未保存内容（仍可 Ctrl+Z 回退）。',
+        );
+        if (!mounted) return;
+        if (choice == null) continue;
+        if (choice == 0) {
+          await _workspace.resolveConflict(path, keepLocal: true);
+        } else if (choice == 1) {
+          await _workspace.forceReload(path);
+        } else {
+          // 合并：编辑器侧按 _savedContent 三向合并，控制器只清冲突+更新戳。
+          await _workspace.resolveConflict(path, keepLocal: true);
+          _requestEditorMerge(path);
+        }
+      }
+    } finally {
+      _promptingConflict = false;
+    }
+  }
+
+  void _requestEditorMerge(String path) {
+    try {
+      final state = _editorKey.currentState;
+      if (state != null && state.path == path) {
+        state.mergeDiskPreservingLocal();
+      }
     } catch (_) {}
   }
 
@@ -128,14 +322,23 @@ class _IdeShellState extends State<IdeShell> with WidgetsBindingObserver {
     CheckpointScope.of(context).bindProject(root);
     // 打开/切换项目后后台建符号索引（内置多语言跳转）
     SymbolIndex.instance.bindProject(root);
+    // 刷新项目级 Skills
+    // ignore: unawaited_futures
+    SkillManager.instance.ensureLoaded(workspaceRoot: root);
     DiagnosticsScope.maybeOf(context)?.clearAll();
     if (root != null) {
       SettingsStore.instance.addRecentProject(root);
+      // 同步原生窗口标题：Dock/窗口菜单按项目名区分窗口。
+      WindowLauncher.setWindowTitle(p.basename(root));
+    } else {
+      WindowLauncher.setWindowTitle('my_ide');
     }
   }
 
   @override
   void dispose() {
+    _cancelWindowReady?.call();
+    _cancelWindowReady = null;
     WidgetsBinding.instance.removeObserver(this);
     _workspace.removeListener(_syncChatsWithWorkspace);
     _workspace.dispose();
@@ -145,7 +348,6 @@ class _IdeShellState extends State<IdeShell> with WidgetsBindingObserver {
   Future<void> _saveActiveFile() async {
     final editor = _editorKey.currentState;
     if (editor == null) return;
-    final path = editor.path;
     final ok = await editor.save();
     if (!mounted || !ok) return;
     ScaffoldMessenger.of(context).showSnackBar(
@@ -154,13 +356,6 @@ class _IdeShellState extends State<IdeShell> with WidgetsBindingObserver {
         duration: Duration(milliseconds: 900),
       ),
     );
-    // 显式保存也记一次 user-edit（无变化则跳过）。
-    try {
-      await CheckpointScope.of(context).checkpoint(
-        message: '用户编辑 ${p.basename(path)}',
-        kind: 'user-edit',
-      );
-    } catch (_) {}
   }
 
   void _onActivityTap(ActivityItem item) {
@@ -178,6 +373,7 @@ class _IdeShellState extends State<IdeShell> with WidgetsBindingObserver {
         _active = item;
         if (item == ActivityItem.settings ||
             item == ActivityItem.git ||
+            item == ActivityItem.stats ||
             item == ActivityItem.webdav) {
           _showExplorer = false;
         }
@@ -190,6 +386,28 @@ class _IdeShellState extends State<IdeShell> with WidgetsBindingObserver {
       (_active == ActivityItem.explorer ||
           _active == ActivityItem.search ||
           _active == ActivityItem.problems);
+
+  /// Problems 面板“AI 修复”：拼修复指令下发给 _AiPanel 自动发送。
+  void _requestAiFix(List<IdeDiagnostic> diagnostics) {
+    if (diagnostics.isEmpty) return;
+    final root = _workspace.rootPath;
+    final buf = StringBuffer('请修复以下诊断问题，修完后调用 get_diagnostics 确认：\n');
+    for (final d in diagnostics.take(20)) {
+      final rel = root != null && p.isWithin(root, d.filePath)
+          ? p.relative(d.filePath, from: root)
+          : d.filePath;
+      buf.writeln(
+        '- $rel:${d.displayLine}:${d.displayColumn} [${d.severity.name}] ${d.message}',
+      );
+    }
+    setState(() {
+      _aiFixPrompt = buf.toString().trimRight();
+      _aiFixNonce++;
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('已下发 ${diagnostics.length} 个诊断给 AI 修复')),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -247,32 +465,40 @@ class _IdeShellState extends State<IdeShell> with WidgetsBindingObserver {
                                     final sideVisible = _sidePanelVisible;
                                     final explorerW = sideVisible
                                         ? _explorerWidth.clamp(
-                                            _minExplorer, total * 0.4)
+                                            _minExplorer,
+                                            total * 0.4,
+                                          )
                                         : 0.0;
-                                    final aiW =
-                                        _aiWidth.clamp(_minAi, total * 0.45);
-                                    final used = (sideVisible
+                                    final aiW = _aiWidth.clamp(
+                                      _minAi,
+                                      total * 0.45,
+                                    );
+                                    final used =
+                                        (sideVisible
                                             ? explorerW + _gap + 4
                                             : 0) +
                                         aiW +
                                         _gap +
                                         4;
-                                    final editorW = (total - used)
-                                        .clamp(_minEditor, double.infinity);
+                                    final editorW = (total - used).clamp(
+                                      _minEditor,
+                                      double.infinity,
+                                    );
                                     // 侧栏在 search/problems 时仍切换内容；explorer 才显示文件树。
-                                    final sideChild = _active ==
-                                            ActivityItem.search
+                                    final sideChild =
+                                        _active == ActivityItem.search
                                         ? _SearchPanel(workspace: _workspace)
                                         : _active == ActivityItem.problems
-                                            ? ProblemsPanel(
-                                                diagnostics:
-                                                    DiagnosticsScope.of(
-                                                        context),
-                                                workspace: _workspace,
-                                              )
-                                            : _FileExplorerPanel(
-                                                workspace: _workspace,
-                                              );
+                                        ? ProblemsPanel(
+                                            diagnostics: DiagnosticsScope.of(
+                                              context,
+                                            ),
+                                            workspace: _workspace,
+                                            onAiFix: _requestAiFix,
+                                          )
+                                        : _FileExplorerPanel(
+                                            workspace: _workspace,
+                                          );
 
                                     return Row(
                                       children: [
@@ -286,9 +512,9 @@ class _IdeShellState extends State<IdeShell> with WidgetsBindingObserver {
                                               setState(() {
                                                 _explorerWidth =
                                                     (_explorerWidth + dx).clamp(
-                                                  _minExplorer,
-                                                  total * 0.45,
-                                                );
+                                                      _minExplorer,
+                                                      total * 0.45,
+                                                    );
                                               });
                                             },
                                           ),
@@ -310,8 +536,10 @@ class _IdeShellState extends State<IdeShell> with WidgetsBindingObserver {
                                         _ResizeHandle(
                                           onDrag: (dx) {
                                             setState(() {
-                                              _aiWidth = (_aiWidth - dx)
-                                                  .clamp(_minAi, total * 0.5);
+                                              _aiWidth = (_aiWidth - dx).clamp(
+                                                _minAi,
+                                                total * 0.5,
+                                              );
                                             });
                                           },
                                         ),
@@ -321,7 +549,10 @@ class _IdeShellState extends State<IdeShell> with WidgetsBindingObserver {
                                             child: _AiPanel(
                                               onOpenSettings: () =>
                                                   _onActivityTap(
-                                                      ActivityItem.settings),
+                                                    ActivityItem.settings,
+                                                  ),
+                                              aiFixPrompt: _aiFixPrompt,
+                                              aiFixNonce: _aiFixNonce,
                                             ),
                                           ),
                                         ),
@@ -341,6 +572,14 @@ class _IdeShellState extends State<IdeShell> with WidgetsBindingObserver {
                                   Positioned.fill(
                                     child: _Panel(
                                       child: VersionPanel(
+                                        onClose: _closeOverlayPanel,
+                                      ),
+                                    ),
+                                  ),
+                                if (_active == ActivityItem.stats)
+                                  Positioned.fill(
+                                    child: _Panel(
+                                      child: StatsPanel(
                                         onClose: _closeOverlayPanel,
                                       ),
                                     ),
@@ -486,8 +725,15 @@ class _ActivityBar extends StatelessWidget {
           _ActivityIcon(
             icon: Icons.account_tree_outlined,
             selected: active == ActivityItem.git,
-            tooltip: '源代码管理',
+            tooltip: '查看节点',
             onTap: () => onTap(ActivityItem.git),
+          ),
+          const SizedBox(height: 4),
+          _ActivityIcon(
+            icon: Icons.grid_on_rounded,
+            selected: active == ActivityItem.stats,
+            tooltip: '贡献统计',
+            onTap: () => onTap(ActivityItem.stats),
           ),
           const SizedBox(height: 4),
           _ActivityIcon(
@@ -535,8 +781,8 @@ class _ActivityIconState extends State<_ActivityIcon> {
     final bg = widget.selected
         ? colors.accentSoft
         : _hover
-            ? colors.panelHover
-            : Colors.transparent;
+        ? colors.panelHover
+        : Colors.transparent;
 
     return Tooltip(
       message: widget.tooltip,
@@ -567,10 +813,7 @@ class _ActivityIconState extends State<_ActivityIcon> {
 }
 
 class _PanelHeader extends StatelessWidget {
-  const _PanelHeader({
-    required this.title,
-    this.trailing,
-  });
+  const _PanelHeader({required this.title, this.trailing});
 
   final String title;
   final Widget? trailing;
@@ -582,9 +825,7 @@ class _PanelHeader extends StatelessWidget {
       height: 44,
       padding: const EdgeInsets.symmetric(horizontal: 14),
       decoration: BoxDecoration(
-        border: Border(
-          bottom: BorderSide(color: colors.border),
-        ),
+        border: Border(bottom: BorderSide(color: colors.border)),
       ),
       child: Row(
         children: [
@@ -628,99 +869,61 @@ class _SettingsPanel extends StatefulWidget {
 }
 
 class _SettingsPanelState extends State<_SettingsPanel> {
-  final ScrollController _scrollController = ScrollController();
-  final Map<String, GlobalKey> _sectionKeys = {};
   String _activeSectionId = 'language';
 
   List<_SettingsNavItem> _navItems(AppStrings t) => [
-        _SettingsNavItem(
-          id: 'language',
-          label: t.language,
-          icon: Icons.translate_rounded,
-        ),
-        _SettingsNavItem(
-          id: 'appearance',
-          label: t.appearance,
-          icon: Icons.palette_outlined,
-        ),
-        _SettingsNavItem(
-          id: 'highlight',
-          label: t.codeHighlight,
-          icon: Icons.code_rounded,
-        ),
-        _SettingsNavItem(
-          id: 'providers',
-          label: t.providers,
-          icon: Icons.cloud_outlined,
-        ),
-        const _SettingsNavItem(
-          id: 'agent',
-          label: 'Agent',
-          icon: Icons.smart_toy_outlined,
-        ),
-        const _SettingsNavItem(
-          id: 'lsp',
-          label: '语言服务器',
-          icon: Icons.hub_outlined,
-        ),
-        _SettingsNavItem(
-          id: 'clean',
-          label: t.cleanProject,
-          icon: Icons.cleaning_services_outlined,
-        ),
-      ];
+    _SettingsNavItem(
+      id: 'language',
+      label: t.language,
+      icon: Icons.translate_rounded,
+    ),
+    _SettingsNavItem(
+      id: 'appearance',
+      label: t.appearance,
+      icon: Icons.palette_outlined,
+    ),
+    _SettingsNavItem(
+      id: 'highlight',
+      label: t.codeHighlight,
+      icon: Icons.code_rounded,
+    ),
+    _SettingsNavItem(
+      id: 'providers',
+      label: t.providers,
+      icon: Icons.cloud_outlined,
+    ),
+    const _SettingsNavItem(
+      id: 'agent',
+      label: 'Agent',
+      icon: Icons.smart_toy_outlined,
+    ),
+    const _SettingsNavItem(
+      id: 'mcp',
+      label: 'MCP',
+      icon: Icons.extension_outlined,
+    ),
+    const _SettingsNavItem(
+      id: 'skills',
+      label: 'Skills',
+      icon: Icons.auto_awesome_outlined,
+    ),
+    const _SettingsNavItem(id: 'lsp', label: '语言服务器', icon: Icons.hub_outlined),
+    _SettingsNavItem(
+      id: 'clean',
+      label: t.cleanProject,
+      icon: Icons.cleaning_services_outlined,
+    ),
+  ];
 
-  GlobalKey _keyFor(String id) =>
-      _sectionKeys.putIfAbsent(id, GlobalKey.new);
-
-  void _scrollToSection(String id) {
+  void _selectSection(String id) {
+    if (_activeSectionId == id) return;
     setState(() => _activeSectionId = id);
-    // 等布局稳定后再算偏移，避免点相邻项时拿到旧坐标
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted || !_scrollController.hasClients) return;
-      final ctx = _keyFor(id).currentContext;
-      final object = ctx?.findRenderObject();
-      if (object == null) return;
-
-      final position = _scrollController.position;
-      double target;
-      try {
-        // 略低于顶部，留出一点呼吸感，避免标题贴死视口上沿
-        final revealed =
-            RenderAbstractViewport.of(object).getOffsetToReveal(object, 0.0);
-        target = revealed.offset - 16;
-      } catch (_) {
-        return;
-      }
-      target = target.clamp(
-        position.minScrollExtent,
-        position.maxScrollExtent,
-      );
-      if ((target - position.pixels).abs() < 0.5) return;
-      _scrollController.animateTo(
-        target,
-        duration: const Duration(milliseconds: 280),
-        curve: Curves.easeOutCubic,
-      );
-    });
-  }
-
-  @override
-  void dispose() {
-    _scrollController.dispose();
-    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     final colors = IdeColors.of(context);
     final t = AppStrings.of(context);
-    final settings = SettingsScope.of(context);
-    final themeController = ThemeScope.of(context);
-    final isDark = themeController.isDark;
-    final styles = ThemeController.preferredStyles
-        .where((item) => item.isDark == isDark)
-        .toList(growable: false);
     final navItems = _navItems(t);
 
     return Column(
@@ -734,8 +937,11 @@ class _SettingsPanelState extends State<_SettingsPanel> {
                   tooltip: '关闭',
                   visualDensity: VisualDensity.compact,
                   onPressed: widget.onClose,
-                  icon: Icon(Icons.close_rounded,
-                      size: 16, color: colors.textMuted),
+                  icon: Icon(
+                    Icons.close_rounded,
+                    size: 16,
+                    color: colors.textMuted,
+                  ),
                 ),
         ),
         Expanded(
@@ -745,290 +951,16 @@ class _SettingsPanelState extends State<_SettingsPanel> {
               _SettingsNavRail(
                 items: navItems,
                 activeId: _activeSectionId,
-                onSelect: _scrollToSection,
+                onSelect: _selectSection,
               ),
               VerticalDivider(width: 1, color: colors.border),
               Expanded(
-                child: LayoutBuilder(
-                  builder: (context, constraints) {
-                    // 底部留出接近一整屏，保证最后一项也能尽量顶对齐
-                    final bottomSpacer =
-                        (constraints.maxHeight - 48).clamp(120.0, 900.0);
-                    // 用 Column 一次性构建全部区块，避免 ListView 懒加载导致 key 尚未挂载
-                    return SingleChildScrollView(
-                      controller: _scrollController,
-                      padding: const EdgeInsets.fromLTRB(24, 20, 24, 24),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: [
-                    AnimatedBuilder(
-                      animation: settings,
-                      builder: (context, _) {
-                        return Column(
-                          crossAxisAlignment: CrossAxisAlignment.stretch,
-                          children: [
-                            KeyedSubtree(
-                              key: _keyFor('language'),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.stretch,
-                                children: [
-                                  _SettingsSectionTitle(
-                                    title: t.language,
-                                    desc: t.languageDesc,
-                                  ),
-                                  const SizedBox(height: 12),
-                                  _SettingsCard(
-                                    child: Row(
-                                      children: [
-                                        Expanded(
-                                          child: _LanguageChoice(
-                                            label: '中文',
-                                            selected:
-                                                settings.localeCode == 'zh',
-                                            onTap: () =>
-                                                settings.setLocaleCode('zh'),
-                                          ),
-                                        ),
-                                        const SizedBox(width: 10),
-                                        Expanded(
-                                          child: _LanguageChoice(
-                                            label: 'English',
-                                            selected:
-                                                settings.localeCode == 'en',
-                                            onTap: () =>
-                                                settings.setLocaleCode('en'),
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                            const SizedBox(height: 20),
-                            KeyedSubtree(
-                              key: _keyFor('appearance'),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.stretch,
-                                children: [
-                                  _SettingsSectionTitle(
-                                    title: t.appearance,
-                                    desc: t.appearanceDesc,
-                                  ),
-                                  const SizedBox(height: 12),
-                                  Container(
-                                    padding: const EdgeInsets.all(16),
-                                    decoration: BoxDecoration(
-                                      color: colors.panelElevated,
-                                      borderRadius: BorderRadius.circular(14),
-                                      border: Border.all(color: colors.border),
-                                    ),
-                                    child: Column(
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.start,
-                                      children: [
-                                        Text(
-                                          '界面风格',
-                                          style: TextStyle(
-                                            color: colors.textPrimary,
-                                            fontSize: 14,
-                                            fontWeight: FontWeight.w600,
-                                          ),
-                                        ),
-                                        const SizedBox(height: 14),
-                                        Row(
-                                          children: [
-                                            Expanded(
-                                              child: _ThemeChoiceCard(
-                                                title: '亮色',
-                                                subtitle: 'Trae Light',
-                                                selected: !isDark,
-                                                preview: const _ThemePreview(
-                                                    dark: false),
-                                                onTap: () => themeController
-                                                    .setMode(ThemeMode.light),
-                                              ),
-                                            ),
-                                            const SizedBox(width: 12),
-                                            Expanded(
-                                              child: _ThemeChoiceCard(
-                                                title: '暗色',
-                                                subtitle: 'Trae Dark',
-                                                selected: isDark,
-                                                preview: const _ThemePreview(
-                                                    dark: true),
-                                                onTap: () => themeController
-                                                    .setMode(ThemeMode.dark),
-                                              ),
-                                            ),
-                                          ],
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                            const SizedBox(height: 20),
-                            KeyedSubtree(
-                              key: _keyFor('highlight'),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.stretch,
-                                children: [
-                                  Text(
-                                    '代码高亮',
-                                    style: TextStyle(
-                                      color: colors.textPrimary,
-                                      fontSize: 16,
-                                      fontWeight: FontWeight.w600,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 6),
-                                  Text(
-                                    '基于 re_highlight 主题，按当前界面亮暗筛选可用风格',
-                                    style: TextStyle(
-                                      color: colors.textMuted,
-                                      fontSize: 13,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 18),
-                                  Container(
-                                    padding: const EdgeInsets.all(16),
-                                    decoration: BoxDecoration(
-                                      color: colors.panelElevated,
-                                      borderRadius: BorderRadius.circular(14),
-                                      border: Border.all(color: colors.border),
-                                    ),
-                                    child: Column(
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.start,
-                                      children: [
-                                        Text(
-                                          '高亮风格',
-                                          style: TextStyle(
-                                            color: colors.textPrimary,
-                                            fontSize: 14,
-                                            fontWeight: FontWeight.w600,
-                                          ),
-                                        ),
-                                        const SizedBox(height: 14),
-                                        Wrap(
-                                          spacing: 10,
-                                          runSpacing: 10,
-                                          children: [
-                                            for (final style in styles)
-                                              _HighlightStyleChip(
-                                                label: style.label,
-                                                selected: themeController
-                                                        .highlightStyleId ==
-                                                    style.id,
-                                                onTap: () => themeController
-                                                    .setHighlightStyle(
-                                                        style.id),
-                                              ),
-                                          ],
-                                        ),
-                                        const SizedBox(height: 16),
-                                        _HighlightPreviewCard(
-                                          theme:
-                                              themeController.highlightTheme,
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ],
-                        );
-                      },
-                    ),
-                    const SizedBox(height: 20),
-                    KeyedSubtree(
-                      key: _keyFor('providers'),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: [
-                          _SettingsSectionTitle(
-                            title: t.providers,
-                            desc: t.providersDesc,
-                          ),
-                          const SizedBox(height: 12),
-                          // 供应商编辑独立于 settings 监听，避免 Token 被冲掉
-                          const _SettingsCard(
-                            child: ProviderSettingsCard(),
-                          ),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(height: 20),
-                    KeyedSubtree(
-                      key: _keyFor('agent'),
-                      child: const _AgentSettingsCard(),
-                    ),
-                    const SizedBox(height: 20),
-                    KeyedSubtree(
-                      key: _keyFor('lsp'),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: [
-                          _SettingsSectionTitle(
-                            title: '语言服务器与符号索引',
-                            desc:
-                                'Ctrl/Cmd+点击：优先 LSP → 内置多语言符号索引（ctags 风格）→ 当前文件规则。'
-                                '打开项目会自动建索引；也可在下方配置外部语言服务器路径。',
-                          ),
-                          const SizedBox(height: 12),
-                          const _SettingsCard(
-                              child: _LanguageServerSettingsCard()),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(height: 20),
-                    KeyedSubtree(
-                      key: _keyFor('clean'),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: [
-                          _SettingsSectionTitle(
-                            title: t.cleanProject,
-                            desc: t.cleanProjectDesc,
-                          ),
-                          const SizedBox(height: 12),
-                          _SettingsCard(
-                            child: Column(
-                              children: [
-                                _CleanProjectActionRow(
-                                  title: t.clearChats,
-                                  subtitle: t.clearChatsDesc,
-                                  buttonLabel: t.clearChats,
-                                  onPressed: () => _confirmClearChats(context),
-                                ),
-                                Padding(
-                                  padding:
-                                      const EdgeInsets.symmetric(vertical: 12),
-                                  child:
-                                      Divider(height: 1, color: colors.border),
-                                ),
-                                _CleanProjectActionRow(
-                                  title: t.clearProjectMemory,
-                                  subtitle: t.clearProjectMemoryDesc,
-                                  buttonLabel: t.clearProjectMemory,
-                                  destructive: true,
-                                  onPressed: () =>
-                                      _confirmClearProjectMemory(context),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    SizedBox(height: bottomSpacer),
-                        ],
-                      ),
-                    );
-                  },
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(24, 20, 24, 24),
+                  child: SingleChildScrollView(
+                    // 仅当前分区内容过长时在页内滚动，不再整页长列表滚动
+                    child: _buildActivePage(context),
+                  ),
                 ),
               ),
             ],
@@ -1038,7 +970,290 @@ class _SettingsPanelState extends State<_SettingsPanel> {
     );
   }
 
+  Widget _buildActivePage(BuildContext context) {
+    final colors = IdeColors.of(context);
+    final t = AppStrings.of(context);
+    final settings = SettingsScope.of(context);
+    final themeController = ThemeScope.of(context);
+
+    switch (_activeSectionId) {
+      case 'language':
+        return AnimatedBuilder(
+          animation: settings,
+          builder: (context, _) {
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                _SettingsSectionTitle(title: t.language, desc: t.languageDesc),
+                const SizedBox(height: 12),
+                _SettingsCard(
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: _LanguageChoice(
+                          label: '中文',
+                          selected: settings.localeCode == 'zh',
+                          onTap: () => settings.setLocaleCode('zh'),
+                          onApply: () async {
+                            await settings.setLocaleCode('zh');
+                            if (context.mounted) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(content: Text('已切换为中文')),
+                              );
+                            }
+                          },
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: _LanguageChoice(
+                          label: 'English',
+                          selected: settings.localeCode == 'en',
+                          onTap: () => settings.setLocaleCode('en'),
+                          onApply: () async {
+                            await settings.setLocaleCode('en');
+                            if (context.mounted) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                  content: Text('Switched to English'),
+                                ),
+                              );
+                            }
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            );
+          },
+        );
+      case 'appearance':
+        return AnimatedBuilder(
+          animation: Listenable.merge([settings, themeController]),
+          builder: (context, _) {
+            final dark = themeController.isDark;
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                _SettingsSectionTitle(
+                  title: t.appearance,
+                  desc: t.appearanceDesc,
+                ),
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: colors.panelElevated,
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(color: colors.border),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        '界面风格',
+                        style: TextStyle(
+                          color: colors.textPrimary,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: _ThemeChoiceCard(
+                              title: '亮色',
+                              subtitle: 'Trae Light',
+                              selected: !dark,
+                              preview: const _ThemePreview(dark: false),
+                              onTap: () =>
+                                  themeController.setMode(ThemeMode.light),
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: _ThemeChoiceCard(
+                              title: '暗色',
+                              subtitle: 'Trae Dark',
+                              selected: dark,
+                              preview: const _ThemePreview(dark: true),
+                              onTap: () =>
+                                  themeController.setMode(ThemeMode.dark),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            );
+          },
+        );
+      case 'highlight':
+        return AnimatedBuilder(
+          animation: themeController,
+          builder: (context, _) {
+            final currentStyles = ThemeController.preferredStyles
+                .where((item) => item.isDark == themeController.isDark)
+                .toList(growable: false);
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  '代码高亮',
+                  style: TextStyle(
+                    color: colors.textPrimary,
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  '基于 re_highlight 主题，按当前界面亮暗筛选可用风格',
+                  style: TextStyle(color: colors.textMuted, fontSize: 13),
+                ),
+                const SizedBox(height: 18),
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: colors.panelElevated,
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(color: colors.border),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        '高亮风格',
+                        style: TextStyle(
+                          color: colors.textPrimary,
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      Wrap(
+                        spacing: 10,
+                        runSpacing: 10,
+                        children: [
+                          for (final style in currentStyles)
+                            _HighlightStyleChip(
+                              label: style.label,
+                              selected:
+                                  themeController.highlightStyleId == style.id,
+                              onTap: () =>
+                                  themeController.setHighlightStyle(style.id),
+                            ),
+                        ],
+                      ),
+                      const SizedBox(height: 16),
+                      _HighlightPreviewCard(
+                        theme: themeController.highlightTheme,
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            );
+          },
+        );
+      case 'providers':
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            _SettingsSectionTitle(title: t.providers, desc: t.providersDesc),
+            const SizedBox(height: 12),
+            const _SettingsCard(child: ProviderSettingsCard()),
+          ],
+        );
+      case 'agent':
+        return const _AgentSettingsCard();
+      case 'mcp':
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: const [
+            _SettingsSectionTitle(
+              title: 'MCP',
+              desc: '导入并连接 Model Context Protocol 服务器；工具会自动提供给 Agent。',
+            ),
+            SizedBox(height: 12),
+            McpSettingsPanel(),
+          ],
+        );
+      case 'skills':
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: const [
+            _SettingsSectionTitle(
+              title: 'Skills',
+              desc:
+                  '兼容开源 Agent Skills（SKILL.md）。可导入通用 skill，并设置全局目录；Agent 通过 load_skill 按需加载。',
+            ),
+            SizedBox(height: 12),
+            _SettingsCard(child: SkillsSettingsPanel()),
+          ],
+        );
+      case 'lsp':
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            _SettingsSectionTitle(
+              title: '语言服务器与符号索引',
+              desc:
+                  'Ctrl/Cmd+点击：优先 LSP → 内置多语言符号索引（ctags 风格）→ 当前文件规则。'
+                  '打开项目会自动建索引；也可在下方配置外部语言服务器路径。',
+            ),
+            const SizedBox(height: 12),
+            const _SettingsCard(child: _LanguageServerSettingsCard()),
+          ],
+        );
+      case 'clean':
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            _SettingsSectionTitle(
+              title: t.cleanProject,
+              desc: t.cleanProjectDesc,
+            ),
+            const SizedBox(height: 12),
+            _SettingsCard(
+              child: Column(
+                children: [
+                  _CleanProjectActionRow(
+                    title: t.clearChats,
+                    subtitle: t.clearChatsDesc,
+                    buttonLabel: t.clearChats,
+                    onPressed: () => _confirmClearChats(context),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    child: Divider(height: 1, color: colors.border),
+                  ),
+                  _CleanProjectActionRow(
+                    title: t.clearProjectMemory,
+                    subtitle: t.clearProjectMemoryDesc,
+                    buttonLabel: t.clearProjectMemory,
+                    destructive: true,
+                    onPressed: () => _confirmClearProjectMemory(context),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        );
+      default:
+        return const SizedBox.shrink();
+    }
+  }
+
   Future<void> _confirmClearChats(BuildContext context) async {
+    if (_IdeShellState.guardAiRunning(context, message: '对话进行中，完成后才能清理对话')) {
+      return;
+    }
     final t = AppStrings.of(context);
     final ok = await _showCodexConfirmDialog(
       context: context,
@@ -1047,10 +1262,16 @@ class _SettingsPanelState extends State<_SettingsPanel> {
       confirmLabel: t.clearChats,
     );
     if (ok != true || !context.mounted) return;
+    if (_IdeShellState.guardAiRunning(context, message: '对话进行中，完成后才能清理对话')) {
+      return;
+    }
     await ChatScope.of(context).clearChats();
   }
 
   Future<void> _confirmClearProjectMemory(BuildContext context) async {
+    if (_IdeShellState.guardAiRunning(context, message: '对话进行中，完成后才能清理项目记忆')) {
+      return;
+    }
     final t = AppStrings.of(context);
     final ok = await _showCodexConfirmDialog(
       context: context,
@@ -1060,6 +1281,9 @@ class _SettingsPanelState extends State<_SettingsPanel> {
       destructive: true,
     );
     if (ok != true || !context.mounted) return;
+    if (_IdeShellState.guardAiRunning(context, message: '对话进行中，完成后才能清理项目记忆')) {
+      return;
+    }
     await ChatScope.of(context).clearAll(includeMemory: true);
     if (!context.mounted) return;
     await CheckpointScope.of(context).clearAll();
@@ -1152,8 +1376,9 @@ class _SettingsNavTileState extends State<_SettingsNavTile> {
                             ? colors.textPrimary
                             : colors.textSecondary,
                         fontSize: 12.5,
-                        fontWeight:
-                            selected ? FontWeight.w700 : FontWeight.w500,
+                        fontWeight: selected
+                            ? FontWeight.w700
+                            : FontWeight.w500,
                       ),
                     ),
                   ),
@@ -1263,7 +1488,8 @@ class _LanguageServerSettingsCardState
     final settings = SettingsStore.instance;
     final next = <String, bool?>{};
     for (final spec in kLanguageServerSpecs) {
-      final override = settings.languageServerCommand(spec.id) ??
+      final override =
+          settings.languageServerCommand(spec.id) ??
           _controllers[spec.id]?.text;
       // 状态检测不强制下发；有应用目录二进制或 PATH 即视为可用。
       // 加超时，避免某一项卡住导致按钮一直「检测中」。
@@ -1307,20 +1533,28 @@ class _LanguageServerSettingsCardState
   final Set<String> _installingIds = {};
   final Map<String, String> _installMsgs = {};
 
-  Future<void> _installBundled(String id) async {
+  Future<void> _downloadLanguagePack(LanguageServerSpec spec) async {
+    final id = spec.id;
+    if (_installingIds.contains(id)) return;
     setState(() {
       _installingIds.add(id);
       _installMsgs[id] = '正在下载到应用支持目录…';
     });
+    if (mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('正在下载 ${spec.label}…')));
+    }
     final consentId = id == 'html-via-ts' ? 'typescript' : id;
     await SettingsStore.instance.setLanguagePackConsent(consentId, true);
-    final path =
-        await BundledLanguageServers.instance.ensureInstalled(id, force: true);
+    final path = await BundledLanguageServers.instance.ensureInstalled(
+      id,
+      force: true,
+    );
     DefinitionService.instance.invalidateAvailabilityCache();
     String extra = '';
     if (path != null && (id == 'typescript' || id == 'html-via-ts')) {
-      final tss =
-          await BundledLanguageServers.instance.tsserverJsPath();
+      final tss = await BundledLanguageServers.instance.tsserverJsPath();
       if (tss == null) {
         extra = '\n警告：缺少 tsserver.js（不要用 typescript@7）';
       } else {
@@ -1328,12 +1562,16 @@ class _LanguageServerSettingsCardState
       }
     }
     if (!mounted) return;
+    final msg = path != null
+        ? '已下载：$path$extra'
+        : (BundledLanguageServers.instance.lastErrorFor(id) ?? '下载失败');
     setState(() {
       _installingIds.remove(id);
-      _installMsgs[id] = path != null
-          ? '已安装：$path$extra'
-          : (BundledLanguageServers.instance.lastErrorFor(id) ?? '安装失败');
+      _installMsgs[id] = msg;
     });
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(path != null ? '${spec.label} 已就绪' : msg)),
+    );
     await _refreshStatus();
   }
 
@@ -1374,8 +1612,9 @@ class _LanguageServerSettingsCardState
               Align(
                 alignment: Alignment.centerRight,
                 child: TextButton(
-                  onPressed:
-                      index.rootPath == null || index.indexing ? null : _rebuildIndex,
+                  onPressed: index.rootPath == null || index.indexing
+                      ? null
+                      : _rebuildIndex,
                   child: Text(index.indexing ? '索引中…' : '重建索引'),
                 ),
               ),
@@ -1404,7 +1643,7 @@ class _LanguageServerSettingsCardState
               const SizedBox(height: 4),
               Text(
                 '安装包不预置语言服务。首次打开 JS/TS · Python · Go · Rust · C/C++ 文件时会询问是否下载到应用支持目录。\n'
-                '也可在下方各条目手动「安装到应用目录」。不写系统全局，不改项目 jsconfig/tsconfig。\n'
+                '也可在下方各条目右侧点「下载」手动获取（与检测弹窗相同）。不写系统全局，不改项目 jsconfig/tsconfig。\n'
                 'JS 语义检查走 VS Code 同款 implicitProjectConfig（默认开启）。',
                 style: TextStyle(color: colors.textMuted, fontSize: 11.5),
               ),
@@ -1486,6 +1725,34 @@ class _LanguageServerSettingsCardState
                         fontFamily: 'Menlo',
                       ),
                     ),
+                    if (spec.autoInstall) ...[
+                      const SizedBox(width: 8),
+                      FilledButton.tonalIcon(
+                        style: FilledButton.styleFrom(
+                          minimumSize: Size.zero,
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 6,
+                          ),
+                          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                        ),
+                        onPressed: _installingIds.contains(spec.id)
+                            ? null
+                            : () => _downloadLanguagePack(spec),
+                        icon: Icon(
+                          _installingIds.contains(spec.id)
+                              ? Icons.hourglass_top_rounded
+                              : Icons.download_rounded,
+                          size: 15,
+                        ),
+                        label: Text(
+                          _installingIds.contains(spec.id)
+                              ? '下载中…'
+                              : (_status[spec.id] == true ? '重新下载' : '下载'),
+                          style: const TextStyle(fontSize: 12),
+                        ),
+                      ),
+                    ],
                   ],
                 ),
                 const SizedBox(height: 4),
@@ -1517,7 +1784,8 @@ class _LanguageServerSettingsCardState
                         ),
                         decoration: InputDecoration(
                           isDense: true,
-                          hintText: '可选：绝对路径覆盖，例如 /usr/local/bin/${spec.command}',
+                          hintText:
+                              '可选：绝对路径覆盖，例如 /usr/local/bin/${spec.command}',
                           hintStyle: TextStyle(
                             color: colors.textMuted,
                             fontSize: 11.5,
@@ -1525,7 +1793,9 @@ class _LanguageServerSettingsCardState
                           filled: true,
                           fillColor: colors.panelElevated,
                           contentPadding: const EdgeInsets.symmetric(
-                              horizontal: 10, vertical: 8),
+                            horizontal: 10,
+                            vertical: 8,
+                          ),
                           border: OutlineInputBorder(
                             borderRadius: BorderRadius.circular(8),
                             borderSide: BorderSide(color: colors.border),
@@ -1539,17 +1809,6 @@ class _LanguageServerSettingsCardState
                       ),
                     ),
                     const SizedBox(width: 8),
-                    if (spec.autoInstall) ...[
-                      TextButton(
-                        onPressed: _installingIds.contains(spec.id)
-                            ? null
-                            : () => _installBundled(spec.id),
-                        child: Text(
-                          _installingIds.contains(spec.id) ? '安装中…' : '安装到应用目录',
-                        ),
-                      ),
-                      const SizedBox(width: 4),
-                    ],
                     FilledButton.tonal(
                       onPressed: () => _save(spec.id),
                       child: const Text('保存'),
@@ -1586,10 +1845,7 @@ class _SettingsSectionTitle extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 6),
-        Text(
-          desc,
-          style: TextStyle(color: colors.textMuted, fontSize: 13),
-        ),
+        Text(desc, style: TextStyle(color: colors.textMuted, fontSize: 13)),
       ],
     );
   }
@@ -1632,6 +1888,8 @@ class _AgentSettingsCardState extends State<_AgentSettingsCard> {
   late String _createOutside;
   late String _delete;
   late String _command;
+  late String _mcp;
+  bool _checkpointPerTurn = true;
 
   static const _actions = <(String, String)>[
     ('auto', '自动通过'),
@@ -1644,19 +1902,26 @@ class _AgentSettingsCardState extends State<_AgentSettingsCard> {
     super.initState();
     final settings = SettingsStore.instance;
     _steps = TextEditingController(
-        text: '${settings.getInt('agentMaxSteps') ?? 45}');
+      text: '${settings.getInt('agentMaxSteps') ?? 45}',
+    );
     _context = TextEditingController(
-        text: '${settings.getInt('agentContextLimit') ?? 20}');
+      text: '${settings.getInt('agentContextLimit') ?? 20}',
+    );
     _keep = TextEditingController(
-        text: '${settings.getInt('agentCompactKeep') ?? 8}');
+      text: '${settings.getInt('agentCompactKeep') ?? 8}',
+    );
     _ratio = TextEditingController(
-        text: '${settings.getInt('agentCompactRatioPct') ?? 80}');
+      text: '${settings.getInt('agentCompactRatioPct') ?? 80}',
+    );
     _retry = TextEditingController(
-        text: '${settings.getInt('agentRetryRounds') ?? 5}');
+      text: '${settings.getInt('agentRetryRounds') ?? 5}',
+    );
     _createInside = settings.getString('approveCreateInside') ?? 'auto';
     _createOutside = settings.getString('approveCreateOutside') ?? 'ask';
     _delete = settings.getString('approveDelete') ?? 'ask';
     _command = settings.getString('approveCommand') ?? 'ask';
+    _mcp = settings.getString('approveMcp') ?? 'ask';
+    _checkpointPerTurn = settings.getBool('agentCheckpointPerTurn') ?? true;
   }
 
   @override
@@ -1685,6 +1950,9 @@ class _AgentSettingsCardState extends State<_AgentSettingsCard> {
         case 'approveCommand':
           _command = value;
           break;
+        case 'approveMcp':
+          _mcp = value;
+          break;
       }
     });
   }
@@ -1701,14 +1969,16 @@ class _AgentSettingsCardState extends State<_AgentSettingsCard> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(title,
-              style: TextStyle(
-                  color: colors.textPrimary,
-                  fontSize: 12.5,
-                  fontWeight: FontWeight.w600)),
+          Text(
+            title,
+            style: TextStyle(
+              color: colors.textPrimary,
+              fontSize: 12.5,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
           const SizedBox(height: 2),
-          Text(desc,
-              style: TextStyle(color: colors.textMuted, fontSize: 11.5)),
+          Text(desc, style: TextStyle(color: colors.textMuted, fontSize: 11.5)),
           const SizedBox(height: 6),
           Wrap(
             spacing: 6,
@@ -1753,8 +2023,7 @@ class _AgentSettingsCardState extends State<_AgentSettingsCard> {
                 child: TextField(
                   controller: _steps,
                   keyboardType: TextInputType.number,
-                  style: TextStyle(
-                      color: colors.textPrimary, fontSize: 12.5),
+                  style: TextStyle(color: colors.textPrimary, fontSize: 12.5),
                   decoration: const InputDecoration(
                     labelText: '最大步数',
                     isDense: true,
@@ -1762,8 +2031,10 @@ class _AgentSettingsCardState extends State<_AgentSettingsCard> {
                   onChanged: (v) {
                     final n = int.tryParse(v);
                     if (n != null) {
-                      SettingsStore.instance
-                          .setInt('agentMaxSteps', n.clamp(1, 100));
+                      SettingsStore.instance.setInt(
+                        'agentMaxSteps',
+                        n.clamp(1, 100),
+                      );
                     }
                   },
                 ),
@@ -1773,8 +2044,7 @@ class _AgentSettingsCardState extends State<_AgentSettingsCard> {
                 child: TextField(
                   controller: _context,
                   keyboardType: TextInputType.number,
-                  style: TextStyle(
-                      color: colors.textPrimary, fontSize: 12.5),
+                  style: TextStyle(color: colors.textPrimary, fontSize: 12.5),
                   decoration: const InputDecoration(
                     labelText: '上下文消息数',
                     isDense: true,
@@ -1783,7 +2053,9 @@ class _AgentSettingsCardState extends State<_AgentSettingsCard> {
                     final n = int.tryParse(v);
                     if (n != null) {
                       SettingsStore.instance.setInt(
-                          'agentContextLimit', n.clamp(4, 100));
+                        'agentContextLimit',
+                        n.clamp(4, 100),
+                      );
                     }
                   },
                 ),
@@ -1797,8 +2069,7 @@ class _AgentSettingsCardState extends State<_AgentSettingsCard> {
                 child: TextField(
                   controller: _keep,
                   keyboardType: TextInputType.number,
-                  style: TextStyle(
-                      color: colors.textPrimary, fontSize: 12.5),
+                  style: TextStyle(color: colors.textPrimary, fontSize: 12.5),
                   decoration: const InputDecoration(
                     labelText: '压缩保留条数',
                     isDense: true,
@@ -1807,7 +2078,9 @@ class _AgentSettingsCardState extends State<_AgentSettingsCard> {
                     final n = int.tryParse(v);
                     if (n != null) {
                       SettingsStore.instance.setInt(
-                          'agentCompactKeep', n.clamp(2, 20));
+                        'agentCompactKeep',
+                        n.clamp(2, 20),
+                      );
                     }
                   },
                 ),
@@ -1817,8 +2090,7 @@ class _AgentSettingsCardState extends State<_AgentSettingsCard> {
                 child: TextField(
                   controller: _ratio,
                   keyboardType: TextInputType.number,
-                  style: TextStyle(
-                      color: colors.textPrimary, fontSize: 12.5),
+                  style: TextStyle(color: colors.textPrimary, fontSize: 12.5),
                   decoration: const InputDecoration(
                     labelText: '压缩阈值%',
                     isDense: true,
@@ -1827,7 +2099,9 @@ class _AgentSettingsCardState extends State<_AgentSettingsCard> {
                     final n = int.tryParse(v);
                     if (n != null) {
                       SettingsStore.instance.setInt(
-                          'agentCompactRatioPct', n.clamp(50, 95));
+                        'agentCompactRatioPct',
+                        n.clamp(50, 95),
+                      );
                     }
                   },
                 ),
@@ -1848,8 +2122,10 @@ class _AgentSettingsCardState extends State<_AgentSettingsCard> {
             onChanged: (v) {
               final n = int.tryParse(v);
               if (n != null) {
-                SettingsStore.instance
-                    .setInt('agentRetryRounds', n.clamp(0, 20));
+                SettingsStore.instance.setInt(
+                  'agentRetryRounds',
+                  n.clamp(0, 20),
+                );
               }
             },
           ),
@@ -1866,7 +2142,7 @@ class _AgentSettingsCardState extends State<_AgentSettingsCard> {
           ),
           const SizedBox(height: 4),
           Text(
-            '控制 Agent 写文件 / 删文件 / 执行命令时是否自动通过或弹窗确认。',
+            '控制 Agent 写文件 / 删文件 / 执行命令 / MCP 工具时是否自动通过或弹窗确认。',
             style: TextStyle(color: colors.textMuted, fontSize: 12),
           ),
           _actionRow(
@@ -1897,6 +2173,48 @@ class _AgentSettingsCardState extends State<_AgentSettingsCard> {
             value: _command,
             settingsKey: 'approveCommand',
           ),
+          _actionRow(
+            colors: colors,
+            title: 'MCP 工具',
+            desc: 'mcp__*；参数命中区外/敏感路径时直接拒绝',
+            value: _mcp,
+            settingsKey: 'approveMcp',
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '每轮改动记版本',
+                      style: TextStyle(
+                        color: colors.textPrimary,
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      '关闭后一轮只在结束记一个节点；开启后每 tool 写一次，便于单步回退',
+                      style: TextStyle(color: colors.textMuted, fontSize: 11.5),
+                    ),
+                  ],
+                ),
+              ),
+              Switch(
+                value: _checkpointPerTurn,
+                onChanged: (v) async {
+                  await SettingsStore.instance.setBool(
+                    'agentCheckpointPerTurn',
+                    v,
+                  );
+                  setState(() => _checkpointPerTurn = v);
+                },
+              ),
+            ],
+          ),
         ],
       ),
     );
@@ -1908,11 +2226,13 @@ class _LanguageChoice extends StatelessWidget {
     required this.label,
     required this.selected,
     required this.onTap,
+    this.onApply,
   });
 
   final String label;
   final bool selected;
   final VoidCallback onTap;
+  final VoidCallback? onApply;
 
   @override
   Widget build(BuildContext context) {
@@ -1920,7 +2240,7 @@ class _LanguageChoice extends StatelessWidget {
     return GestureDetector(
       onTap: onTap,
       child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 10),
+        padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 8),
         alignment: Alignment.center,
         decoration: BoxDecoration(
           color: selected ? colors.accentSoft : colors.panel,
@@ -1929,13 +2249,40 @@ class _LanguageChoice extends StatelessWidget {
             color: selected ? colors.accent : colors.borderStrong,
           ),
         ),
-        child: Text(
-          label,
-          style: TextStyle(
-            color: selected ? colors.accent : colors.textSecondary,
-            fontSize: 13,
-            fontWeight: FontWeight.w600,
-          ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              label,
+              style: TextStyle(
+                color: selected ? colors.accent : colors.textSecondary,
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            if (onApply != null) ...[
+              const SizedBox(height: 6),
+              TextButton(
+                style: TextButton.styleFrom(
+                  minimumSize: Size.zero,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 4,
+                  ),
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                onPressed: onApply,
+                child: Text(
+                  selected ? (label == '中文' ? '已应用' : 'Applied') : '执行',
+                  style: TextStyle(
+                    color: colors.accent,
+                    fontSize: 11.5,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          ],
         ),
       ),
     );
@@ -1975,8 +2322,8 @@ class _HighlightStyleChipState extends State<_HighlightStyleChip> {
             color: widget.selected
                 ? colors.accentSoft
                 : _hover
-                    ? colors.panelHover
-                    : colors.panel,
+                ? colors.panelHover
+                : colors.panel,
             borderRadius: BorderRadius.circular(999),
             border: Border.all(
               color: widget.selected ? colors.accent : colors.borderStrong,
@@ -2072,8 +2419,8 @@ class _ThemeChoiceCardState extends State<_ThemeChoiceCard> {
             color: widget.selected
                 ? colors.accentSoft
                 : _hover
-                    ? colors.panelHover
-                    : colors.panel,
+                ? colors.panelHover
+                : colors.panel,
             borderRadius: BorderRadius.circular(12),
             border: Border.all(
               color: widget.selected ? colors.accent : colors.borderStrong,
@@ -2178,8 +2525,7 @@ class _ThemePreview extends StatelessWidget {
                         height: 2,
                         width: i == 0 ? 16 : 10,
                         decoration: BoxDecoration(
-                          color:
-                              i == 0 ? accent.withValues(alpha: 0.55) : line,
+                          color: i == 0 ? accent.withValues(alpha: 0.55) : line,
                           borderRadius: BorderRadius.circular(99),
                         ),
                       ),
@@ -2206,10 +2552,7 @@ class _ThemePreview extends StatelessWidget {
 }
 
 class _DropImportHost extends StatefulWidget {
-  const _DropImportHost({
-    required this.workspace,
-    required this.child,
-  });
+  const _DropImportHost({required this.workspace, required this.child});
 
   final WorkspaceController workspace;
   final Widget child;
@@ -2226,9 +2569,9 @@ class _DropImportHostState extends State<_DropImportHost> {
     if (_busy) return;
     final workspace = widget.workspace;
     if (!workspace.hasWorkspace) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('请先打开项目后再拖入文件')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('请先打开项目后再拖入文件')));
       return;
     }
     final paths = details.files
@@ -2241,9 +2584,9 @@ class _DropImportHostState extends State<_DropImportHost> {
       final imported = await workspace.importDroppedPaths(paths);
       if (!mounted) return;
       if (imported.isEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('没有可导入的文件')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('没有可导入的文件')));
         return;
       }
       if (!mounted) return;
@@ -2251,7 +2594,8 @@ class _DropImportHostState extends State<_DropImportHost> {
       final checkpoints = CheckpointScope.of(context);
       try {
         await checkpoints.checkpoint(
-          message: '拖入文件 ${imported.take(3).join(', ')}'
+          message:
+              '拖入文件 ${imported.take(3).join(', ')}'
               '${imported.length > 3 ? ' 等' : ''}',
           kind: 'user-edit',
         );
@@ -2286,7 +2630,9 @@ class _DropImportHostState extends State<_DropImportHost> {
                 child: Center(
                   child: Container(
                     padding: const EdgeInsets.symmetric(
-                        horizontal: 16, vertical: 10),
+                      horizontal: 16,
+                      vertical: 10,
+                    ),
                     decoration: BoxDecoration(
                       color: colors.panel,
                       borderRadius: BorderRadius.circular(10),
@@ -2429,14 +2775,21 @@ class _SearchPanelState extends State<_SearchPanel> {
               isDense: true,
               hintText: hasWorkspace ? '在文件中搜索' : '请先打开项目',
               hintStyle: TextStyle(color: colors.textMuted, fontSize: 12.5),
-              prefixIcon: Icon(Icons.search_rounded,
-                  size: 16, color: colors.textMuted),
-              prefixIconConstraints:
-                  const BoxConstraints(minWidth: 32, minHeight: 32),
+              prefixIcon: Icon(
+                Icons.search_rounded,
+                size: 16,
+                color: colors.textMuted,
+              ),
+              prefixIconConstraints: const BoxConstraints(
+                minWidth: 32,
+                minHeight: 32,
+              ),
               filled: true,
               fillColor: colors.panelHover.withValues(alpha: 0.55),
-              contentPadding:
-                  const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 8,
+                vertical: 8,
+              ),
               border: OutlineInputBorder(
                 borderRadius: BorderRadius.circular(8),
                 borderSide: BorderSide(color: colors.border),
@@ -2540,10 +2893,7 @@ class _SearchPanelState extends State<_SearchPanel> {
       itemCount: _groups.length,
       itemBuilder: (context, index) {
         final group = _groups[index];
-        return _SearchFileTile(
-          group: group,
-          onOpenHit: _openHit,
-        );
+        return _SearchFileTile(group: group, onOpenHit: _openHit);
       },
     );
   }
@@ -2577,9 +2927,7 @@ class _SearchToggle extends StatelessWidget {
                 ? colors.accent.withValues(alpha: 0.18)
                 : colors.panelHover.withValues(alpha: 0.4),
             borderRadius: BorderRadius.circular(6),
-            border: Border.all(
-              color: selected ? colors.accent : colors.border,
-            ),
+            border: Border.all(color: selected ? colors.accent : colors.border),
           ),
           child: Text(
             label,
@@ -2597,10 +2945,7 @@ class _SearchToggle extends StatelessWidget {
 }
 
 class _SearchFileTile extends StatefulWidget {
-  const _SearchFileTile({
-    required this.group,
-    required this.onOpenHit,
-  });
+  const _SearchFileTile({required this.group, required this.onOpenHit});
 
   final SearchFileGroup group;
   final ValueChanged<SearchHit> onOpenHit;
@@ -2634,8 +2979,11 @@ class _SearchFileTileState extends State<_SearchFileTile> {
                   color: colors.textMuted,
                 ),
                 const SizedBox(width: 2),
-                Icon(Icons.description_outlined,
-                    size: 14, color: colors.textSecondary),
+                Icon(
+                  Icons.description_outlined,
+                  size: 14,
+                  color: colors.textSecondary,
+                ),
                 const SizedBox(width: 6),
                 Expanded(
                   child: Text(
@@ -2720,50 +3068,125 @@ class _FileExplorerPanel extends StatelessWidget {
                 tooltip: '打开项目',
                 visualDensity: VisualDensity.compact,
                 padding: EdgeInsets.zero,
-                constraints:
-                    const BoxConstraints.tightFor(width: 28, height: 28),
+                constraints: const BoxConstraints.tightFor(
+                  width: 28,
+                  height: 28,
+                ),
                 onPressed: workspace.pickingFolder
                     ? null
-                    : workspace.pickAndOpenFolder,
-                icon: Icon(Icons.folder_open_rounded,
-                    size: 16, color: colors.textMuted),
+                    : () {
+                        context
+                            .findAncestorStateOfType<_IdeShellState>()
+                            ?._pickAndOpenFolderGuarded();
+                      },
+                icon: Icon(
+                  Icons.folder_open_rounded,
+                  size: 16,
+                  color: colors.textMuted,
+                ),
+              ),
+              IconButton(
+                tooltip: '新窗口打开项目',
+                visualDensity: VisualDensity.compact,
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints.tightFor(
+                  width: 28,
+                  height: 28,
+                ),
+                onPressed: () {
+                  context
+                      .findAncestorStateOfType<_IdeShellState>()
+                      ?._openInNewWindowGuarded();
+                },
+                icon: Icon(
+                  Icons.open_in_new_rounded,
+                  size: 16,
+                  color: colors.textMuted,
+                ),
               ),
               if (workspace.hasWorkspace) ...[
+                IconButton(
+                  tooltip: '新建文件',
+                  visualDensity: VisualDensity.compact,
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints.tightFor(
+                    width: 28,
+                    height: 28,
+                  ),
+                  onPressed: () => _promptCreateInExplorer(
+                    context,
+                    workspace,
+                    isFolder: false,
+                  ),
+                  icon: Icon(
+                    Icons.note_add_outlined,
+                    size: 16,
+                    color: colors.textMuted,
+                  ),
+                ),
+                IconButton(
+                  tooltip: '新建文件夹',
+                  visualDensity: VisualDensity.compact,
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints.tightFor(
+                    width: 28,
+                    height: 28,
+                  ),
+                  onPressed: () => _promptCreateInExplorer(
+                    context,
+                    workspace,
+                    isFolder: true,
+                  ),
+                  icon: Icon(
+                    Icons.create_new_folder_outlined,
+                    size: 16,
+                    color: colors.textMuted,
+                  ),
+                ),
                 IconButton(
                   tooltip: '刷新',
                   visualDensity: VisualDensity.compact,
                   padding: EdgeInsets.zero,
-                  constraints:
-                      const BoxConstraints.tightFor(width: 28, height: 28),
+                  constraints: const BoxConstraints.tightFor(
+                    width: 28,
+                    height: 28,
+                  ),
                   onPressed: workspace.loadTree,
-                  icon: Icon(Icons.refresh_rounded,
-                      size: 16, color: colors.textMuted),
+                  icon: Icon(
+                    Icons.refresh_rounded,
+                    size: 16,
+                    color: colors.textMuted,
+                  ),
                 ),
                 IconButton(
                   tooltip: '关闭项目',
                   visualDensity: VisualDensity.compact,
                   padding: EdgeInsets.zero,
-                  constraints:
-                      const BoxConstraints.tightFor(width: 28, height: 28),
-                  onPressed: () async {
-                    await workspace.closeWorkspace();
-                    if (!context.mounted) return;
-                    ChatScope.of(context).loadForProject(null);
-                    CheckpointScope.of(context).bindProject(null);
+                  constraints: const BoxConstraints.tightFor(
+                    width: 28,
+                    height: 28,
+                  ),
+                  onPressed: () {
+                    context
+                        .findAncestorStateOfType<_IdeShellState>()
+                        ?._closeWorkspaceGuarded();
                   },
-                  icon: Icon(Icons.close_rounded,
-                      size: 16, color: colors.textMuted),
+                  icon: Icon(
+                    Icons.close_rounded,
+                    size: 16,
+                    color: colors.textMuted,
+                  ),
                 ),
               ],
             ],
           ),
         ),
-        Expanded(child: _buildBody(colors)),
+        Expanded(child: _buildBody(context, colors)),
       ],
     );
   }
 
-  Widget _buildBody(IdeColors colors) {
+  Widget _buildBody(BuildContext context, IdeColors colors) {
     if (workspace.pickingFolder || workspace.loadingTree) {
       return const Center(
         child: SizedBox(
@@ -2776,7 +3199,11 @@ class _FileExplorerPanel extends StatelessWidget {
 
     if (!workspace.hasWorkspace) {
       return _OpenFolderEmptyState(
-        onOpen: workspace.pickAndOpenFolder,
+        onOpen: () {
+          context
+              .findAncestorStateOfType<_IdeShellState>()
+              ?._pickAndOpenFolderGuarded();
+        },
       );
     }
 
@@ -2790,14 +3217,15 @@ class _FileExplorerPanel extends StatelessWidget {
               Text(
                 workspace.treeError!,
                 textAlign: TextAlign.center,
-                style: TextStyle(
-                  color: colors.textMuted,
-                  fontSize: 12.5,
-                ),
+                style: TextStyle(color: colors.textMuted, fontSize: 12.5),
               ),
               const SizedBox(height: 12),
               TextButton(
-                onPressed: workspace.pickAndOpenFolder,
+                onPressed: () {
+                  context
+                      .findAncestorStateOfType<_IdeShellState>()
+                      ?._pickAndOpenFolderGuarded();
+                },
                 child: const Text('重新选择文件夹'),
               ),
             ],
@@ -2817,11 +3245,21 @@ class _FileExplorerPanel extends StatelessWidget {
                 depth: 0,
                 selectedPath: workspace.selectedPath,
                 onSelect: workspace.selectInTree,
+                onReveal: (target) =>
+                    workspace.revealInFileManager(target.path),
+                onCreate: (parent, {required bool isFolder}) =>
+                    _promptCreateInExplorer(
+                      context,
+                      workspace,
+                      isFolder: isFolder,
+                      parentPath: parent.isDirectory
+                          ? parent.path
+                          : p.dirname(parent.path),
+                    ),
                 onDelete: (target) async {
                   final messenger = ScaffoldMessenger.of(context);
                   final checkpoints = CheckpointScope.of(context);
-                  final deleted =
-                      await workspace.deletePaths([target.path]);
+                  final deleted = await workspace.deletePaths([target.path]);
                   if (deleted.isEmpty) {
                     messenger.showSnackBar(
                       const SnackBar(content: Text('删除失败或目标不存在')),
@@ -2836,17 +3274,143 @@ class _FileExplorerPanel extends StatelessWidget {
                     );
                   } catch (_) {}
                   messenger.showSnackBar(
-                    SnackBar(
-                      content: Text('已删除 ${deleted.length} 项并记录版本'),
-                    ),
+                    SnackBar(content: Text('已删除 ${deleted.length} 项并记录版本')),
                   );
                 },
+                onRename: (target) =>
+                    _promptRenameInExplorer(context, workspace, target: target),
               ),
           ],
         );
       },
     );
   }
+}
+
+Future<void> _promptCreateInExplorer(
+  BuildContext context,
+  WorkspaceController workspace, {
+  required bool isFolder,
+  String? parentPath,
+}) async {
+  final root = workspace.rootPath;
+  if (root == null) return;
+  final parent =
+      parentPath ??
+      (workspace.selectedPath != null &&
+              FileSystemEntity.isDirectorySync(workspace.selectedPath!)
+          ? workspace.selectedPath!
+          : (workspace.selectedPath != null
+                ? p.dirname(workspace.selectedPath!)
+                : root));
+  final colors = IdeColors.of(context);
+  final controller = TextEditingController();
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      backgroundColor: colors.panel,
+      title: Text(
+        isFolder ? '新建文件夹' : '新建文件',
+        style: TextStyle(color: colors.textPrimary),
+      ),
+      content: TextField(
+        controller: controller,
+        autofocus: true,
+        decoration: InputDecoration(
+          hintText: isFolder ? '文件夹名称' : '文件名，例如 main.dart',
+          helperText: '不能为空',
+        ),
+        onSubmitted: (_) => Navigator.pop(ctx, true),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(ctx, false),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(ctx, true),
+          child: const Text('创建'),
+        ),
+      ],
+    ),
+  );
+  if (ok != true) return;
+  final name = controller.text.trim();
+  if (name.isEmpty) {
+    if (context.mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('名称不能为空')));
+    }
+    return;
+  }
+  final created = isFolder
+      ? await workspace.createFolder(parent, name)
+      : await workspace.createFile(parent, name);
+  if (!context.mounted) return;
+  if (created == null) {
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('创建失败：名称无效或已存在')));
+    return;
+  }
+  try {
+    await CheckpointScope.of(context).checkpoint(
+      message: '${isFolder ? '新建文件夹' : '新建文件'} ${p.basename(created)}',
+      kind: 'user-edit',
+    );
+  } catch (_) {}
+}
+
+Future<void> _promptRenameInExplorer(
+  BuildContext context,
+  WorkspaceController workspace, {
+  required WorkspaceFile target,
+}) async {
+  final colors = IdeColors.of(context);
+  final controller = TextEditingController(text: target.name);
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      backgroundColor: colors.panel,
+      title: Text(
+        target.isDirectory ? '重命名文件夹' : '重命名文件',
+        style: TextStyle(color: colors.textPrimary),
+      ),
+      content: TextField(
+        controller: controller,
+        autofocus: true,
+        decoration: const InputDecoration(hintText: '新名称，同目录同名会拒绝'),
+        onSubmitted: (_) => Navigator.pop(ctx, true),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(ctx, false),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(ctx, true),
+          child: const Text('重命名'),
+        ),
+      ],
+    ),
+  );
+  if (ok != true) return;
+  final name = controller.text.trim();
+  if (name.isEmpty || name == target.name) return;
+  final renamed = await workspace.renamePath(target.path, name);
+  if (!context.mounted) return;
+  if (renamed == null) {
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('重命名失败：名称无效或目标已存在')));
+    return;
+  }
+  try {
+    await CheckpointScope.of(
+      context,
+    ).checkpoint(message: '重命名 ${target.name} → $name', kind: 'user-edit');
+  } catch (_) {}
 }
 
 class _OpenFolderEmptyState extends StatelessWidget {
@@ -2899,6 +3463,9 @@ class _FileTreeItem extends StatefulWidget {
     required this.selectedPath,
     required this.onSelect,
     required this.onDelete,
+    required this.onReveal,
+    required this.onCreate,
+    required this.onRename,
   });
 
   final WorkspaceFile node;
@@ -2906,6 +3473,10 @@ class _FileTreeItem extends StatefulWidget {
   final String? selectedPath;
   final void Function(String path, {required bool isDirectory}) onSelect;
   final Future<void> Function(WorkspaceFile node) onDelete;
+  final Future<void> Function(WorkspaceFile node) onReveal;
+  final Future<void> Function(WorkspaceFile node, {required bool isFolder})
+  onCreate;
+  final Future<void> Function(WorkspaceFile node) onRename;
 
   @override
   State<_FileTreeItem> createState() => _FileTreeItemState();
@@ -2923,8 +3494,10 @@ class _FileTreeItemState extends State<_FileTreeItem> {
         final colors = IdeColors.of(ctx);
         return AlertDialog(
           backgroundColor: colors.panel,
-          title: Text('删除${node.isDirectory ? '文件夹' : '文件'}？',
-              style: TextStyle(color: colors.textPrimary)),
+          title: Text(
+            '删除${node.isDirectory ? '文件夹' : '文件'}？',
+            style: TextStyle(color: colors.textPrimary),
+          ),
           content: Text(
             node.isDirectory
                 ? '将删除「${node.name}」及其全部内容，并记入版本变更。'
@@ -2974,6 +3547,30 @@ class _FileTreeItemState extends State<_FileTreeItem> {
                 globalPosition: details.globalPosition,
                 items: [
                   _CodexContextMenuItem(
+                    value: _FileTreeAction.newFile,
+                    icon: Icons.note_add_outlined,
+                    title: '新建文件',
+                    subtitle: '在此目录创建文件',
+                  ),
+                  _CodexContextMenuItem(
+                    value: _FileTreeAction.newFolder,
+                    icon: Icons.create_new_folder_outlined,
+                    title: '新建文件夹',
+                    subtitle: '在此目录创建文件夹',
+                  ),
+                  _CodexContextMenuItem(
+                    value: _FileTreeAction.reveal,
+                    icon: Icons.folder_open_rounded,
+                    title: Platform.isMacOS ? '在 Finder 中显示' : '在资源管理器中显示',
+                    subtitle: '打开系统文件管理器并定位',
+                  ),
+                  _CodexContextMenuItem(
+                    value: _FileTreeAction.rename,
+                    icon: Icons.drive_file_rename_outline,
+                    title: node.isDirectory ? '重命名文件夹' : '重命名文件',
+                    subtitle: '同名目标会拒绝',
+                  ),
+                  _CodexContextMenuItem(
                     value: _FileTreeAction.delete,
                     icon: Icons.delete_outline_rounded,
                     title: node.isDirectory ? '删除文件夹' : '删除文件',
@@ -2983,6 +3580,14 @@ class _FileTreeItemState extends State<_FileTreeItem> {
               );
               if (action == _FileTreeAction.delete) {
                 await _confirmAndDelete();
+              } else if (action == _FileTreeAction.rename) {
+                await widget.onRename(node);
+              } else if (action == _FileTreeAction.reveal) {
+                await widget.onReveal(node);
+              } else if (action == _FileTreeAction.newFile) {
+                await widget.onCreate(node, isFolder: false);
+              } else if (action == _FileTreeAction.newFolder) {
+                await widget.onCreate(node, isFolder: true);
               }
             },
             child: AnimatedContainer(
@@ -2994,8 +3599,8 @@ class _FileTreeItemState extends State<_FileTreeItem> {
                 color: selected
                     ? colors.accentSoft
                     : _hover
-                        ? colors.panelHover
-                        : Colors.transparent,
+                    ? colors.panelHover
+                    : Colors.transparent,
                 borderRadius: BorderRadius.circular(8),
               ),
               child: Row(
@@ -3014,8 +3619,8 @@ class _FileTreeItemState extends State<_FileTreeItem> {
                   Icon(
                     node.isDirectory
                         ? (_expanded
-                            ? Icons.folder_open_rounded
-                            : Icons.folder_rounded)
+                              ? Icons.folder_open_rounded
+                              : Icons.folder_rounded)
                         : _fileIcon(node.name),
                     size: 15,
                     color: node.isDirectory
@@ -3032,8 +3637,9 @@ class _FileTreeItemState extends State<_FileTreeItem> {
                             ? colors.textPrimary
                             : colors.textSecondary,
                         fontSize: 13,
-                        fontWeight:
-                            selected ? FontWeight.w600 : FontWeight.w400,
+                        fontWeight: selected
+                            ? FontWeight.w600
+                            : FontWeight.w400,
                       ),
                     ),
                   ),
@@ -3050,6 +3656,9 @@ class _FileTreeItemState extends State<_FileTreeItem> {
               selectedPath: widget.selectedPath,
               onSelect: widget.onSelect,
               onDelete: widget.onDelete,
+              onReveal: widget.onReveal,
+              onCreate: widget.onCreate,
+              onRename: widget.onRename,
             ),
       ],
     );
@@ -3072,10 +3681,7 @@ class _FileTreeItemState extends State<_FileTreeItem> {
 }
 
 class _EditorPanel extends StatelessWidget {
-  const _EditorPanel({
-    required this.workspace,
-    required this.editorKey,
-  });
+  const _EditorPanel({required this.workspace, required this.editorKey});
 
   final WorkspaceController workspace;
   final GlobalKey<CodeEditorPaneState> editorKey;
@@ -3094,9 +3700,7 @@ class _EditorPanel extends StatelessWidget {
           height: 44,
           padding: const EdgeInsets.symmetric(horizontal: 8),
           decoration: BoxDecoration(
-            border: Border(
-              bottom: BorderSide(color: colors.border),
-            ),
+            border: Border(bottom: BorderSide(color: colors.border)),
           ),
           child: tabs.isEmpty
               ? Align(
@@ -3134,16 +3738,43 @@ class _EditorPanel extends StatelessWidget {
           child: active == null
               ? EmptyEditorPane(
                   hasWorkspace: workspace.hasWorkspace,
-                  onOpenFolder: workspace.pickAndOpenFolder,
+                  onOpenFolder: () {
+                    context
+                        .findAncestorStateOfType<_IdeShellState>()
+                        ?._pickAndOpenFolderGuarded();
+                  },
+                  onOpenInNewWindow: () {
+                    context
+                        .findAncestorStateOfType<_IdeShellState>()
+                        ?._openInNewWindowGuarded();
+                  },
                   recentProjects: settings.recentProjects,
-                  onOpenRecent: (path) => workspace.openFolder(path),
-                  onRemoveRecent: (path) =>
-                      settings.removeRecentProject(path),
+                  onOpenRecent: (path) {
+                    context
+                        .findAncestorStateOfType<_IdeShellState>()
+                        ?._openFolderGuarded(path);
+                  },
+                  onOpenRecentInNewWindow: (path) {
+                    context
+                        .findAncestorStateOfType<_IdeShellState>()
+                        ?._openRecentInNewWindowGuarded(path);
+                  },
+                  onRemoveRecent: (path) => settings.removeRecentProject(path),
                 )
               : FilePreviewPane(
                   key: ValueKey(active.path),
                   tab: active,
                   editorKey: editorKey,
+                  onSaved: (path) async {
+                    try {
+                      await CheckpointScope.of(context).checkpoint(
+                        message: '用户编辑 ${p.basename(path)}',
+                        kind: 'user-edit',
+                      );
+                    } catch (_) {}
+                    if (!context.mounted) return;
+                    await ChatScope.of(context).attachUserEditedFile(path);
+                  },
                 ),
         ),
         Container(
@@ -3151,9 +3782,7 @@ class _EditorPanel extends StatelessWidget {
           padding: const EdgeInsets.symmetric(horizontal: 14),
           decoration: BoxDecoration(
             color: colors.panel,
-            border: Border(
-              top: BorderSide(color: colors.border),
-            ),
+            border: Border(top: BorderSide(color: colors.border)),
           ),
           child: Row(
             children: [
@@ -3168,7 +3797,8 @@ class _EditorPanel extends StatelessWidget {
               ),
               _ProblemsStatusChip(
                 onOpenProblems: () {
-                  final shell = context.findAncestorStateOfType<_IdeShellState>();
+                  final shell = context
+                      .findAncestorStateOfType<_IdeShellState>();
                   shell?._onActivityTap(ActivityItem.problems);
                 },
               ),
@@ -3220,17 +3850,14 @@ class _ProblemsStatusChip extends StatelessWidget {
         final color = errors > 0
             ? const Color(0xFFE35D6A)
             : warnings > 0
-                ? const Color(0xFFE3A008)
-                : IdeColors.of(context).textMuted;
+            ? const Color(0xFFE3A008)
+            : IdeColors.of(context).textMuted;
         return InkWell(
           onTap: onOpenProblems,
           borderRadius: BorderRadius.circular(4),
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-            child: Text(
-              label,
-              style: TextStyle(color: color, fontSize: 11),
-            ),
+            child: Text(label, style: TextStyle(color: color, fontSize: 11)),
           ),
         );
       },
@@ -3279,12 +3906,11 @@ class _EditorTabState extends State<_EditorTab> {
             color: widget.selected
                 ? colors.panelElevated
                 : _hover
-                    ? colors.panelHover
-                    : Colors.transparent,
+                ? colors.panelHover
+                : Colors.transparent,
             borderRadius: BorderRadius.circular(8),
             border: Border.all(
-              color:
-                  widget.selected ? colors.borderStrong : Colors.transparent,
+              color: widget.selected ? colors.borderStrong : Colors.transparent,
             ),
           ),
           child: Row(
@@ -3299,11 +3925,13 @@ class _EditorTabState extends State<_EditorTab> {
               Text(
                 widget.dirty ? '• ${widget.label}' : widget.label,
                 style: TextStyle(
-                  color:
-                      widget.selected ? colors.textPrimary : colors.textMuted,
+                  color: widget.selected
+                      ? colors.textPrimary
+                      : colors.textMuted,
                   fontSize: 12.5,
-                  fontWeight:
-                      widget.selected ? FontWeight.w600 : FontWeight.w400,
+                  fontWeight: widget.selected
+                      ? FontWeight.w600
+                      : FontWeight.w400,
                 ),
               ),
               const SizedBox(width: 2),
@@ -3342,9 +3970,18 @@ class _EditorTabState extends State<_EditorTab> {
 }
 
 class _AiPanel extends StatefulWidget {
-  const _AiPanel({required this.onOpenSettings});
+  const _AiPanel({
+    super.key,
+    required this.onOpenSettings,
+    this.aiFixPrompt,
+    this.aiFixNonce = 0,
+  });
 
   final VoidCallback onOpenSettings;
+
+  /// Problems 面板“AI 修复”下发的修复指令；nonce 变化时自动发送一次。
+  final String? aiFixPrompt;
+  final int aiFixNonce;
 
   @override
   State<_AiPanel> createState() => _AiPanelState();
@@ -3355,8 +3992,11 @@ class _AiPanelState extends State<_AiPanel> {
   final _focusNode = FocusNode();
   final _chatListKey = GlobalKey();
   AgentRunner? _runner;
+  int _consumedAiFixNonce = 0;
+
   /// 粘贴/拖入的图片（data URL），仅当模型 supportsVision 时发送。
   final List<_PendingImage> _images = [];
+
   /// 拖入的文件/文件夹引用（显示在图片行下方）。
   final List<_PendingAttachment> _attachments = [];
   bool _draggingComposer = false;
@@ -3364,12 +4004,30 @@ class _AiPanelState extends State<_AiPanel> {
 
   @override
   void dispose() {
+    _runner?.removeListener(_syncAiRunningFlag);
+    if (_runner != null) unawaited(_runner!.shutdown());
     _controller.dispose();
     _focusNode.dispose();
     // 切页已改为叠层保活，正常不会走到这里。
-    // 若极端情况下面板被卸载：不要 cancel/dispose runner，
-    // 让进行中的写盘与版本记录跑完，避免“UI 丢了但文件已创建”。
+    // 若极端情况下面板被卸载，Runner 会统一取消模型与命令进程。
     super.dispose();
+  }
+
+  @override
+  void didUpdateWidget(covariant _AiPanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Problems 面板“AI 修复”下发后自动发送一次。
+    if (widget.aiFixPrompt != null &&
+        widget.aiFixPrompt!.isNotEmpty &&
+        widget.aiFixNonce != _consumedAiFixNonce &&
+        widget.aiFixNonce != 0) {
+      _consumedAiFixNonce = widget.aiFixNonce;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _controller.text = widget.aiFixPrompt!;
+        _sendMessage();
+      });
+    }
   }
 
   bool get _isMac => Platform.isMacOS;
@@ -3426,15 +4084,18 @@ class _AiPanelState extends State<_AiPanel> {
             nextAttachments.any((a) => a.path == abs)) {
           continue;
         }
-        nextAttachments.add(_PendingAttachment(
-          path: abs,
-          name: p.basename(abs),
-          kind: _AttachmentKind.folder,
-          displayPath: _displayPath(abs, rootPath),
-          insideWorkspace: rootPath != null &&
-              (abs == p.normalize(rootPath) ||
-                  p.isWithin(p.normalize(rootPath), abs)),
-        ));
+        nextAttachments.add(
+          _PendingAttachment(
+            path: abs,
+            name: p.basename(abs),
+            kind: _AttachmentKind.folder,
+            displayPath: _displayPath(abs, rootPath),
+            insideWorkspace:
+                rootPath != null &&
+                (abs == p.normalize(rootPath) ||
+                    p.isWithin(p.normalize(rootPath), abs)),
+          ),
+        );
         continue;
       }
       if (!await file.exists()) continue;
@@ -3443,11 +4104,13 @@ class _AiPanelState extends State<_AiPanel> {
           final bytes = await file.readAsBytes();
           if (bytes.isEmpty || bytes.length > 8 * 1024 * 1024) continue;
           final mime = _mimeFromPath(abs);
-          nextImages.add(_PendingImage(
-            bytes: Uint8List.fromList(bytes),
-            mime: mime,
-            dataUrl: 'data:$mime;base64,${base64Encode(bytes)}',
-          ));
+          nextImages.add(
+            _PendingImage(
+              bytes: Uint8List.fromList(bytes),
+              mime: mime,
+              dataUrl: 'data:$mime;base64,${base64Encode(bytes)}',
+            ),
+          );
         } catch (_) {}
         continue;
       }
@@ -3459,15 +4122,17 @@ class _AiPanelState extends State<_AiPanel> {
       try {
         size = await file.length();
       } catch (_) {}
-      nextAttachments.add(_PendingAttachment(
-        path: abs,
-        name: p.basename(abs),
-        kind: _AttachmentKind.file,
-        displayPath: _displayPath(abs, rootPath),
-        sizeBytes: size,
-        insideWorkspace: rootPath != null &&
-            p.isWithin(p.normalize(rootPath), abs),
-      ));
+      nextAttachments.add(
+        _PendingAttachment(
+          path: abs,
+          name: p.basename(abs),
+          kind: _AttachmentKind.file,
+          displayPath: _displayPath(abs, rootPath),
+          sizeBytes: size,
+          insideWorkspace:
+              rootPath != null && p.isWithin(p.normalize(rootPath), abs),
+        ),
+      );
     }
     if (!mounted) return;
     if (nextImages.isEmpty && nextAttachments.isEmpty) return;
@@ -3479,9 +4144,9 @@ class _AiPanelState extends State<_AiPanel> {
 
   Future<void> _onComposerDrop(DropDoneDetails details) async {
     if (!WorkspaceScope.of(context).hasWorkspace) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('请先打开项目后再拖入附件')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('请先打开项目后再拖入附件')));
       return;
     }
     final paths = details.files
@@ -3529,7 +4194,8 @@ class _AiPanelState extends State<_AiPanel> {
           continue;
         }
         final text = utf8.decode(bytes, allowMalformed: true);
-        final looksBinary = text.contains('\u0000') ||
+        final looksBinary =
+            text.contains('\u0000') ||
             text.codeUnits.where((c) => c < 9).length > 8;
         if (looksBinary) {
           buf.writeln('  疑似二进制，未内联内容。');
@@ -3546,16 +4212,62 @@ class _AiPanelState extends State<_AiPanel> {
   }
 
   AgentRunner _agentOf(BuildContext context) {
-    _runner ??= AgentRunner(
-      chats: ChatScope.of(context),
-      checkpoints: CheckpointScope.of(context),
-      onFilesTouched: (paths) {
-        // 写/删/命令后刷新资源管理器，并驱动已打开编辑器重读磁盘。
-        WorkspaceScope.of(context).notifyExternalChanges(paths);
-      },
-    );
+    if (_runner == null) {
+      _runner = AgentRunner(
+        chats: ChatScope.of(context),
+        checkpoints: CheckpointScope.of(context),
+        onFilesTouched: (paths) {
+          // 写/删/命令后刷新资源管理器，并驱动已打开编辑器重读磁盘。
+          if (context.mounted) {
+            WorkspaceScope.of(context).notifyExternalChanges(paths);
+          }
+        },
+        readDiagnostics: (path) async {
+          if (!context.mounted) return '诊断服务不可用';
+          final store = DiagnosticsScope.of(context);
+          final root = WorkspaceScope.of(context).rootPath;
+          if (path != null && path.isNotEmpty) {
+            final abs = root == null
+                ? path
+                : p.normalize(p.isAbsolute(path) ? path : p.join(root, path));
+            final list = store.diagnosticsOf(abs);
+            if (list.isEmpty) return '$path：暂无诊断';
+            return _formatDiagnostics(path, list);
+          }
+          final all = store.allDiagnostics;
+          if (all.isEmpty) return '暂无诊断';
+          final buf = StringBuffer('全部诊断 ${all.length} 条：\n');
+          for (final d in all.take(50)) {
+            final rel = root != null && p.isWithin(root, d.filePath)
+                ? p.relative(d.filePath, from: root)
+                : d.filePath;
+            buf.writeln(
+              '- $rel:${d.displayLine}:${d.displayColumn} [${d.severity.name}] ${d.message}',
+            );
+          }
+          return buf.toString().trimRight();
+        },
+      );
+      // Runner 状态同步给窗口关闭拦截：UI 可丢，但运行标记不能丢。
+      _runner!.addListener(_syncAiRunningFlag);
+      _syncAiRunningFlag();
+    }
     _runner!.loadSettings(SettingsScope.of(context));
     return _runner!;
+  }
+
+  String _formatDiagnostics(String path, List<IdeDiagnostic> list) {
+    final buf = StringBuffer('$path 共 ${list.length} 条诊断：\n');
+    for (final d in list.take(50)) {
+      buf.writeln(
+        '- L${d.displayLine}:${d.displayColumn} [${d.severity.name}] ${d.message}',
+      );
+    }
+    return buf.toString().trimRight();
+  }
+
+  void _syncAiRunningFlag() {
+    _IdeShellState._setAiRunnerRunning(_runner?.running == true);
   }
 
   Future<void> _exportChat(ChatSession session) async {
@@ -3572,22 +4284,16 @@ class _AiPanelState extends State<_AiPanel> {
     if (target == null) return;
     try {
       await File(target.path).writeAsString(await file.readAsString());
-      messenger.showSnackBar(
-        SnackBar(content: Text('已导出：${target.path}')),
-      );
+      messenger.showSnackBar(SnackBar(content: Text('已导出：${target.path}')));
     } catch (e) {
-      messenger.showSnackBar(
-        SnackBar(content: Text('导出失败：$e')),
-      );
+      messenger.showSnackBar(SnackBar(content: Text('导出失败：$e')));
     }
   }
 
   String _chatLabel(ChatSession s) {
     final raw = s.title.trim().isNotEmpty
         ? s.title.trim()
-        : (s.messages.isNotEmpty
-            ? s.messages.first.text.trim()
-            : '新对话');
+        : (s.messages.isNotEmpty ? s.messages.first.text.trim() : '新对话');
     final oneLine = raw.replaceAll(RegExp(r'\s+'), ' ');
     if (oneLine.length <= 16) return oneLine.isEmpty ? '新对话' : oneLine;
     return '${oneLine.substring(0, 16)}...';
@@ -3638,7 +4344,16 @@ class _AiPanelState extends State<_AiPanel> {
         );
       },
     );
-    if (picked != null) chats.select(picked);
+    if (picked != null) {
+      if (_runner?.running == true) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('对话进行中，完成后才能切换对话')));
+        return;
+      }
+      chats.select(picked);
+    }
   }
 
   Future<void> _showChatContextMenu({
@@ -3688,10 +4403,16 @@ class _AiPanelState extends State<_AiPanel> {
     ChatSession session, {
     required bool mergeVersions,
   }) async {
+    // 运行期间禁止删除任何对话：对话逻辑不能丢。
+    if (_runner?.running == true) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('对话进行中，完成后才能删除对话')));
+      return;
+    }
     final t = AppStrings.of(context);
-    final title = mergeVersions
-        ? t.deleteChatAndMergeVersions
-        : t.deleteChat;
+    final title = mergeVersions ? t.deleteChatAndMergeVersions : t.deleteChat;
     final message = mergeVersions
         ? '${session.title}\n\n${t.confirmDeleteChatAndMerge}'
         : '${session.title}\n\n${t.confirmDeleteChat}';
@@ -3717,9 +4438,9 @@ class _AiPanelState extends State<_AiPanel> {
           await checkpoints.dropVersions(dropIds);
         } catch (e) {
           if (!mounted) return;
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('版本合并失败：$e')),
-          );
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text('版本合并失败：$e')));
           return;
         }
       }
@@ -3737,14 +4458,20 @@ class _AiPanelState extends State<_AiPanel> {
     final runner = _agentOf(context);
 
     return AnimatedBuilder(
-      animation: Listenable.merge(
-          [chats, runner, SettingsScope.of(context), workspace]),
+      animation: Listenable.merge([
+        chats,
+        runner,
+        runner.approvals,
+        SettingsScope.of(context),
+        workspace,
+      ]),
       builder: (context, _) {
         final current = chats.active;
         final settings = SettingsScope.of(context);
         final provider = _resolveProvider(settings);
-        final model =
-            provider == null ? null : _resolveModel(settings, provider);
+        final model = provider == null
+            ? null
+            : _resolveModel(settings, provider);
         final hasProject = workspace.hasWorkspace;
         final canCompose = hasProject && !runner.running;
         return DropTarget(
@@ -3760,462 +4487,566 @@ class _AiPanelState extends State<_AiPanel> {
               Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-            _PanelHeader(
-              title: t.aiAssistant,
-              trailing: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  IconButton(
-                    tooltip: t.exportMd,
-                    visualDensity: VisualDensity.compact,
-                    onPressed: !hasProject ||
-                            current == null ||
-                            runner.running
-                        ? null
-                        : () => _exportChat(current),
-                    icon: Icon(Icons.ios_share_rounded,
-                        size: 16,
-                        color: hasProject
-                            ? colors.textMuted
-                            : colors.textMuted.withValues(alpha: 0.35)),
-                  ),
-                  IconButton(
-                    key: _chatListKey,
-                    tooltip: '对话列表',
-                    visualDensity: VisualDensity.compact,
-                    onPressed: !hasProject || chats.sessions.isEmpty
-                        ? null
-                        : () => _pickChat(chats),
-                    icon: Icon(Icons.forum_outlined,
-                        size: 16,
-                        color: hasProject && chats.sessions.isNotEmpty
-                            ? colors.textMuted
-                            : colors.textMuted.withValues(alpha: 0.35)),
-                  ),
-                  IconButton(
-                    tooltip: hasProject ? t.newChat : '未打开项目',
-                    visualDensity: VisualDensity.compact,
-                    onPressed: canCompose ? () => chats.newChat() : null,
-                    icon: Icon(Icons.add_comment_outlined,
-                        size: 16,
-                        color: canCompose
-                            ? colors.textMuted
-                            : colors.textMuted.withValues(alpha: 0.35)),
-                  ),
-                ],
-              ),
-            ),
-            if (runner.compacting)
-              Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                decoration: BoxDecoration(
-                  border: Border(
-                      bottom: BorderSide(color: colors.border)),
-                ),
-                child: Row(
-                  children: [
-                    const SizedBox(
-                      width: 12,
-                      height: 12,
-                      child:
-                          CircularProgressIndicator(strokeWidth: 2),
-                    ),
-                    const SizedBox(width: 8),
-                    Text(
-                      '正在压缩上下文…',
-                      style: TextStyle(
-                        color: colors.textMuted,
-                        fontSize: 12,
-                      ),
-                    ),
-                  ],
-                ),
-              )
-            else if (current != null &&
-                (current.compactionSummary?.isNotEmpty ?? false))
-              Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                decoration: BoxDecoration(
-                  border: Border(
-                      bottom: BorderSide(color: colors.border)),
-                ),
-                child: Text(
-                  '已压缩记忆${runner.lastTokensBefore != null ? ' ${runner.lastTokensBefore}→${runner.lastTokensAfter} tokens' : ''} · 丢弃 ${current.compactedDropped} 条',
-                  style: TextStyle(
-                    color: colors.textMuted,
-                    fontSize: 11.5,
-                  ),
-                ),
-              ),
-            if (chats.sessions.isNotEmpty)
-              Container(
-                height: 40,
-                padding: const EdgeInsets.symmetric(horizontal: 10),
-                decoration: BoxDecoration(
-                  border: Border(bottom: BorderSide(color: colors.border)),
-                ),
-                child: ListView.separated(
-                  scrollDirection: Axis.horizontal,
-                  itemCount: chats.sessions.length,
-                  separatorBuilder: (_, _) => const SizedBox(width: 6),
-                  itemBuilder: (context, index) {
-                    final s = chats.sessions[index];
-                    final selected = s.id == chats.active?.id;
-                    return GestureDetector(
-                      onTap: () => chats.select(s.id),
-                      onSecondaryTapDown: (details) {
-                        _showChatContextMenu(
-                          context: context,
-                          globalPosition: details.globalPosition,
-                          session: s,
-                        );
-                      },
-                      child: Tooltip(
-                        message: '右键可删除对话',
-                        waitDuration: const Duration(milliseconds: 600),
-                        child: Container(
-                          alignment: Alignment.center,
-                          margin: const EdgeInsets.symmetric(vertical: 7),
-                          padding: const EdgeInsets.symmetric(horizontal: 10),
-                          decoration: BoxDecoration(
-                            color: selected
-                                ? colors.accentSoft
-                                : colors.panelElevated,
-                            borderRadius: BorderRadius.circular(8),
-                            border: Border.all(
-                              color: selected
-                                  ? colors.accent
-                                  : colors.borderStrong,
-                            ),
-                          ),
-                          child: Text(
-                            s.title,
-                            style: TextStyle(
-                              color: selected
-                                  ? colors.textPrimary
-                                  : colors.textSecondary,
-                              fontSize: 12,
-                              fontWeight: selected
-                                  ? FontWeight.w600
-                                  : FontWeight.w400,
-                            ),
+                  _PanelHeader(
+                    title: t.aiAssistant,
+                    trailing: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        IconButton(
+                          tooltip: t.exportMd,
+                          visualDensity: VisualDensity.compact,
+                          onPressed:
+                              !hasProject || current == null || runner.running
+                              ? null
+                              : () => _exportChat(current),
+                          icon: Icon(
+                            Icons.ios_share_rounded,
+                            size: 16,
+                            color: hasProject
+                                ? colors.textMuted
+                                : colors.textMuted.withValues(alpha: 0.35),
                           ),
                         ),
+                        IconButton(
+                          key: _chatListKey,
+                          tooltip: '对话列表',
+                          visualDensity: VisualDensity.compact,
+                          onPressed: !hasProject || chats.sessions.isEmpty
+                              ? null
+                              : () => _pickChat(chats),
+                          icon: Icon(
+                            Icons.forum_outlined,
+                            size: 16,
+                            color: hasProject && chats.sessions.isNotEmpty
+                                ? colors.textMuted
+                                : colors.textMuted.withValues(alpha: 0.35),
+                          ),
+                        ),
+                        IconButton(
+                          tooltip: hasProject ? t.newChat : '未打开项目',
+                          visualDensity: VisualDensity.compact,
+                          onPressed: canCompose ? () => chats.newChat() : null,
+                          icon: Icon(
+                            Icons.add_comment_outlined,
+                            size: 16,
+                            color: canCompose
+                                ? colors.textMuted
+                                : colors.textMuted.withValues(alpha: 0.35),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (runner.compacting)
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 6,
                       ),
-                    );
-                  },
-                ),
-              ),
-            Expanded(
-              child: !hasProject
-                  ? Center(
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 24),
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(Icons.folder_off_outlined,
-                                size: 34, color: colors.textMuted),
-                            const SizedBox(height: 10),
-                            Text(
-                              '未打开项目',
-                              style: TextStyle(
-                                color: colors.textPrimary,
-                                fontSize: 13.5,
-                                fontWeight: FontWeight.w600,
-                              ),
-                            ),
-                            const SizedBox(height: 6),
-                            Text(
-                              '对话会保存在项目的 .my_ide/chats 下，未打开项目时不可新建或发送',
-                              textAlign: TextAlign.center,
-                              style: TextStyle(
-                                color: colors.textMuted,
-                                fontSize: 12.5,
-                                height: 1.4,
-                              ),
-                            ),
-                          ],
+                      decoration: BoxDecoration(
+                        border: Border(
+                          bottom: BorderSide(color: colors.border),
                         ),
                       ),
-                    )
-                  : current == null
-                  ? Center(
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
+                      child: Row(
                         children: [
-                          Icon(Icons.forum_outlined,
-                              size: 34, color: colors.textMuted),
-                          const SizedBox(height: 10),
-                          Text(t.emptyChat,
-                              style: TextStyle(
-                                  color: colors.textMuted, fontSize: 12.5)),
-                          const SizedBox(height: 12),
-                          FilledButton.icon(
-                            onPressed: () => chats.newChat(),
-                            icon: const Icon(Icons.add_rounded, size: 16),
-                            label: Text(t.newChat),
+                          const SizedBox(
+                            width: 12,
+                            height: 12,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          ),
+                          const SizedBox(width: 8),
+                          Text(
+                            '正在压缩上下文…',
+                            style: TextStyle(
+                              color: colors.textMuted,
+                              fontSize: 12,
+                            ),
                           ),
                         ],
                       ),
                     )
-                  : ListView.separated(
-                      padding: const EdgeInsets.fromLTRB(14, 14, 14, 8),
-                      itemCount: current.messages.length +
-                          (runner.running ? 1 : 0),
-                      separatorBuilder: (_, _) => const SizedBox(height: 12),
-                      itemBuilder: (context, index) {
-                        if (index >= current.messages.length) {
-                          return _StreamingBlock(
-                            reasoning: runner.streamReasoning ?? '',
-                            content: runner.streamContent ?? '',
-                            tool: runner.currentTool,
-                          );
-                        }
-                        final m = current.messages[index];
-                        final isAssistant = m.role == 'assistant';
-                        return _ChatBubble(
-                          isUser: m.role == 'user',
-                          text: m.text,
-                          thinking: m.thinking,
-                          files: m.files,
-                          versionId: m.afterVersionId,
-                          promptTokens: m.promptTokens,
-                          completionTokens: m.completionTokens,
-                          contextUsed: m.contextUsed,
-                          contextLimit: m.contextLimit,
-                          // 每轮助手消息都显示 tokens / 上下文 / 回撤
-                          showFooterMeta: isAssistant,
-                          onRevert: isAssistant
-                              ? () => _revertChatMessage(
-                                  current.id, m.id)
-                              : null,
-                          onRevertFile: isAssistant &&
-                                  m.afterVersionId != null
-                              ? (path) => _revertSingleFileInMessage(
-                                    sessionId: current.id,
-                                    messageId: m.id,
-                                    versionId: m.afterVersionId!,
-                                    relativePath: path,
-                                  )
-                              : null,
-                        );
-                      },
+                  else if (current != null &&
+                      (current.compactionSummary?.isNotEmpty ?? false))
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 4,
+                      ),
+                      decoration: BoxDecoration(
+                        border: Border(
+                          bottom: BorderSide(color: colors.border),
+                        ),
+                      ),
+                      child: Text(
+                        '已压缩记忆${runner.lastTokensBefore != null ? ' ${runner.lastTokensBefore}→${runner.lastTokensAfter} tokens' : ''} · 丢弃 ${current.compactedDropped} 条',
+                        style: TextStyle(
+                          color: colors.textMuted,
+                          fontSize: 11.5,
+                        ),
+                      ),
                     ),
-            ),
-            if (runner.pendingApproval != null)
-              _ApprovalCard(
-                approval: runner.pendingApproval!,
-                onDecision: runner.resolveApproval,
-              ),
-            if (runner.pendingQuestion != null)
-              _QuestionCard(
-                question: runner.pendingQuestion!,
-                onAnswer: runner.resolveQuestion,
-              ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-              child: Container(
-                decoration: BoxDecoration(
-                  color: colors.inputFill,
-                  borderRadius: BorderRadius.circular(14),
-                  border: Border.all(
-                    color: _draggingComposer
-                        ? colors.accent
-                        : colors.borderStrong,
-                  ),
-                ),
-                padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                if (_images.isNotEmpty) ...[
-                  SizedBox(
-                    height: 64,
-                    child: ListView.separated(
-                      scrollDirection: Axis.horizontal,
-                      itemCount: _images.length,
-                      separatorBuilder: (_, _) => const SizedBox(width: 8),
-                      itemBuilder: (context, i) {
-                        final img = _images[i];
-                        return Stack(
-                          clipBehavior: Clip.none,
-                          children: [
-                            ClipRRect(
-                              borderRadius: BorderRadius.circular(8),
-                              child: Image.memory(
-                                img.bytes,
-                                width: 64,
-                                height: 64,
-                                fit: BoxFit.cover,
-                              ),
-                            ),
-                            Positioned(
-                              top: -6,
-                              right: -6,
-                              child: InkWell(
-                                onTap: () =>
-                                    setState(() => _images.removeAt(i)),
-                                child: Container(
-                                  decoration: BoxDecoration(
-                                    color: colors.panel,
-                                    shape: BoxShape.circle,
-                                    border: Border.all(color: colors.border),
+                  if (chats.lastSaveError != null)
+                    Container(
+                      width: double.infinity,
+                      color: const Color(0xFF5C2B2B),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 6,
+                      ),
+                      child: Text(
+                        chats.lastSaveError!,
+                        style: const TextStyle(
+                          color: Color(0xFFFFC9C9),
+                          fontSize: 12,
+                        ),
+                      ),
+                    ),
+                  if (chats.sessions.isNotEmpty)
+                    Container(
+                      height: 40,
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      decoration: BoxDecoration(
+                        border: Border(
+                          bottom: BorderSide(color: colors.border),
+                        ),
+                      ),
+                      child: ListView.separated(
+                        scrollDirection: Axis.horizontal,
+                        itemCount: chats.sessions.length,
+                        separatorBuilder: (_, _) => const SizedBox(width: 6),
+                        itemBuilder: (context, index) {
+                          final s = chats.sessions[index];
+                          final selected = s.id == chats.active?.id;
+                          // 运行期间锁定切换/删除：对话逻辑不能丢，UI 可丢但不许切走。
+                          final locked = runner.running;
+                          return GestureDetector(
+                            onTap: () {
+                              if (locked) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                    content: Text('对话进行中，完成后才能切换对话'),
                                   ),
-                                  padding: const EdgeInsets.all(2),
-                                  child: Icon(Icons.close_rounded,
-                                      size: 12, color: colors.textMuted),
+                                );
+                                return;
+                              }
+                              chats.select(s.id);
+                            },
+                            onSecondaryTapDown: (details) {
+                              if (locked) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                    content: Text('对话进行中，完成后才能删除对话'),
+                                  ),
+                                );
+                                return;
+                              }
+                              _showChatContextMenu(
+                                context: context,
+                                globalPosition: details.globalPosition,
+                                session: s,
+                              );
+                            },
+                            child: Tooltip(
+                              message: '右键可删除对话',
+                              waitDuration: const Duration(milliseconds: 600),
+                              child: Container(
+                                alignment: Alignment.center,
+                                margin: const EdgeInsets.symmetric(vertical: 7),
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: selected
+                                      ? colors.accentSoft
+                                      : colors.panelElevated,
+                                  borderRadius: BorderRadius.circular(8),
+                                  border: Border.all(
+                                    color: selected
+                                        ? colors.accent
+                                        : colors.borderStrong,
+                                  ),
+                                ),
+                                child: Text(
+                                  s.title,
+                                  style: TextStyle(
+                                    color: selected
+                                        ? colors.textPrimary
+                                        : colors.textSecondary,
+                                    fontSize: 12,
+                                    fontWeight: selected
+                                        ? FontWeight.w600
+                                        : FontWeight.w400,
+                                  ),
                                 ),
                               ),
                             ),
+                          );
+                        },
+                      ),
+                    ),
+                  Expanded(
+                    child: !hasProject
+                        ? Center(
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 24,
+                              ),
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    Icons.folder_off_outlined,
+                                    size: 34,
+                                    color: colors.textMuted,
+                                  ),
+                                  const SizedBox(height: 10),
+                                  Text(
+                                    '未打开项目',
+                                    style: TextStyle(
+                                      color: colors.textPrimary,
+                                      fontSize: 13.5,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 6),
+                                  Text(
+                                    '对话会保存在项目的 .my_ide/chats 下，未打开项目时不可新建或发送',
+                                    textAlign: TextAlign.center,
+                                    style: TextStyle(
+                                      color: colors.textMuted,
+                                      fontSize: 12.5,
+                                      height: 1.4,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          )
+                        : current == null
+                        ? Center(
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  Icons.forum_outlined,
+                                  size: 34,
+                                  color: colors.textMuted,
+                                ),
+                                const SizedBox(height: 10),
+                                Text(
+                                  t.emptyChat,
+                                  style: TextStyle(
+                                    color: colors.textMuted,
+                                    fontSize: 12.5,
+                                  ),
+                                ),
+                                const SizedBox(height: 12),
+                                FilledButton.icon(
+                                  onPressed: runner.running
+                                      ? null
+                                      : () => chats.newChat(),
+                                  icon: const Icon(Icons.add_rounded, size: 16),
+                                  label: Text(t.newChat),
+                                ),
+                              ],
+                            ),
+                          )
+                        : ListView.separated(
+                            padding: const EdgeInsets.fromLTRB(14, 14, 14, 8),
+                            itemCount:
+                                current.messages.length +
+                                (runner.running ? 1 : 0),
+                            separatorBuilder: (_, _) =>
+                                const SizedBox(height: 12),
+                            itemBuilder: (context, index) {
+                              if (index >= current.messages.length) {
+                                return _StreamingBlock(
+                                  reasoning: runner.streamReasoning ?? '',
+                                  content: runner.streamContent ?? '',
+                                  tool: runner.currentTool,
+                                );
+                              }
+                              final m = current.messages[index];
+                              final isAssistant = m.role == 'assistant';
+                              return _ChatBubble(
+                                isUser: m.role == 'user',
+                                text: m.text,
+                                thinking: m.thinking,
+                                files: m.files,
+                                userEditedFiles: m.userEditedFiles,
+                                versionId: m.afterVersionId,
+                                sessionId: current.id,
+                                messageId: m.id,
+                                canRevertHunk:
+                                    isAssistant &&
+                                    !runner.running &&
+                                    m.afterVersionId != null,
+                                isLastFileInTurn:
+                                    isAssistant &&
+                                    m.files
+                                            .where(
+                                              (e) => !e.endsWith('.DS_Store'),
+                                            )
+                                            .length ==
+                                        1,
+                                promptTokens: m.promptTokens,
+                                completionTokens: m.completionTokens,
+                                contextUsed: m.contextUsed,
+                                contextLimit: m.contextLimit,
+                                durationMs: m.durationMs,
+                                stopReason: m.stopReason,
+                                // 每轮助手消息都显示 tokens / 上下文 / 回撤
+                                showFooterMeta: isAssistant,
+                                onRevert: isAssistant && !runner.running
+                                    ? () => _revertChatMessage(current.id, m.id)
+                                    : null,
+                                onRevertFile:
+                                    isAssistant &&
+                                        !runner.running &&
+                                        m.afterVersionId != null
+                                    ? (path) => _revertSingleFileInMessage(
+                                        sessionId: current.id,
+                                        messageId: m.id,
+                                        versionId: m.afterVersionId!,
+                                        relativePath: path,
+                                        isLastFileInTurn:
+                                            m.files
+                                                .where(
+                                                  (e) =>
+                                                      !e.endsWith('.DS_Store'),
+                                                )
+                                                .length ==
+                                            1,
+                                      )
+                                    : null,
+                              );
+                            },
+                          ),
+                  ),
+                  if (runner.approvals.pendingApproval != null)
+                    _ApprovalCard(
+                      approval: runner.approvals.pendingApproval!,
+                      onDecision: runner.approvals.resolveApproval,
+                    ),
+                  if (runner.approvals.pendingQuestion != null)
+                    _QuestionCard(
+                      question: runner.approvals.pendingQuestion!,
+                      onAnswer: runner.approvals.resolveQuestion,
+                    ),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: colors.inputFill,
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(
+                          color: _draggingComposer
+                              ? colors.accent
+                              : colors.borderStrong,
+                        ),
+                      ),
+                      padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          if (_images.isNotEmpty) ...[
+                            SizedBox(
+                              height: 64,
+                              child: ListView.separated(
+                                scrollDirection: Axis.horizontal,
+                                itemCount: _images.length,
+                                separatorBuilder: (_, _) =>
+                                    const SizedBox(width: 8),
+                                itemBuilder: (context, i) {
+                                  final img = _images[i];
+                                  return Stack(
+                                    clipBehavior: Clip.none,
+                                    children: [
+                                      ClipRRect(
+                                        borderRadius: BorderRadius.circular(8),
+                                        child: Image.memory(
+                                          img.bytes,
+                                          width: 64,
+                                          height: 64,
+                                          fit: BoxFit.cover,
+                                        ),
+                                      ),
+                                      Positioned(
+                                        top: -6,
+                                        right: -6,
+                                        child: InkWell(
+                                          onTap: () => setState(
+                                            () => _images.removeAt(i),
+                                          ),
+                                          child: Container(
+                                            decoration: BoxDecoration(
+                                              color: colors.panel,
+                                              shape: BoxShape.circle,
+                                              border: Border.all(
+                                                color: colors.border,
+                                              ),
+                                            ),
+                                            padding: const EdgeInsets.all(2),
+                                            child: Icon(
+                                              Icons.close_rounded,
+                                              size: 12,
+                                              color: colors.textMuted,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  );
+                                },
+                              ),
+                            ),
+                            const SizedBox(height: 8),
                           ],
-                        );
-                      },
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                ],
-                if (_attachments.isNotEmpty) ...[
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    children: [
-                      for (var i = 0; i < _attachments.length; i++)
-                        _ComposerAttachmentChip(
-                          attachment: _attachments[i],
-                          sizeLabel: _attachments[i].sizeBytes == null
-                              ? null
-                              : _formatBytes(_attachments[i].sizeBytes!),
-                          onRemove: () =>
-                              setState(() => _attachments.removeAt(i)),
-                        ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                ],
-                CallbackShortcuts(
-                  bindings: {
-                    SingleActivator(
-                      LogicalKeyboardKey.enter,
-                      meta: _isMac,
-                      control: !_isMac,
-                    ): () {
-                      if (canCompose && !runner.running) {
-                        _sendMessage();
-                      }
-                    },
-                  },
-                  child: Focus(
-                    onKeyEvent: (node, event) {
-                      if (event is! KeyDownEvent) {
-                        return KeyEventResult.ignored;
-                      }
-                      // 自行处理粘贴：优先图片，否则再插入文本
-                      final isPaste = event.logicalKey ==
-                              LogicalKeyboardKey.keyV &&
-                          (HardwareKeyboard.instance.isMetaPressed ||
-                              HardwareKeyboard.instance.isControlPressed);
-                      if (isPaste && canCompose) {
-                        _handlePaste();
-                        return KeyEventResult.handled;
-                      }
-                      return KeyEventResult.ignored;
-                    },
-                    child: TextField(
-                      controller: _controller,
-                      focusNode: _focusNode,
-                      enabled: canCompose,
-                      maxLines: 3,
-                      minLines: 2,
-                      style: TextStyle(
-                        color: canCompose
-                            ? colors.textPrimary
-                            : colors.textMuted,
-                        fontSize: 13,
-                        height: 1.4,
-                      ),
-                      cursorColor: colors.accent,
-                      decoration: InputDecoration(
-                        isDense: true,
-                        border: InputBorder.none,
-                        hintText: hasProject
-                            ? '描述你想做的改动…（可拖入图片/文件/文件夹，或粘贴图片）'
-                            : '请先打开项目后再对话',
-                        hintStyle: TextStyle(
-                          color: colors.textMuted,
-                          fontSize: 13,
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Row(
-                  children: [
-                    _ModeChip(
-                      runner: runner,
-                      enabled: canCompose,
-                    ),
-                    const SizedBox(width: 8),
-                    Flexible(
-                      child: _ModelChip(
-                        provider: provider,
-                        model: model,
-                        enabled: canCompose,
-                        onOpenSettings: widget.onOpenSettings,
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Text(
-                      _sendHint,
-                      style: TextStyle(
-                        color: colors.textMuted,
-                        fontSize: 11,
-                      ),
-                    ),
-                    const Spacer(),
-                    Opacity(
-                      opacity: (canCompose || runner.running) ? 1 : 0.38,
-                      child: Material(
-                        color: runner.running
-                            ? colors.panelHover
-                            : (canCompose
-                                ? colors.accent
-                                : colors.panelHover),
-                        borderRadius: BorderRadius.circular(10),
-                        child: InkWell(
-                          onTap: runner.running
-                              ? runner.requestCancel
-                              : (canCompose ? _sendMessage : null),
-                          borderRadius: BorderRadius.circular(10),
-                          child: SizedBox(
-                            width: 34,
-                            height: 34,
-                            child: Icon(
-                              runner.running
-                                  ? Icons.stop_rounded
-                                  : Icons.arrow_upward_rounded,
-                              size: 18,
-                              color: runner.running
-                                  ? colors.textPrimary
-                                  : (canCompose
-                                      ? colors.sendIcon
-                                      : colors.textMuted),
+                          if (_attachments.isNotEmpty) ...[
+                            Wrap(
+                              spacing: 8,
+                              runSpacing: 8,
+                              children: [
+                                for (var i = 0; i < _attachments.length; i++)
+                                  _ComposerAttachmentChip(
+                                    attachment: _attachments[i],
+                                    sizeLabel: _attachments[i].sizeBytes == null
+                                        ? null
+                                        : _formatBytes(
+                                            _attachments[i].sizeBytes!,
+                                          ),
+                                    onRemove: () => setState(
+                                      () => _attachments.removeAt(i),
+                                    ),
+                                  ),
+                              ],
+                            ),
+                            const SizedBox(height: 8),
+                          ],
+                          CallbackShortcuts(
+                            bindings: {
+                              SingleActivator(
+                                LogicalKeyboardKey.enter,
+                                meta: _isMac,
+                                control: !_isMac,
+                              ): () {
+                                if (canCompose && !runner.running) {
+                                  _sendMessage();
+                                }
+                              },
+                            },
+                            child: Focus(
+                              onKeyEvent: (node, event) {
+                                if (event is! KeyDownEvent) {
+                                  return KeyEventResult.ignored;
+                                }
+                                // 自行处理粘贴：优先图片，否则再插入文本
+                                final isPaste =
+                                    event.logicalKey ==
+                                        LogicalKeyboardKey.keyV &&
+                                    (HardwareKeyboard.instance.isMetaPressed ||
+                                        HardwareKeyboard
+                                            .instance
+                                            .isControlPressed);
+                                if (isPaste && canCompose) {
+                                  _handlePaste();
+                                  return KeyEventResult.handled;
+                                }
+                                return KeyEventResult.ignored;
+                              },
+                              child: TextField(
+                                controller: _controller,
+                                focusNode: _focusNode,
+                                enabled: canCompose,
+                                maxLines: 3,
+                                minLines: 2,
+                                style: TextStyle(
+                                  color: canCompose
+                                      ? colors.textPrimary
+                                      : colors.textMuted,
+                                  fontSize: 13,
+                                  height: 1.4,
+                                ),
+                                cursorColor: colors.accent,
+                                decoration: InputDecoration(
+                                  isDense: true,
+                                  border: InputBorder.none,
+                                  hintText: hasProject
+                                      ? '描述你想做的改动…（可拖入图片/文件/文件夹，或粘贴图片）'
+                                      : '请先打开项目后再对话',
+                                  hintStyle: TextStyle(
+                                    color: colors.textMuted,
+                                    fontSize: 13,
+                                  ),
+                                ),
+                              ),
                             ),
                           ),
-                        ),
+                          const SizedBox(height: 8),
+                          Row(
+                            children: [
+                              _ModeChip(runner: runner, enabled: canCompose),
+                              const SizedBox(width: 8),
+                              Flexible(
+                                child: _ModelChip(
+                                  provider: provider,
+                                  model: model,
+                                  enabled: canCompose,
+                                  onOpenSettings: widget.onOpenSettings,
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Text(
+                                _sendHint,
+                                style: TextStyle(
+                                  color: colors.textMuted,
+                                  fontSize: 11,
+                                ),
+                              ),
+                              const Spacer(),
+                              Opacity(
+                                opacity: (canCompose || runner.running)
+                                    ? 1
+                                    : 0.38,
+                                child: Material(
+                                  color: runner.running
+                                      ? colors.panelHover
+                                      : (canCompose
+                                            ? colors.accent
+                                            : colors.panelHover),
+                                  borderRadius: BorderRadius.circular(10),
+                                  child: InkWell(
+                                    onTap: runner.running
+                                        ? runner.requestCancel
+                                        : (canCompose ? _sendMessage : null),
+                                    borderRadius: BorderRadius.circular(10),
+                                    child: SizedBox(
+                                      width: 34,
+                                      height: 34,
+                                      child: Icon(
+                                        runner.running
+                                            ? Icons.stop_rounded
+                                            : Icons.arrow_upward_rounded,
+                                        size: 18,
+                                        color: runner.running
+                                            ? colors.textPrimary
+                                            : (canCompose
+                                                  ? colors.sendIcon
+                                                  : colors.textMuted),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
                       ),
                     ),
-                  ],
-                ),
-                  ],
-                ),
+                  ),
+                ],
               ),
-            ),
-              ],
-            ),
               if (_draggingComposer)
                 Positioned.fill(
                   child: IgnorePointer(
@@ -4274,7 +5105,9 @@ class _AiPanelState extends State<_AiPanel> {
   }
 
   AiModelOption? _resolveModel(
-      SettingsStore settings, AiProviderConfig provider) {
+    SettingsStore settings,
+    AiProviderConfig provider,
+  ) {
     final activeId = settings.activeModelId;
     if (activeId == null) return null;
     for (final m in provider.models) {
@@ -4289,11 +5122,13 @@ class _AiPanelState extends State<_AiPanel> {
       if (!mounted) return;
       if (pasted != null) {
         setState(() {
-          _images.add(_PendingImage(
-            bytes: pasted.bytes,
-            mime: pasted.mime,
-            dataUrl: pasted.dataUrl,
-          ));
+          _images.add(
+            _PendingImage(
+              bytes: pasted.bytes,
+              mime: pasted.mime,
+              dataUrl: pasted.dataUrl,
+            ),
+          );
         });
         return;
       }
@@ -4322,40 +5157,38 @@ class _AiPanelState extends State<_AiPanel> {
     final workspace = WorkspaceScope.of(context);
     if (runner.running) return;
     if (!workspace.hasWorkspace) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('未打开项目后再对话')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('未打开项目后再对话')));
       return;
     }
     if (chats.active == null) {
       await chats.newChat();
     }
     final provider = _resolveProvider(settings);
-    final model =
-        provider == null ? null : _resolveModel(settings, provider);
+    final model = provider == null ? null : _resolveModel(settings, provider);
     if (provider == null || model == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-            content: Text('请先在设置勾选要启用的模型')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('请先在设置勾选要启用的模型')));
       return;
     }
 
-    // 下一轮开始前：未保存编辑先落盘，再记一次 user-edit（无变化则跳过）。
+    // 下一轮开始前：先存当前编辑器，再存其余脏 tab，全部落盘后记一次 user-edit（无变化则跳过）。
     try {
       final shell = context.findAncestorStateOfType<_IdeShellState>();
       final editor = shell?._editorKey.currentState;
-      var hadDirty = editor?.isDirty == true || workspace.dirtyPaths().isNotEmpty;
       if (editor != null && editor.isDirty) {
         await editor.save();
-        hadDirty = true;
       }
-      if (hadDirty) {
-        await CheckpointScope.of(context).checkpoint(
-          message: '用户编辑',
-          kind: 'user-edit',
-        );
+      await workspace.saveAllDirtyTabs();
+      if (workspace.dirtyPaths().isNotEmpty) {
+        // 仍有未挂载编辑器的脏 tab：缓冲不在内存，无法落盘，
+        // 只记版本快照磁盘态，不静默丢弃本地缓冲。
       }
+      await CheckpointScope.of(
+        context,
+      ).checkpoint(message: '用户编辑', kind: 'user-edit');
     } catch (_) {}
 
     final images = List<_PendingImage>.from(_images);
@@ -4363,14 +5196,14 @@ class _AiPanelState extends State<_AiPanel> {
     final attachmentCtx = await _composeAttachmentContext(attachments);
     final visibleText = text.isEmpty
         ? (images.isNotEmpty && attachments.isEmpty
-            ? '（见附图）'
-            : (attachments.isNotEmpty ? '（见附件）' : ''))
+              ? '（见附图）'
+              : (attachments.isNotEmpty ? '（见附件）' : ''))
         : text;
     final userText = attachmentCtx.isEmpty
         ? visibleText
         : (visibleText.isEmpty
-            ? attachmentCtx
-            : '$visibleText\n\n$attachmentCtx');
+              ? attachmentCtx
+              : '$visibleText\n\n$attachmentCtx');
     _controller.clear();
     setState(() {
       _images.clear();
@@ -4395,7 +5228,15 @@ class _AiPanelState extends State<_AiPanel> {
     required String messageId,
     required String versionId,
     required String relativePath,
+    required bool isLastFileInTurn,
   }) async {
+    if (_runner?.running == true) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('对话进行中，完成后才能回退')));
+      return;
+    }
     final messenger = ScaffoldMessenger.of(context);
     final ok = await showDialog<bool>(
       context: context,
@@ -4408,8 +5249,11 @@ class _AiPanelState extends State<_AiPanel> {
             style: TextStyle(color: colors.textPrimary, fontSize: 15),
           ),
           content: Text(
-            '仅撤销本轮对「$relativePath」的改动，其它文件与对话保留。\n'
-            '该文件会从本轮修改列表中移除并合并进上一版。',
+            isLastFileInTurn
+                ? '确定需要回退该改动吗？\n'
+                      '回退后本轮将没有文件改动，并同时删除该轮对话。'
+                : '确定需要回退该改动吗？\n'
+                      '仅撤销本轮对「$relativePath」的改动，其它文件与对话保留。',
             style: TextStyle(color: colors.textSecondary, fontSize: 13),
           ),
           actions: [
@@ -4430,22 +5274,20 @@ class _AiPanelState extends State<_AiPanel> {
     final checkpoints = CheckpointScope.of(context);
     final chats = ChatScope.of(context);
     final workspace = WorkspaceScope.of(context);
-    final existedBefore =
-        checkpoints.checkpoints.any((e) => e.id == versionId);
+    final existedBefore = checkpoints.checkpoints.any((e) => e.id == versionId);
     try {
       final success = await checkpoints.revertSingleFile(
         versionId: versionId,
         relativePath: relativePath,
       );
       if (!success) {
-        messenger.showSnackBar(
-          const SnackBar(content: Text('未找到该文件的本轮改动')),
-        );
+        messenger.showSnackBar(const SnackBar(content: Text('未找到该文件的本轮改动')));
         return;
       }
-      final versionRemoved = existedBefore &&
+      final versionRemoved =
+          existedBefore &&
           !checkpoints.checkpoints.any((e) => e.id == versionId);
-      await chats.removeFileFromMessage(
+      final turnDeleted = await chats.removeFileFromMessage(
         sessionId: sessionId,
         messageId: messageId,
         relativePath: relativePath,
@@ -4454,7 +5296,13 @@ class _AiPanelState extends State<_AiPanel> {
       await workspace.notifyExternalChanges([relativePath]);
       if (!mounted) return;
       messenger.showSnackBar(
-        SnackBar(content: Text('已回退文件 $relativePath')),
+        SnackBar(
+          content: Text(
+            turnDeleted
+                ? '已回退文件 $relativePath，本轮无剩余改动，已同时删除该轮对话'
+                : '已回退文件 $relativePath',
+          ),
+        ),
       );
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('单文件回退失败：$e')));
@@ -4462,6 +5310,13 @@ class _AiPanelState extends State<_AiPanel> {
   }
 
   Future<void> _revertChatMessage(String sessionId, String messageId) async {
+    if (_runner?.running == true) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('对话进行中，完成后才能回退')));
+      return;
+    }
     final chats = ChatScope.of(context);
     final checkpoints = CheckpointScope.of(context);
     final messenger = ScaffoldMessenger.of(context);
@@ -4480,7 +5335,7 @@ class _AiPanelState extends State<_AiPanel> {
             '· 回撤到本轮：删除本轮及之后本对话轮次\n'
             '· 仅回撤本轮：只删除这一轮，后续轮次保留\n\n'
             '提问会填回输入框（输入框已有内容则不覆盖）。\n'
-            '若本对话没有剩余轮次，将自动删除该对话。',
+            '如果回退完没有文件改动，将同时删除该轮对话；如果还有改动，先确认“确定需要回退该改动吗？”。',
           ),
           actions: [
             TextButton(
@@ -4493,8 +5348,7 @@ class _AiPanelState extends State<_AiPanel> {
               child: const Text('仅回撤本轮'),
             ),
             FilledButton(
-              onPressed: () =>
-                  Navigator.of(context).pop(ChatRevertMode.toTurn),
+              onPressed: () => Navigator.of(context).pop(ChatRevertMode.toTurn),
               child: const Text('回撤到本轮'),
             ),
           ],
@@ -4550,9 +5404,7 @@ class _AiPanelState extends State<_AiPanel> {
         ),
       );
     } catch (e) {
-      messenger.showSnackBar(
-        SnackBar(content: Text('回退失败：$e')),
-      );
+      messenger.showSnackBar(SnackBar(content: Text('回退失败：$e')));
     }
   }
 }
@@ -4643,10 +5495,7 @@ class _ComposerAttachmentChip extends StatelessWidget {
                   ].join(' · '),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    color: colors.textMuted,
-                    fontSize: 10.5,
-                  ),
+                  style: TextStyle(color: colors.textMuted, fontSize: 10.5),
                 ),
               ],
             ),
@@ -4657,7 +5506,11 @@ class _ComposerAttachmentChip extends StatelessWidget {
             borderRadius: BorderRadius.circular(10),
             child: Padding(
               padding: const EdgeInsets.all(4),
-              child: Icon(Icons.close_rounded, size: 13, color: colors.textMuted),
+              child: Icon(
+                Icons.close_rounded,
+                size: 13,
+                color: colors.textMuted,
+              ),
             ),
           ),
         ],
@@ -4666,47 +5519,303 @@ class _ComposerAttachmentChip extends StatelessWidget {
   }
 }
 
-
-
 Future<void> _openFileDiff(
   BuildContext context,
   String versionId,
-  String path,
-) async {
+  String path, {
+  String? sessionId,
+  String? messageId,
+  bool canRevertHunk = false,
+  bool isLastFileInTurn = false,
+}) async {
   final store = CheckpointScope.of(context);
-  final workspace = WorkspaceScope.of(context);
-  final messenger = ScaffoldMessenger.of(context);
   try {
     final diff = await store.lineDiff(versionId, path);
     if (!context.mounted) return;
-    final root = workspace.rootPath;
-    final abs = (root != null && !p.isAbsolute(path))
-        ? p.join(root, path)
-        : path;
     await showDialog<void>(
       context: context,
-      builder: (context) => DiffDialog(
+      builder: (context) => _ChatFileDiffDialog(
         title: '$path @ $versionId',
-        diff: diff.isEmpty ? '（无可显示的差异）' : diff,
-        onApplyMerged: (merged) async {
-          try {
-            final f = File(abs);
-            await f.parent.create(recursive: true);
-            await f.writeAsString(merged);
-            await workspace.notifyExternalChanges([abs]);
-            messenger.showSnackBar(
-              SnackBar(content: Text('已应用精细合并：$path')),
-            );
-          } catch (e) {
-            messenger.showSnackBar(
-              SnackBar(content: Text('应用合并失败：$e')),
-            );
-          }
-        },
+        versionId: versionId,
+        path: path,
+        initialDiff: diff.isEmpty ? '（无可显示的差异）' : diff,
+        sessionId: sessionId,
+        messageId: messageId,
+        canRevertHunk: canRevertHunk,
+        isLastFileInTurn: isLastFileInTurn,
       ),
     );
   } catch (e) {
-    messenger.showSnackBar(SnackBar(content: Text('打开差异失败：$e')));
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text('打开差异失败：$e')));
+  }
+}
+
+class _ChatFileDiffDialog extends StatefulWidget {
+  const _ChatFileDiffDialog({
+    required this.title,
+    required this.versionId,
+    required this.path,
+    required this.initialDiff,
+    this.sessionId,
+    this.messageId,
+    this.canRevertHunk = false,
+    this.isLastFileInTurn = false,
+  });
+
+  final String title;
+  final String versionId;
+  final String path;
+  final String initialDiff;
+  final String? sessionId;
+  final String? messageId;
+  final bool canRevertHunk;
+  final bool isLastFileInTurn;
+
+  @override
+  State<_ChatFileDiffDialog> createState() => _ChatFileDiffDialogState();
+}
+
+class _ChatFileDiffDialogState extends State<_ChatFileDiffDialog> {
+  late String _diff = widget.initialDiff;
+  int? _revertingIndex;
+
+  Future<void> _refreshDiff() async {
+    final store = CheckpointScope.of(context);
+    final stillExists = store.checkpoints.any((e) => e.id == widget.versionId);
+    if (!stillExists) {
+      _diff = '（该版本已无剩余改动）';
+      return;
+    }
+    final diff = await store.lineDiff(widget.versionId, widget.path);
+    _diff = diff.isEmpty ? '（无可显示的差异）' : diff;
+  }
+
+  Future<void> _revertHunk(int hunkIndex) async {
+    if (!widget.canRevertHunk ||
+        widget.sessionId == null ||
+        widget.messageId == null ||
+        _revertingIndex != null) {
+      return;
+    }
+    final hunkCount = _countDiffHunks(_diff);
+    final removesLastFileChange =
+        widget.isLastFileInTurn && hunkIndex == hunkCount - 1;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: IdeColors.of(ctx).panel,
+        title: Text(
+          '回退此块？',
+          style: TextStyle(color: IdeColors.of(ctx).textPrimary, fontSize: 15),
+        ),
+        content: Text(
+          removesLastFileChange
+              ? '确定需要回退该改动吗？\n'
+                    '回退后本轮将没有文件改动，并同时删除该轮对话。'
+              : '确定需要回退该改动吗？\n'
+                    '仅撤销「${widget.path}」的这一处改动，其它块保留。',
+          style: TextStyle(
+            color: IdeColors.of(ctx).textSecondary,
+            fontSize: 13,
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xFFE03131),
+            ),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('回退此块'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    setState(() => _revertingIndex = hunkIndex);
+    final checkpoints = CheckpointScope.of(context);
+    final chats = ChatScope.of(context);
+    final workspace = WorkspaceScope.of(context);
+    final messenger = ScaffoldMessenger.of(context);
+    final existedBefore = checkpoints.checkpoints.any(
+      (e) => e.id == widget.versionId,
+    );
+    try {
+      final success = await checkpoints.revertSingleHunk(
+        versionId: widget.versionId,
+        relativePath: widget.path,
+        hunkIndex: hunkIndex,
+      );
+      if (!success) {
+        messenger.showSnackBar(const SnackBar(content: Text('该块已无可回退内容')));
+        return;
+      }
+      final versionRemoved =
+          existedBefore &&
+          !checkpoints.checkpoints.any((e) => e.id == widget.versionId);
+      var fileGone = versionRemoved;
+      if (!fileGone) {
+        final changes = await checkpoints.changesOf(widget.versionId);
+        fileGone = !changes.any((c) => c.path == widget.path);
+      }
+      var turnDeleted = false;
+      if (fileGone) {
+        turnDeleted = await chats.removeFileFromMessage(
+          sessionId: widget.sessionId!,
+          messageId: widget.messageId!,
+          relativePath: widget.path,
+          versionRemoved: versionRemoved,
+        );
+      }
+      await workspace.notifyExternalChanges([widget.path]);
+      await _refreshDiff();
+      if (!mounted) return;
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(
+            turnDeleted
+                ? '已回退该块，本轮无剩余改动，已同时删除该轮对话'
+                : (fileGone ? '已回退该块，文件无剩余改动' : '已回退该块'),
+          ),
+        ),
+      );
+      if (turnDeleted && mounted) Navigator.of(context).pop();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('回退该块失败：$e')));
+    } finally {
+      if (mounted) setState(() => _revertingIndex = null);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = IdeColors.of(context);
+    final lines = _parseDiffStats(_diff);
+    return Dialog(
+      backgroundColor: colors.panel,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+      child: SizedBox(
+        width: 900,
+        height: 600,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              decoration: BoxDecoration(
+                border: Border(bottom: BorderSide(color: colors.border)),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    Icons.difference_outlined,
+                    size: 16,
+                    color: colors.accent,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      widget.title,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: colors.textPrimary,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                  _DiffStatChip(
+                    label: '+${lines.$1}',
+                    color: const Color(0xFF2F9E44),
+                  ),
+                  const SizedBox(width: 6),
+                  _DiffStatChip(
+                    label: '-${lines.$2}',
+                    color: const Color(0xFFE5484D),
+                  ),
+                  IconButton(
+                    visualDensity: VisualDensity.compact,
+                    onPressed: () => Navigator.of(context).pop(),
+                    icon: Icon(
+                      Icons.close_rounded,
+                      size: 17,
+                      color: colors.textMuted,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Expanded(
+              child: DiffView(
+                diff: _diff,
+                showRevertBubble: widget.canRevertHunk,
+                revertingIndex: _revertingIndex,
+                onRevertHunk: widget.canRevertHunk ? _revertHunk : null,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+(int, int) _parseDiffStats(String diff) {
+  var adds = 0;
+  var dels = 0;
+  for (final raw in diff.split('\n')) {
+    if (raw.startsWith('+') && !raw.startsWith('+++')) adds++;
+    if (raw.startsWith('-') && !raw.startsWith('---')) dels++;
+  }
+  return (adds, dels);
+}
+
+int _countDiffHunks(String diff) {
+  var count = 0;
+  var inHunk = false;
+  for (final raw in diff.split('\n')) {
+    final changed =
+        (raw.startsWith('+') && !raw.startsWith('+++')) ||
+        (raw.startsWith('-') && !raw.startsWith('---'));
+    if (changed && !inHunk) {
+      count++;
+      inHunk = true;
+    } else if (!changed) {
+      inHunk = false;
+    }
+  }
+  return count;
+}
+
+class _DiffStatChip extends StatelessWidget {
+  const _DiffStatChip({required this.label, required this.color});
+  final String label;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          color: color,
+          fontSize: 11,
+          fontWeight: FontWeight.w700,
+          fontFamily: 'Menlo',
+        ),
+      ),
+    );
   }
 }
 
@@ -4716,11 +5825,18 @@ class _ChatBubble extends StatelessWidget {
     required this.text,
     this.thinking,
     this.files = const [],
+    this.userEditedFiles = const [],
     this.versionId,
+    this.sessionId,
+    this.messageId,
+    this.canRevertHunk = false,
+    this.isLastFileInTurn = false,
     this.promptTokens,
     this.completionTokens,
     this.contextUsed,
     this.contextLimit,
+    this.durationMs,
+    this.stopReason,
     this.showFooterMeta = false,
     this.onRevert,
     this.onRevertFile,
@@ -4730,11 +5846,18 @@ class _ChatBubble extends StatelessWidget {
   final String text;
   final String? thinking;
   final List<String> files;
+  final List<String> userEditedFiles;
   final String? versionId;
+  final String? sessionId;
+  final String? messageId;
+  final bool canRevertHunk;
+  final bool isLastFileInTurn;
   final int? promptTokens;
   final int? completionTokens;
   final int? contextUsed;
   final int? contextLimit;
+  final int? durationMs;
+  final String? stopReason;
   final bool showFooterMeta;
   final VoidCallback? onRevert;
   final ValueChanged<String>? onRevertFile;
@@ -4745,9 +5868,8 @@ class _ChatBubble extends StatelessWidget {
     final totalTokens = (promptTokens == null && completionTokens == null)
         ? null
         : (promptTokens ?? 0) + (completionTokens ?? 0);
-    final ratio = (contextUsed != null &&
-            contextLimit != null &&
-            contextLimit! > 0)
+    final ratio =
+        (contextUsed != null && contextLimit != null && contextLimit! > 0)
         ? (contextUsed! / contextLimit!).clamp(0.0, 1.0)
         : null;
 
@@ -4760,9 +5882,7 @@ class _ChatBubble extends StatelessWidget {
           // 用户消息保留底色；助手回复透明，便于区分输入与机器回复
           color: isUser ? colors.accentSoft : Colors.transparent,
           borderRadius: BorderRadius.circular(12),
-          border: isUser
-              ? Border.all(color: colors.userBubbleBorder)
-              : null,
+          border: isUser ? Border.all(color: colors.userBubbleBorder) : null,
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -4786,78 +5906,127 @@ class _ChatBubble extends StatelessWidget {
                 softLineBreak: true,
                 styleSheet: MarkdownStyleSheet.fromTheme(Theme.of(context))
                     .copyWith(
-                  p: TextStyle(
-                    color: colors.textPrimary,
-                    fontSize: 13,
-                    height: 1.45,
-                  ),
-                  h1: TextStyle(
-                    color: colors.textPrimary,
-                    fontSize: 18,
-                    fontWeight: FontWeight.w700,
-                    height: 1.3,
-                  ),
-                  h2: TextStyle(
-                    color: colors.textPrimary,
-                    fontSize: 16,
-                    fontWeight: FontWeight.w700,
-                    height: 1.3,
-                  ),
-                  h3: TextStyle(
-                    color: colors.textPrimary,
-                    fontSize: 14.5,
-                    fontWeight: FontWeight.w700,
-                    height: 1.3,
-                  ),
-                  strong: TextStyle(
-                    color: colors.textPrimary,
-                    fontWeight: FontWeight.w700,
-                  ),
-                  em: TextStyle(
-                    color: colors.textPrimary,
-                    fontStyle: FontStyle.italic,
-                  ),
-                  code: TextStyle(
-                    color: colors.accent,
-                    backgroundColor: colors.panelHover,
-                    fontFamily: 'Menlo',
-                    fontSize: 12,
-                  ),
-                  codeblockDecoration: BoxDecoration(
-                    color: colors.panelHover,
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: colors.border),
-                  ),
-                  codeblockPadding: const EdgeInsets.all(10),
-                  blockquoteDecoration: BoxDecoration(
-                    border: Border(
-                      left: BorderSide(color: colors.accent, width: 3),
+                      p: TextStyle(
+                        color: colors.textPrimary,
+                        fontSize: 13,
+                        height: 1.45,
+                      ),
+                      h1: TextStyle(
+                        color: colors.textPrimary,
+                        fontSize: 18,
+                        fontWeight: FontWeight.w700,
+                        height: 1.3,
+                      ),
+                      h2: TextStyle(
+                        color: colors.textPrimary,
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700,
+                        height: 1.3,
+                      ),
+                      h3: TextStyle(
+                        color: colors.textPrimary,
+                        fontSize: 14.5,
+                        fontWeight: FontWeight.w700,
+                        height: 1.3,
+                      ),
+                      strong: TextStyle(
+                        color: colors.textPrimary,
+                        fontWeight: FontWeight.w700,
+                      ),
+                      em: TextStyle(
+                        color: colors.textPrimary,
+                        fontStyle: FontStyle.italic,
+                      ),
+                      code: TextStyle(
+                        color: colors.accent,
+                        backgroundColor: colors.panelHover,
+                        fontFamily: 'Menlo',
+                        fontSize: 12,
+                      ),
+                      codeblockDecoration: BoxDecoration(
+                        color: colors.panelHover,
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: colors.border),
+                      ),
+                      codeblockPadding: const EdgeInsets.all(10),
+                      blockquoteDecoration: BoxDecoration(
+                        border: Border(
+                          left: BorderSide(color: colors.accent, width: 3),
+                        ),
+                        color: colors.panelHover.withValues(alpha: 0.45),
+                      ),
+                      blockquotePadding: const EdgeInsets.fromLTRB(10, 6, 8, 6),
+                      listBullet: TextStyle(
+                        color: colors.textSecondary,
+                        fontSize: 13,
+                      ),
+                      a: TextStyle(
+                        color: colors.accent,
+                        decoration: TextDecoration.underline,
+                      ),
+                      tableHead: TextStyle(
+                        color: colors.textPrimary,
+                        fontWeight: FontWeight.w700,
+                        fontSize: 12.5,
+                      ),
+                      tableBody: TextStyle(
+                        color: colors.textPrimary,
+                        fontSize: 12.5,
+                      ),
+                      tableBorder: TableBorder.all(color: colors.border),
+                      checkbox: TextStyle(color: colors.accent),
                     ),
-                    color: colors.panelHover.withValues(alpha: 0.45),
-                  ),
-                  blockquotePadding:
-                      const EdgeInsets.fromLTRB(10, 6, 8, 6),
-                  listBullet: TextStyle(
-                    color: colors.textSecondary,
-                    fontSize: 13,
-                  ),
-                  a: TextStyle(
-                    color: colors.accent,
-                    decoration: TextDecoration.underline,
-                  ),
-                  tableHead: TextStyle(
-                    color: colors.textPrimary,
-                    fontWeight: FontWeight.w700,
-                    fontSize: 12.5,
-                  ),
-                  tableBody: TextStyle(
-                    color: colors.textPrimary,
-                    fontSize: 12.5,
-                  ),
-                  tableBorder: TableBorder.all(color: colors.border),
-                  checkbox: TextStyle(color: colors.accent),
+              ),
+            if (userEditedFiles.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text(
+                '用户改动',
+                style: TextStyle(
+                  color: colors.textMuted,
+                  fontSize: 10.5,
+                  fontWeight: FontWeight.w600,
                 ),
               ),
+              for (final f in userEditedFiles.where(
+                (e) => !e.endsWith('.DS_Store'),
+              ))
+                Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 6,
+                    ),
+                    decoration: BoxDecoration(
+                      color: colors.panelHover.withValues(alpha: 0.55),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: colors.border),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.edit_outlined,
+                          size: 13,
+                          color: colors.textSecondary,
+                        ),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(
+                            f,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              color: colors.textSecondary,
+                              fontSize: 11.5,
+                              fontFamily: 'Menlo',
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+            ],
             if (versionId != null)
               Padding(
                 padding: const EdgeInsets.only(top: 6),
@@ -4877,7 +6046,9 @@ class _ChatBubble extends StatelessWidget {
                   padding: const EdgeInsets.only(top: 4),
                   child: Container(
                     padding: const EdgeInsets.symmetric(
-                        horizontal: 8, vertical: 6),
+                      horizontal: 8,
+                      vertical: 6,
+                    ),
                     decoration: BoxDecoration(
                       color: colors.panelHover.withValues(alpha: 0.55),
                       borderRadius: BorderRadius.circular(8),
@@ -4885,14 +6056,25 @@ class _ChatBubble extends StatelessWidget {
                     ),
                     child: Row(
                       children: [
-                        Icon(Icons.difference_outlined,
-                            size: 13, color: colors.accent),
+                        Icon(
+                          Icons.difference_outlined,
+                          size: 13,
+                          color: colors.accent,
+                        ),
                         const SizedBox(width: 6),
                         Expanded(
                           child: InkWell(
                             onTap: versionId == null
                                 ? null
-                                : () => _openFileDiff(context, versionId!, f),
+                                : () => _openFileDiff(
+                                    context,
+                                    versionId!,
+                                    f,
+                                    sessionId: sessionId,
+                                    messageId: messageId,
+                                    canRevertHunk: canRevertHunk,
+                                    isLastFileInTurn: isLastFileInTurn,
+                                  ),
                             child: Text(
                               f,
                               overflow: TextOverflow.ellipsis,
@@ -4909,11 +6091,20 @@ class _ChatBubble extends StatelessWidget {
                             style: TextButton.styleFrom(
                               minimumSize: Size.zero,
                               padding: const EdgeInsets.symmetric(
-                                  horizontal: 6, vertical: 2),
+                                horizontal: 6,
+                                vertical: 2,
+                              ),
                               tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                             ),
-                            onPressed: () =>
-                                _openFileDiff(context, versionId!, f),
+                            onPressed: () => _openFileDiff(
+                              context,
+                              versionId!,
+                              f,
+                              sessionId: sessionId,
+                              messageId: messageId,
+                              canRevertHunk: canRevertHunk,
+                              isLastFileInTurn: isLastFileInTurn,
+                            ),
                             child: Text(
                               '差异',
                               style: TextStyle(
@@ -4929,7 +6120,9 @@ class _ChatBubble extends StatelessWidget {
                             style: TextButton.styleFrom(
                               minimumSize: Size.zero,
                               padding: const EdgeInsets.symmetric(
-                                  horizontal: 6, vertical: 2),
+                                horizontal: 6,
+                                vertical: 2,
+                              ),
                               tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                             ),
                             onPressed: () => onRevertFile!(f),
@@ -4948,10 +6141,10 @@ class _ChatBubble extends StatelessWidget {
                   ),
                 ),
             ],
-            if (showFooterMeta && !isUser) ...[
-              const SizedBox(height: 10),
-              Row(
-                children: [
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                if (showFooterMeta && !isUser) ...[
                   Text(
                     totalTokens == null
                         ? '—'
@@ -4962,30 +6155,80 @@ class _ChatBubble extends StatelessWidget {
                       fontFamily: 'Menlo',
                     ),
                   ),
-                  const Spacer(),
-                  if (ratio != null) ...[
-                    _ContextUsageRing(ratio: ratio),
+                  if (durationMs != null) ...[
                     const SizedBox(width: 8),
+                    Text(
+                      _formatDuration(durationMs!),
+                      style: TextStyle(
+                        color: colors.textMuted,
+                        fontSize: 11,
+                        fontFamily: 'Menlo',
+                      ),
+                    ),
                   ],
-                  if (onRevert != null)
-                    Tooltip(
-                      message: '回撤对话',
-                      child: InkWell(
-                        onTap: onRevert,
-                        borderRadius: BorderRadius.circular(8),
-                        child: Padding(
-                          padding: const EdgeInsets.all(4),
-                          child: Icon(
-                            Icons.undo_rounded,
-                            size: 16,
-                            color: colors.textMuted,
-                          ),
+                  if (stopReason != null && stopReason!.isNotEmpty) ...[
+                    const SizedBox(width: 8),
+                    Text(
+                      stopReason!,
+                      style: TextStyle(color: colors.textMuted, fontSize: 11),
+                    ),
+                  ],
+                  if (ratio != null) ...[
+                    const SizedBox(width: 8),
+                    _ContextUsageRing(ratio: ratio),
+                  ],
+                ],
+                const Spacer(),
+                Tooltip(
+                  message: '复制内容',
+                  child: InkWell(
+                    onTap: () async {
+                      final buf = StringBuffer();
+                      if (thinking != null && thinking!.isNotEmpty) {
+                        buf.writeln(thinking);
+                        buf.writeln();
+                      }
+                      buf.write(text);
+                      await Clipboard.setData(
+                        ClipboardData(text: buf.toString()),
+                      );
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(content: Text('已复制到剪贴板')),
+                        );
+                      }
+                    },
+                    borderRadius: BorderRadius.circular(8),
+                    child: Padding(
+                      padding: const EdgeInsets.all(4),
+                      child: Icon(
+                        Icons.copy_rounded,
+                        size: 15,
+                        color: colors.textMuted,
+                      ),
+                    ),
+                  ),
+                ),
+                if (showFooterMeta && !isUser && onRevert != null) ...[
+                  const SizedBox(width: 2),
+                  Tooltip(
+                    message: '回撤对话',
+                    child: InkWell(
+                      onTap: onRevert,
+                      borderRadius: BorderRadius.circular(8),
+                      child: Padding(
+                        padding: const EdgeInsets.all(4),
+                        child: Icon(
+                          Icons.undo_rounded,
+                          size: 16,
+                          color: colors.textMuted,
                         ),
                       ),
                     ),
+                  ),
                 ],
-              ),
-            ],
+              ],
+            ),
           ],
         ),
       ),
@@ -4996,6 +6239,15 @@ class _ChatBubble extends StatelessWidget {
     if (n >= 1000000) return '${(n / 1000000).toStringAsFixed(1)}M';
     if (n >= 1000) return '${(n / 1000).toStringAsFixed(1)}k';
     return '$n';
+  }
+
+  /// 耗时格式化：<60s 显示秒，>=60s 显示分秒。
+  static String _formatDuration(int ms) {
+    final seconds = (ms / 1000).round();
+    if (seconds < 60) return '${seconds}s';
+    final minutes = seconds ~/ 60;
+    final rest = seconds % 60;
+    return '${minutes}分${rest}s';
   }
 }
 
@@ -5010,8 +6262,8 @@ class _ContextUsageRing extends StatelessWidget {
     final color = ratio >= 0.9
         ? const Color(0xFFE5484D)
         : ratio >= 0.75
-            ? const Color(0xFFE5A000)
-            : colors.accent;
+        ? const Color(0xFFE5A000)
+        : colors.accent;
     return Tooltip(
       message: '上下文占用 $pct%',
       child: SizedBox(
@@ -5115,7 +6367,7 @@ class _ThinkingBlockState extends State<_ThinkingBlock> {
 
 enum _ChatDeleteAction { deleteOnly, deleteAndMerge }
 
-enum _FileTreeAction { delete }
+enum _FileTreeAction { delete, reveal, newFile, newFolder, rename }
 
 class _CodexSoftButton extends StatelessWidget {
   const _CodexSoftButton({
@@ -5135,9 +6387,7 @@ class _CodexSoftButton extends StatelessWidget {
         ? const Color(0x55E35D6A)
         : colors.borderStrong;
     final fg = destructive ? const Color(0xFFE35D6A) : colors.textSecondary;
-    final bg = destructive
-        ? const Color(0x14E35D6A)
-        : colors.panelHover;
+    final bg = destructive ? const Color(0x14E35D6A) : colors.panelHover;
     return Material(
       color: bg,
       borderRadius: BorderRadius.circular(10),
@@ -5256,6 +6506,94 @@ Future<bool?> _showCodexConfirmDialog({
   );
 }
 
+/// 外部冲突三选项：0=保留本地，1=载入磁盘，2=合并；null=取消稍后处理。
+Future<int?> _showConflictChoiceDialog({
+  required BuildContext context,
+  required String title,
+  required String message,
+}) {
+  final colors = IdeColors.of(context);
+  return showGeneralDialog<int>(
+    context: context,
+    barrierDismissible: true,
+    barrierLabel: 'dismiss',
+    barrierColor: Colors.black.withValues(alpha: 0.28),
+    transitionDuration: const Duration(milliseconds: 140),
+    pageBuilder: (ctx, _, __) {
+      return Center(
+        child: Material(
+          color: Colors.transparent,
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 440),
+            child: Container(
+              margin: const EdgeInsets.symmetric(horizontal: 24),
+              padding: const EdgeInsets.fromLTRB(18, 16, 18, 14),
+              decoration: BoxDecoration(
+                color: colors.panelElevated,
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: colors.borderStrong),
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Text(
+                    title,
+                    style: TextStyle(
+                      color: colors.textPrimary,
+                      fontSize: 15,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    message,
+                    style: TextStyle(
+                      color: colors.textSecondary,
+                      fontSize: 13,
+                      height: 1.45,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Wrap(
+                    alignment: WrapAlignment.end,
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      _CodexSoftButton(
+                        label: '保留本地',
+                        onTap: () => Navigator.of(ctx).pop(0),
+                      ),
+                      _CodexSoftButton(
+                        label: '载入磁盘',
+                        onTap: () => Navigator.of(ctx).pop(1),
+                      ),
+                      _CodexSoftButton(
+                        label: '合并',
+                        onTap: () => Navigator.of(ctx).pop(2),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    },
+    transitionBuilder: (ctx, anim, _, child) {
+      final curved = CurvedAnimation(parent: anim, curve: Curves.easeOutCubic);
+      return FadeTransition(
+        opacity: curved,
+        child: ScaleTransition(
+          scale: Tween(begin: 0.97, end: 1.0).animate(curved),
+          child: child,
+        ),
+      );
+    },
+  );
+}
+
 class _CodexContextMenuItem<T> {
   const _CodexContextMenuItem({
     required this.value,
@@ -5278,8 +6616,7 @@ Future<T?> _showCodexContextMenu<T>({
   required List<_CodexContextMenuItem<T>> items,
   double width = 220,
 }) {
-  final overlay =
-      Overlay.of(context).context.findRenderObject() as RenderBox?;
+  final overlay = Overlay.of(context).context.findRenderObject() as RenderBox?;
   if (overlay == null) return Future.value(null);
   final colors = IdeColors.of(context);
   final left = globalPosition.dx.clamp(8.0, overlay.size.width - width - 8);
@@ -5359,8 +6696,7 @@ Future<T?> _showSoftMenu<T>({
   bool preferBelow = false,
 }) {
   final box = anchorKey.currentContext?.findRenderObject() as RenderBox?;
-  final overlay =
-      Overlay.of(context).context.findRenderObject() as RenderBox?;
+  final overlay = Overlay.of(context).context.findRenderObject() as RenderBox?;
   if (box == null || overlay == null) return Future.value(null);
 
   final offset = box.localToGlobal(Offset.zero, ancestor: overlay);
@@ -5377,8 +6713,7 @@ Future<T?> _showSoftMenu<T>({
       return const SizedBox.shrink();
     },
     transitionBuilder: (ctx, anim, _, child) {
-      final curved =
-          CurvedAnimation(parent: anim, curve: Curves.easeOutCubic);
+      final curved = CurvedAnimation(parent: anim, curve: Curves.easeOutCubic);
       final panel = FadeTransition(
         opacity: curved,
         child: ScaleTransition(
@@ -5568,7 +6903,7 @@ class _ModeChipState extends State<_ModeChip> {
       anchorKey: _key,
       width: 180,
       builder: (ctx, pick) {
-        final isAgent = widget.runner.mode == AgentMode.agent;
+        final mode = widget.runner.mode;
         return Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -5576,14 +6911,21 @@ class _ModeChipState extends State<_ModeChip> {
               icon: Icons.chat_bubble_outline_rounded,
               title: 'Chat',
               subtitle: '纯对话，不调工具',
-              selected: !isAgent,
+              selected: mode == AgentMode.chat,
               onTap: () => pick(AgentMode.chat),
+            ),
+            _SoftMenuItem(
+              icon: Icons.fact_check_outlined,
+              title: 'Plan',
+              subtitle: '只读调研出方案，不落盘',
+              selected: mode == AgentMode.plan,
+              onTap: () => pick(AgentMode.plan),
             ),
             _SoftMenuItem(
               icon: Icons.auto_awesome_rounded,
               title: 'Agent',
               subtitle: '可读写文件与命令',
-              selected: isAgent,
+              selected: mode == AgentMode.agent,
               onTap: () => pick(AgentMode.agent),
             ),
           ],
@@ -5594,14 +6936,28 @@ class _ModeChipState extends State<_ModeChip> {
     widget.runner.setMode(picked);
     SettingsStore.instance.setString(
       'agentMode',
-      picked == AgentMode.chat ? 'chat' : 'agent',
+      picked == AgentMode.chat
+          ? 'chat'
+          : picked == AgentMode.plan
+          ? 'plan'
+          : 'agent',
     );
   }
 
   @override
   Widget build(BuildContext context) {
     final colors = IdeColors.of(context);
-    final isAgent = widget.runner.mode == AgentMode.agent;
+    final mode = widget.runner.mode;
+    final icon = mode == AgentMode.agent
+        ? Icons.auto_awesome_rounded
+        : mode == AgentMode.plan
+        ? Icons.fact_check_outlined
+        : Icons.chat_bubble_outline_rounded;
+    final label = mode == AgentMode.agent
+        ? 'Agent'
+        : mode == AgentMode.plan
+        ? 'Plan'
+        : 'Chat';
     return GestureDetector(
       key: _key,
       onTap: _open,
@@ -5614,24 +6970,17 @@ class _ModeChipState extends State<_ModeChip> {
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(
-              isAgent
-                  ? Icons.auto_awesome_rounded
-                  : Icons.chat_bubble_outline_rounded,
-              size: 12,
-              color: colors.textSecondary,
-            ),
+            Icon(icon, size: 12, color: colors.textSecondary),
             const SizedBox(width: 4),
             Text(
-              isAgent ? 'Agent' : 'Chat',
+              label,
               style: TextStyle(
                 color: colors.textSecondary,
                 fontSize: 11,
                 fontWeight: FontWeight.w600,
               ),
             ),
-            Icon(Icons.expand_more_rounded,
-                size: 14, color: colors.textMuted),
+            Icon(Icons.expand_more_rounded, size: 14, color: colors.textMuted),
           ],
         ),
       ),
@@ -5698,7 +7047,8 @@ class _ModelChipState extends State<_ModelChip> {
                       _ModelMenuRow(
                         providerId: p.id,
                         model: m,
-                        selected: widget.provider?.id == p.id &&
+                        selected:
+                            widget.provider?.id == p.id &&
                             widget.model?.id == m.id,
                         onSelect: () => pick('${p.id}::${m.id}'),
                       ),
@@ -5733,7 +7083,8 @@ class _ModelChipState extends State<_ModelChip> {
     final colors = IdeColors.of(context);
     final settings = SettingsScope.of(context);
     final providers = settings.providersRaw;
-    final label = widget.model?.displayName ??
+    final label =
+        widget.model?.displayName ??
         widget.model?.id ??
         (providers.isEmpty ? '添加供应商' : '选择模型');
     return GestureDetector(
@@ -5759,8 +7110,7 @@ class _ModelChipState extends State<_ModelChip> {
                 ),
               ),
             ),
-            Icon(Icons.expand_more_rounded,
-                size: 14, color: colors.textMuted),
+            Icon(Icons.expand_more_rounded, size: 14, color: colors.textMuted),
           ],
         ),
       ),
@@ -5824,13 +7174,15 @@ class _ModelMenuRowState extends State<_ModelMenuRow> {
   Widget build(BuildContext context) {
     final colors = IdeColors.of(context);
     final m = widget.model;
-    final showExtras = _hover || widget.selected || _extra != _ModelMenuExtra.none;
+    final showExtras =
+        _hover || widget.selected || _extra != _ModelMenuExtra.none;
     final thinkingLabel = m.thinkingLevel ?? 'medium';
     final contextLabel = m.contextLength == null
         ? 'ctx'
         : AiModelOption.formatContext(m.contextLength!);
-    final presets =
-        AiModelOption.contextPresets.whereType<int>().toList(growable: false);
+    final presets = AiModelOption.contextPresets.whereType<int>().toList(
+      growable: false,
+    );
 
     return MouseRegion(
       onEnter: (_) => setState(() => _hover = true),
@@ -6017,10 +7369,7 @@ class _SoftMiniChip extends StatelessWidget {
 }
 
 class _ApprovalCard extends StatelessWidget {
-  const _ApprovalCard({
-    required this.approval,
-    required this.onDecision,
-  });
+  const _ApprovalCard({required this.approval, required this.onDecision});
 
   final PendingApproval approval;
   final ValueChanged<bool> onDecision;
@@ -6070,8 +7419,7 @@ class _ApprovalCard extends StatelessWidget {
               fontFamily: 'Menlo',
             ),
           ),
-          if (approval.diffOld != null &&
-              approval.diffNew != null) ...[
+          if (approval.diffOld != null && approval.diffNew != null) ...[
             const SizedBox(height: 8),
             SizedBox(
               height: 140,
@@ -6090,14 +7438,12 @@ class _ApprovalCard extends StatelessWidget {
             children: [
               TextButton(
                 onPressed: () => onDecision(false),
-                child: const Text('拒绝',
-                    style: TextStyle(fontSize: 12)),
+                child: const Text('拒绝', style: TextStyle(fontSize: 12)),
               ),
               const SizedBox(width: 6),
               FilledButton(
                 onPressed: () => onDecision(true),
-                child: const Text('允许',
-                    style: TextStyle(fontSize: 12)),
+                child: const Text('允许', style: TextStyle(fontSize: 12)),
               ),
             ],
           ),
@@ -6128,9 +7474,10 @@ class _ApprovalDiff extends StatelessWidget {
             child: ListView(
               padding: const EdgeInsets.all(8),
               children: [
-                Text('旧版（${oldLines.length} 行）',
-                    style: TextStyle(
-                        color: colors.textMuted, fontSize: 11)),
+                Text(
+                  '旧版（${oldLines.length} 行）',
+                  style: TextStyle(color: colors.textMuted, fontSize: 11),
+                ),
                 const SizedBox(height: 4),
                 SelectableText(
                   oldLines.take(60).join('\n'),
@@ -6149,9 +7496,10 @@ class _ApprovalDiff extends StatelessWidget {
             child: ListView(
               padding: const EdgeInsets.all(8),
               children: [
-                Text('新版（${newLines.length} 行）',
-                    style: TextStyle(
-                        color: colors.textMuted, fontSize: 11)),
+                Text(
+                  '新版（${newLines.length} 行）',
+                  style: TextStyle(color: colors.textMuted, fontSize: 11),
+                ),
                 const SizedBox(height: 4),
                 SelectableText(
                   newLines.take(60).join('\n'),
@@ -6172,10 +7520,7 @@ class _ApprovalDiff extends StatelessWidget {
 }
 
 class _QuestionCard extends StatefulWidget {
-  const _QuestionCard({
-    required this.question,
-    required this.onAnswer,
-  });
+  const _QuestionCard({required this.question, required this.onAnswer});
 
   final AgentQuestion question;
   final ValueChanged<String?> onAnswer;
@@ -6209,8 +7554,7 @@ class _QuestionCardState extends State<_QuestionCard> {
         children: [
           Row(
             children: [
-              Icon(Icons.help_outline_rounded,
-                  size: 15, color: colors.accent),
+              Icon(Icons.help_outline_rounded, size: 15, color: colors.accent),
               const SizedBox(width: 6),
               Expanded(
                 child: Text(
@@ -6232,8 +7576,7 @@ class _QuestionCardState extends State<_QuestionCard> {
               children: [
                 for (final opt in widget.question.options)
                   ActionChip(
-                    label:
-                        Text(opt, style: const TextStyle(fontSize: 12)),
+                    label: Text(opt, style: const TextStyle(fontSize: 12)),
                     onPressed: () => widget.onAnswer(opt),
                   ),
               ],
@@ -6245,18 +7588,21 @@ class _QuestionCardState extends State<_QuestionCard> {
               Expanded(
                 child: TextField(
                   controller: _controller,
-                  style: TextStyle(
-                      color: colors.textPrimary, fontSize: 12.5),
+                  style: TextStyle(color: colors.textPrimary, fontSize: 12.5),
                   decoration: InputDecoration(
                     isDense: true,
                     hintText: '输入回答…',
                     hintStyle: TextStyle(
-                        color: colors.textMuted, fontSize: 12.5),
+                      color: colors.textMuted,
+                      fontSize: 12.5,
+                    ),
                     border: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(8),
                     ),
                     contentPadding: const EdgeInsets.symmetric(
-                        horizontal: 10, vertical: 8),
+                      horizontal: 10,
+                      vertical: 8,
+                    ),
                   ),
                   onSubmitted: (v) => widget.onAnswer(v),
                 ),
@@ -6264,11 +7610,11 @@ class _QuestionCardState extends State<_QuestionCard> {
               const SizedBox(width: 6),
               FilledButton(
                 onPressed: () => widget.onAnswer(
-                    _controller.text.trim().isEmpty
-                        ? null
-                        : _controller.text.trim()),
-                child: const Text('发送',
-                    style: TextStyle(fontSize: 12)),
+                  _controller.text.trim().isEmpty
+                      ? null
+                      : _controller.text.trim(),
+                ),
+                child: const Text('发送', style: TextStyle(fontSize: 12)),
               ),
             ],
           ),
@@ -6296,8 +7642,7 @@ class _StreamingBlock extends StatelessWidget {
       alignment: Alignment.centerLeft,
       child: Container(
         constraints: const BoxConstraints(maxWidth: 420),
-        padding:
-            const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
         decoration: const BoxDecoration(
           color: Colors.transparent,
           borderRadius: BorderRadius.all(Radius.circular(12)),
@@ -6306,8 +7651,25 @@ class _StreamingBlock extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           mainAxisSize: MainAxisSize.min,
           children: [
-            if (reasoning.isNotEmpty)
-              _ThinkingBlock(text: reasoning),
+            if (reasoning.isEmpty &&
+                content.isEmpty &&
+                (tool == null || tool!.isEmpty))
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const SizedBox(
+                    width: 12,
+                    height: 12,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    '思考中...',
+                    style: TextStyle(color: colors.textMuted, fontSize: 12),
+                  ),
+                ],
+              ),
+            if (reasoning.isNotEmpty) _ThinkingBlock(text: reasoning),
             if (content.isNotEmpty)
               Text(
                 content,
@@ -6331,10 +7693,7 @@ class _StreamingBlock extends StatelessWidget {
                   Flexible(
                     child: Text(
                       tool!,
-                      style: TextStyle(
-                        color: colors.textMuted,
-                        fontSize: 11.5,
-                      ),
+                      style: TextStyle(color: colors.textMuted, fontSize: 11.5),
                     ),
                   ),
                 ],

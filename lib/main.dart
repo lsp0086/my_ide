@@ -3,16 +3,32 @@ import 'package:flutter/material.dart';
 import 'ai/chat_store.dart';
 import 'diagnostics/diagnostics_store.dart';
 import 'i18n/app_strings.dart';
+import 'mcp/mcp_manager.dart';
 import 'settings/settings_store.dart';
+import 'skills/skill_manager.dart';
 import 'theme/app_colors.dart';
 import 'theme/shortcut_controller.dart';
 import 'theme/theme_controller.dart';
 import 'ui/ide_shell.dart';
 import 'version/checkpoint_store.dart';
+import 'workspace/window_launcher.dart';
 
-Future<void> main() async {
+Future<void> main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
   await SettingsStore.init();
+  // 新窗口直达项目：`--open=<path>`（见 WindowLauncher）。
+  // 落盘，供 IdeShell 首帧打开，并参与项目锁互斥。
+  final argOpen = WindowLauncher.extractOpenPath(args);
+  final envOpen =
+      const String.fromEnvironment('MY_IDE_OPEN', defaultValue: '');
+  InitialOpenPath.value =
+      argOpen ?? (envOpen.isEmpty ? null : envOpen);
+  // 后台加载 MCP 配置并尝试连接已启用服务器
+  // ignore: unawaited_futures
+  McpManager.instance.ensureLoaded();
+  // 预加载全局 Skills（工作区打开后会再扫项目目录）
+  // ignore: unawaited_futures
+  SkillManager.instance.ensureLoaded();
   runApp(const MyIdeApp());
 }
 

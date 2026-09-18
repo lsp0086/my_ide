@@ -33,10 +33,12 @@ class CodeEditorPane extends StatefulWidget {
     super.key,
     required this.path,
     this.readOnly = false,
+    this.onSaved,
   });
 
   final String path;
   final bool readOnly;
+  final Future<void> Function(String path)? onSaved;
 
   @override
   State<CodeEditorPane> createState() => CodeEditorPaneState();
@@ -67,6 +69,10 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
   Map<String, CodeHighlightThemeMode>? _cachedHighlightLanguages;
   String? _cachedHighlightLanguageId;
   final Set<String> _promptingPackIds = {};
+
+  /// 大文件只读横幅：超 1MB 只读打开，不提示输入（可手动 Ctrl+S 强制存）。
+  static const _largeFileBytes = 1024 * 1024;
+  bool _isLargeFile = false;
 
   bool get isDirty => _dirty;
   bool get isSaving => _saving;
@@ -102,11 +108,14 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
     final workspace = WorkspaceScope.maybeOf(context);
     if (!identical(workspace, _workspace)) {
       _workspace?.removeListener(_onWorkspaceChanged);
+      _workspace?.unregisterSaveHandler(widget.path);
       _workspace = workspace;
       _workspace?.addListener(_onWorkspaceChanged);
+      _workspace?.registerSaveHandler(widget.path, save);
       // 首次挂载只记录世代，避免与 initState._load 重复读盘。
       _seenContentEpoch = workspace?.contentEpochOf(widget.path) ?? 0;
     } else {
+      _workspace?.registerSaveHandler(widget.path, save);
       _syncExternalContent();
     }
     _diagnostics = DiagnosticsScope.maybeOf(context);
@@ -123,14 +132,130 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
     if (epoch == _seenContentEpoch) return;
     _seenContentEpoch = epoch;
     if (_loading || _saving) return;
-    // 外部覆盖：强制重读磁盘，丢弃本地未保存缓冲。
-    _load();
+    // 外部覆盖：干净 tab 才重读磁盘；脏 tab 走冲突抉择，不静默覆盖丢编辑。
+    if (_dirty || (workspace.isDirty(widget.path))) {
+      workspace.markConflict(widget.path);
+      return;
+    }
+    _mergeExternalDisk();
+  }
+
+  /// 干净 tab 的外部合并：以磁盘为准重载，但走 _applyDiskText 保留撤销栈，
+  /// Ctrl+Z 可回到合并前，不直接销毁撤销历史。
+  Future<void> _mergeExternalDisk() async {
+    try {
+      final disk = await _readText(widget.path);
+      if (!mounted) return;
+      _applyDiskText(disk);
+    } catch (_) {
+      if (!mounted) return;
+      _load();
+    }
+  }
+
+  /// 保留撤销栈的磁盘同步：磁盘内容经 controller.text 写入（re_editor 会记一条
+  /// 可撤销记录），_savedContent 同步为磁盘态，dirty 清零但撤销历史保留。
+  void _applyDiskText(String disk) {
+    if (_controller.text == disk) {
+      _savedContent = disk;
+      if (_dirty) {
+        setState(() => _dirty = false);
+        _workspace?.setDirty(widget.path, false);
+      }
+      _workspace?.rememberDiskStamp(widget.path);
+      return;
+    }
+    _savedContent = disk;
+    // 经 setter 写入：re_editor runRevocableOp 会记撤销节点，Ctrl+Z 可回退合并。
+    _controller.text = disk;
+    if (!mounted) return;
+    setState(() => _dirty = false);
+    _workspace?.setDirty(widget.path, false);
+    _workspace?.rememberDiskStamp(widget.path);
+    _scheduleLocalIntegrityCheck(immediate: true);
+  }
+
+  /// 三向合并（冲突选“合并”用）：base=_savedContent，local=当前缓冲，remote=磁盘。
+  /// 未改行用磁盘，本地改过行保留本地并插冲突标记；经 controller.text 一次写入，
+  /// 撤销栈保留，Ctrl+Z 可回到合并前。
+  Future<void> mergeDiskPreservingLocal() async {
+    if (_loading || _saving) return;
+    String disk;
+    try {
+      disk = await _readText(widget.path);
+    } catch (_) {
+      return;
+    }
+    if (!mounted) return;
+    final local = _controller.text;
+    if (local == disk) {
+      _applyDiskText(disk);
+      return;
+    }
+    final merged = _threeWayMerge(
+      base: _savedContent,
+      local: local,
+      remote: disk,
+    );
+    _savedContent = disk;
+    _controller.text = merged;
+    if (!mounted) return;
+    final dirty = merged != disk;
+    setState(() {
+      _dirty = dirty;
+      _gotoHint = dirty ? '已合并外部改动，冲突行已标记，请检查保存' : null;
+    });
+    _workspace?.setDirty(widget.path, dirty);
+    _workspace?.rememberDiskStamp(widget.path);
+    _scheduleLocalIntegrityCheck(immediate: true);
+  }
+
+  /// 行级三向合并：base 与 local 相同的行视为未改，用 remote；否则保留 local。
+  /// 双边都改且不一致时插 <<<<<<< LOCAL / ======= / >>>>>>> DISK 标记，不静默丢任一边。
+  String _threeWayMerge({
+    required String base,
+    required String local,
+    required String remote,
+  }) {
+    final b = base.split('\n');
+    final l = local.split('\n');
+    final r = remote.split('\n');
+    final n = [b.length, l.length, r.length].reduce((a, v) => a > v ? a : v);
+    final out = <String>[];
+    for (var i = 0; i < n; i++) {
+      final bb = i < b.length ? b[i] : null;
+      final ll = i < l.length ? l[i] : null;
+      final rr = i < r.length ? r[i] : null;
+      if (ll == rr) {
+        if (ll != null) out.add(ll);
+        continue;
+      }
+      if (ll == bb) {
+        // 本地未改：用磁盘
+        if (rr != null) out.add(rr);
+        continue;
+      }
+      if (rr == bb) {
+        // 磁盘未改：保留本地
+        if (ll != null) out.add(ll);
+        continue;
+      }
+      // 双边都改且不一致：插冲突标记，两边都保留
+      out.add('<<<<<<< LOCAL');
+      if (ll != null) out.add(ll);
+      out.add('=======');
+      if (rr != null) out.add(rr);
+      out.add('>>>>>>> DISK');
+    }
+    return out.join('\n');
   }
 
   @override
   void didUpdateWidget(covariant CodeEditorPane oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.path != widget.path) {
+      _workspace?.unregisterSaveHandler(oldWidget.path);
+      _workspace?.registerSaveHandler(widget.path, save);
       _localCheckTimer?.cancel();
       _diagnostics?.clearFile(oldWidget.path);
       _language = CodeLanguage.fromFileName(p.basename(widget.path));
@@ -445,7 +570,7 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
               : (spec.languageIds.isNotEmpty
                   ? spec.languageIds.first
                   : _language.id);
-          client.didChange(
+          client.didChangeIncremental(
             widget.path,
             _controller.text,
             version: (_diagnostics ?? DiagnosticsScope.maybeOf(context))
@@ -535,6 +660,7 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
     _localCheckTimer?.cancel();
     _diagnostics?.clearFile(widget.path);
     _workspace?.removeListener(_onWorkspaceChanged);
+    _workspace?.unregisterSaveHandler(widget.path);
     HardwareKeyboard.instance.removeHandler(_onHardwareKey);
     _controller.removeListener(_onChanged);
     _controller.dispose();
@@ -796,7 +922,7 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
         (_diagnostics ?? DiagnosticsScope.maybeOf(context))
                 ?.contentVersionOf(widget.path) ??
             version;
-    client.didChange(
+    client.didChangeIncremental(
       widget.path,
       _controller.text,
       version: latestVersion <= 0 ? 1 : latestVersion,
@@ -853,12 +979,14 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
       _loading = true;
       _error = null;
       _dirty = false;
+      _isLargeFile = false;
       _gotoLine = null;
       _gotoStart = null;
       _gotoEnd = null;
     });
 
     try {
+      final stat = await File(widget.path).stat();
       final content = await _readText(widget.path);
       if (!mounted) return;
       _savedContent = content;
@@ -866,6 +994,7 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
       setState(() {
         _loading = false;
         _dirty = false;
+        _isLargeFile = stat.size > _largeFileBytes;
       });
       final workspace = WorkspaceScope.maybeOf(context);
       workspace?.setDirty(widget.path, false);
@@ -904,6 +1033,7 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
         widget.path,
         content: _controller.text,
       );
+      await widget.onSaved?.call(widget.path);
       return true;
     } catch (error) {
       if (!mounted) return false;
@@ -1002,6 +1132,32 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
+          if (_isLargeFile)
+            Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              decoration: BoxDecoration(
+                color: colors.panelHover,
+                border: Border(
+                  bottom: BorderSide(color: colors.borderStrong),
+                ),
+              ),
+              child: Row(
+                children: [
+                  Icon(Icons.warning_amber_rounded, size: 14, color: colors.accent),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      '文件较大，已按只读打开（${_largeFileBytes} 阈值）。可编辑另存为其它文件。',
+                      style: TextStyle(
+                        color: colors.textMuted,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
           if (_gotoHint != null)
             Container(
               padding:
@@ -1044,7 +1200,7 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
                   child: CodeEditor(
                     controller: _controller,
                     focusNode: _focusNode,
-                    readOnly: widget.readOnly,
+                    readOnly: widget.readOnly || _isLargeFile,
                     autofocus: false,
                     wordWrap: false,
                     padding: const EdgeInsets.only(left: 4, right: 12),

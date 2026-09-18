@@ -12,10 +12,12 @@ class FilePreviewPane extends StatelessWidget {
     super.key,
     required this.tab,
     this.editorKey,
+    this.onSaved,
   });
 
   final OpenEditorTab tab;
   final GlobalKey<CodeEditorPaneState>? editorKey;
+  final Future<void> Function(String path)? onSaved;
 
   @override
   Widget build(BuildContext context) {
@@ -24,6 +26,7 @@ class FilePreviewPane extends StatelessWidget {
         return CodeEditorPane(
           key: editorKey,
           path: tab.path,
+          onSaved: onSaved,
         );
       case FileKind.image:
         return _ImagePreview(path: tab.path);
@@ -322,15 +325,19 @@ class EmptyEditorPane extends StatelessWidget {
     super.key,
     this.hasWorkspace = false,
     this.onOpenFolder,
+    this.onOpenInNewWindow,
     this.recentProjects = const [],
     this.onOpenRecent,
+    this.onOpenRecentInNewWindow,
     this.onRemoveRecent,
   });
 
   final bool hasWorkspace;
   final VoidCallback? onOpenFolder;
+  final VoidCallback? onOpenInNewWindow;
   final List<String> recentProjects;
   final ValueChanged<String>? onOpenRecent;
+  final ValueChanged<String>? onOpenRecentInNewWindow;
   final ValueChanged<String>? onRemoveRecent;
 
   @override
@@ -377,6 +384,16 @@ class EmptyEditorPane extends StatelessWidget {
                           const Icon(Icons.folder_open_rounded, size: 16),
                       label: const Text('打开项目'),
                     ),
+                    if (onOpenInNewWindow != null) ...[
+                      const SizedBox(height: 8),
+                      OutlinedButton.icon(
+                        onPressed: onOpenInNewWindow,
+                        icon: const Icon(
+                            Icons.open_in_new_rounded,
+                            size: 16),
+                        label: const Text('新窗口打开'),
+                      ),
+                    ],
                   ],
                 ],
               ),
@@ -386,6 +403,7 @@ class EmptyEditorPane extends StatelessWidget {
             _RecentProjectsBar(
               projects: recentProjects,
               onOpen: onOpenRecent,
+              onOpenInNewWindow: onOpenRecentInNewWindow,
               onRemove: onRemoveRecent,
             ),
         ],
@@ -398,11 +416,13 @@ class _RecentProjectsBar extends StatelessWidget {
   const _RecentProjectsBar({
     required this.projects,
     this.onOpen,
+    this.onOpenInNewWindow,
     this.onRemove,
   });
 
   final List<String> projects;
   final ValueChanged<String>? onOpen;
+  final ValueChanged<String>? onOpenInNewWindow;
   final ValueChanged<String>? onRemove;
 
   @override
@@ -473,6 +493,18 @@ class _RecentProjectsBar extends StatelessWidget {
                               ],
                             ),
                           ),
+                          if (onOpenInNewWindow != null)
+                            IconButton(
+                              tooltip: '新窗口打开',
+                              visualDensity: VisualDensity.compact,
+                              padding: EdgeInsets.zero,
+                              constraints: const BoxConstraints.tightFor(
+                                  width: 28, height: 28),
+                              onPressed: () =>
+                                  onOpenInNewWindow!(path),
+                              icon: Icon(Icons.open_in_new_rounded,
+                                  size: 14, color: colors.textMuted),
+                            ),
                           if (onRemove != null)
                             IconButton(
                               tooltip: '从历史移除',

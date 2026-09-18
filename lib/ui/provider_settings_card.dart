@@ -94,6 +94,8 @@ class _ProviderEditorState extends State<_ProviderEditor> {
   late final TextEditingController _baseUrl;
   late final TextEditingController _token;
   late final TextEditingController _version;
+  late final TextEditingController _manualModel;
+  late final TextEditingController _extraHeaders;
   bool _fetching = false;
   bool _tokenVisible = false;
   bool _modelsExpanded = false;
@@ -107,6 +109,12 @@ class _ProviderEditorState extends State<_ProviderEditor> {
     _baseUrl = TextEditingController(text: widget.provider.baseUrl);
     _token = TextEditingController(text: widget.provider.token);
     _version = TextEditingController(text: widget.provider.anthropicVersion);
+    _manualModel = TextEditingController();
+    _extraHeaders = TextEditingController(
+      text: widget.provider.extraHeaders.entries
+          .map((e) => '${e.key}: ${e.value}')
+          .join('\n'),
+    );
     // 已启用的默认展开，方便继续配置；其余默认收起
     for (final m in widget.provider.models) {
       if (m.enabled) _expandedModelIds.add(m.id);
@@ -119,6 +127,8 @@ class _ProviderEditorState extends State<_ProviderEditor> {
     _baseUrl.dispose();
     _token.dispose();
     _version.dispose();
+    _manualModel.dispose();
+    _extraHeaders.dispose();
     super.dispose();
   }
 
@@ -217,9 +227,22 @@ class _ProviderEditorState extends State<_ProviderEditor> {
                   children: [
                     _SegChip(
                       label: 'OpenAI 兼容',
-                      selected: !p.isAnthropic,
+                      selected: p.apiStyle == AiApiStyle.openaiCompatible,
+                      enabled: p.models.isEmpty,
                       onTap: () {
-                        setState(() => p.apiStyle = AiApiStyle.openaiCompatible);
+                        setState(() =>
+                            p.apiStyle = AiApiStyle.openaiCompatible);
+                        widget.onChanged(p);
+                      },
+                    ),
+                    const SizedBox(width: 8),
+                    _SegChip(
+                      label: 'Responses',
+                      selected: p.isResponses,
+                      enabled: p.models.isEmpty,
+                      onTap: () {
+                        setState(() =>
+                            p.apiStyle = AiApiStyle.openaiResponses);
                         widget.onChanged(p);
                       },
                     ),
@@ -227,6 +250,7 @@ class _ProviderEditorState extends State<_ProviderEditor> {
                     _SegChip(
                       label: 'Anthropic',
                       selected: p.isAnthropic,
+                      enabled: p.models.isEmpty,
                       onTap: () {
                         setState(() {
                           p.apiStyle = AiApiStyle.anthropic;
@@ -242,10 +266,13 @@ class _ProviderEditorState extends State<_ProviderEditor> {
                     Expanded(
                       child: Text(
                         p.isAnthropic
-                            ? '走 /v1/messages + x-api-key'
-                            : '默认，走 /v1/chat/completions',
+                            ? '走 /v1/messages + x-api-key${p.models.isNotEmpty ? '（已有模型，协议已锁定）' : ''}'
+                            : p.isResponses
+                                ? '走 /v1/responses${p.models.isNotEmpty ? '（已有模型，协议已锁定）' : ''}'
+                                : '默认，走 /v1/chat/completions${p.models.isNotEmpty ? '（已有模型，协议已锁定）' : ''}',
                         overflow: TextOverflow.ellipsis,
-                        style: TextStyle(color: colors.textMuted, fontSize: 11),
+                        style:
+                            TextStyle(color: colors.textMuted, fontSize: 11),
                       ),
                     ),
                   ],
@@ -265,9 +292,13 @@ class _ProviderEditorState extends State<_ProviderEditor> {
                         ? (p.fullUrl
                             ? 'https://api.anthropic.com/v1/messages'
                             : 'https://api.anthropic.com')
-                        : (p.fullUrl
-                            ? 'https://host/v1/chat/completions'
-                            : 'https://host/v1'),
+                        : p.isResponses
+                            ? (p.fullUrl
+                                ? 'https://host/v1/responses'
+                                : 'https://host/v1')
+                            : (p.fullUrl
+                                ? 'https://host/v1/chat/completions'
+                                : 'https://host/v1'),
                   ),
                   onChanged: (v) {
                     p.baseUrl = v.trim();
@@ -288,7 +319,11 @@ class _ProviderEditorState extends State<_ProviderEditor> {
                     ),
                     const SizedBox(width: 8),
                     _SegChip(
-                      label: p.isAnthropic ? '完整messages' : '完整chat',
+                      label: p.isAnthropic
+                          ? '完整messages'
+                          : p.isResponses
+                              ? '完整responses'
+                              : '完整chat',
                       selected: p.fullUrl,
                       onTap: () {
                         setState(() => p.fullUrl = true);
@@ -301,7 +336,9 @@ class _ProviderEditorState extends State<_ProviderEditor> {
                         p.fullUrl
                             ? (p.isAnthropic
                                 ? '填 …/messages，自动剥到 /v1'
-                                : '填 …/chat/completions，自动剥到 /v1')
+                                : p.isResponses
+                                    ? '填 …/responses，自动剥到 /v1'
+                                    : '填 …/chat/completions，自动剥到 /v1')
                             : '填 …/v1 或主机根',
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(color: colors.textMuted, fontSize: 11),
@@ -365,14 +402,150 @@ class _ProviderEditorState extends State<_ProviderEditor> {
                     },
                   ),
                 ],
+                if (p.isResponses) ...[
+                  const SizedBox(height: 10),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      _SegChip(
+                        label: '后台 background',
+                        selected: p.responsesBackground,
+                        onTap: () {
+                          setState(() => p.responsesBackground =
+                              !p.responsesBackground);
+                          widget.onChanged(p);
+                        },
+                      ),
+                      _SegChip(
+                        label: '多轮 previous_response_id',
+                        selected: p.responsesPreviousResponse,
+                        onTap: () {
+                          setState(() => p.responsesPreviousResponse =
+                              !p.responsesPreviousResponse);
+                          widget.onChanged(p);
+                        },
+                      ),
+                      _SegChip(
+                        label: '内置 web_search',
+                        selected: p.responsesWebSearch,
+                        onTap: () {
+                          setState(() => p.responsesWebSearch =
+                              !p.responsesWebSearch);
+                          widget.onChanged(p);
+                        },
+                      ),
+                      _SegChip(
+                        label: '内置 code_interpreter',
+                        selected: p.responsesCodeInterpreter,
+                        onTap: () {
+                          setState(() => p.responsesCodeInterpreter =
+                              !p.responsesCodeInterpreter);
+                          widget.onChanged(p);
+                        },
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      for (final c in ['auto', 'required', 'none'])
+                        _SegChip(
+                          label: 'tool_choice:$c',
+                          selected: p.responsesToolChoice == c,
+                          onTap: () {
+                            setState(() => p.responsesToolChoice = c);
+                            widget.onChanged(p);
+                          },
+                        ),
+                    ],
+                  ),
+                ],
+                if (!p.isAnthropic) ...[
+                  const SizedBox(height: 10),
+                  _SegChip(
+                    label: 'Azure 风格 api-key 头',
+                    selected: p.useApiKeyHeader,
+                    onTap: () {
+                      setState(
+                          () => p.useApiKeyHeader = !p.useApiKeyHeader);
+                      widget.onChanged(p);
+                    },
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: _extraHeaders,
+                    maxLines: 3,
+                    style: TextStyle(
+                      color: colors.textPrimary,
+                      fontSize: 12.5,
+                      fontFamily: 'Menlo',
+                    ),
+                    decoration: _fieldDeco(
+                      colors,
+                      label: '自定义请求头（每行 Key: Value）',
+                      hint: 'HTTP-Referer: https://...\nX-Title: my-ide',
+                    ),
+                    onChanged: (v) {
+                      p.extraHeaders = _parseHeaders(v);
+                      widget.onChanged(p);
+                    },
+                  ),
+                ],
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _manualModel,
+                        style: TextStyle(
+                          color: colors.textPrimary,
+                          fontSize: 12.5,
+                          fontFamily: 'Menlo',
+                        ),
+                        decoration: _fieldDeco(
+                          colors,
+                          label:
+                              '手动添加模型${p.isAnthropic ? '（Anthropic 无拉表接口，请手动添加）' : ''}',
+                          hint: p.isAnthropic
+                              ? '如 claude-opus-4-6'
+                              : '如 gpt-5',
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    _SoftActionButton(
+                      icon: Icons.add_rounded,
+                      label: '添加',
+                      onTap: () {
+                        final id = _manualModel.text.trim();
+                        if (id.isEmpty) return;
+                        if (p.models.any((m) => m.id == id)) {
+                          setState(() => _manualModel.clear());
+                          return;
+                        }
+                        setState(() {
+                          p.models.add(
+                              AiModelOption(id: id, enabled: true));
+                          _expandedModelIds.add(id);
+                          _modelsExpanded = true;
+                          _manualModel.clear();
+                        });
+                        widget.onChanged(p);
+                      },
+                    ),
+                  ],
+                ),
                 const SizedBox(height: 12),
                 Row(
                   children: [
                     _SoftActionButton(
                       icon: _fetching
                           ? Icons.hourglass_top_rounded
-                          : Icons.download_rounded,
-                      label: _fetching ? '读取中…' : '读取模型列表',
+                          : Icons.refresh_rounded,
+                      label: _fetching ? '刷新中…' : '刷新模型列表',
                       filled: true,
                       onTap: _fetching ? null : _fetchModels,
                     ),
@@ -463,6 +636,22 @@ class _ProviderEditorState extends State<_ProviderEditor> {
     );
   }
 
+  /// 自定义请求头解析：每行 `Key: Value`，空行跳过，无冒号整行丢弃。
+  static Map<String, String> _parseHeaders(String raw) {
+    final out = <String, String>{};
+    for (final line in raw.split(RegExp(r'\r?\n'))) {
+      final t = line.trim();
+      if (t.isEmpty || t.startsWith('#')) continue;
+      final idx = t.indexOf(':');
+      if (idx <= 0) continue;
+      final k = t.substring(0, idx).trim();
+      final v = t.substring(idx + 1).trim();
+      if (k.isEmpty || v.isEmpty) continue;
+      out[k] = v;
+    }
+    return out;
+  }
+
   Future<void> _fetchModels() async {
     final p = widget.provider;
     final tokenFromField = _token.text;
@@ -478,8 +667,7 @@ class _ProviderEditorState extends State<_ProviderEditor> {
       return;
     }
     if (p.token.isEmpty) {
-      setState(() => _fetchError =
-          'Token 输入框为空（len=${tokenFromField.length}），请重新粘贴后再试');
+      setState(() => _fetchError = 'Token 输入框为空，请重新粘贴后再试');
       return;
     }
 
@@ -494,17 +682,45 @@ class _ProviderEditorState extends State<_ProviderEditor> {
         token: tokenFromField,
         apiStyle: p.apiStyle,
         anthropicVersion: p.anthropicVersion,
+        extraHeaders: p.extraHeaders,
+        useApiKeyHeader: p.useApiKeyHeader,
       );
-      final existing = p.models.map((e) => e.id).toSet();
+      final fetched = ids.toSet();
+      final store = SettingsStore.instance;
+      // 同一供应商下当前选中的模型
+      final activeModelId = store.activeProviderId == p.id
+          ? store.activeModelId
+          : null;
+      String? removedActiveId;
       setState(() {
+        // 新增：拉到但本地没有的，追加（默认不启用）
+        final existing = p.models.map((e) => e.id).toSet();
         for (final id in ids) {
           if (!existing.contains(id)) {
             p.models.add(AiModelOption(id: id));
           }
         }
+        // 删除已下线：远端没有但本地有的，移除
+        p.models.removeWhere((m) => !fetched.contains(m.id));
+        _expandedModelIds.removeWhere((id) => !fetched.contains(id));
+        // 当前选中的模型若已下线，重置为空
+        if (activeModelId != null &&
+            activeModelId.isNotEmpty &&
+            !fetched.contains(activeModelId)) {
+          removedActiveId = activeModelId;
+        }
         // 拉取后仍保持收起；用户需要时再展开
       });
+      if (removedActiveId != null) {
+        // 同一供应商的当前模型已下线：选中重置为空
+        await store.setActiveModel(null, null);
+      }
       widget.onChanged(p);
+      if (mounted && removedActiveId != null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('当前模型 $removedActiveId 已下线，已重置，请重新选择')),
+        );
+      }
     } catch (e) {
       setState(() => _fetchError = '$e');
     } finally {
@@ -996,37 +1212,43 @@ class _SegChip extends StatelessWidget {
     required this.label,
     required this.selected,
     required this.onTap,
+    this.enabled = true,
   });
 
   final String label;
   final bool selected;
   final VoidCallback onTap;
+  final bool enabled;
 
   @override
   Widget build(BuildContext context) {
     final colors = IdeColors.of(context);
-    return Material(
-      color: selected ? colors.accentSoft : colors.panelHover,
-      borderRadius: BorderRadius.circular(999),
-      child: InkWell(
-        onTap: onTap,
+    final showSelected = selected && enabled;
+    return Opacity(
+      opacity: enabled ? 1.0 : 0.45,
+      child: Material(
+        color: showSelected ? colors.accentSoft : colors.panelHover,
         borderRadius: BorderRadius.circular(999),
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(999),
-            border: Border.all(
-              color: selected
-                  ? colors.accent.withValues(alpha: 0.35)
-                  : colors.border,
+        child: InkWell(
+          onTap: enabled ? onTap : () {},
+          borderRadius: BorderRadius.circular(999),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(999),
+              border: Border.all(
+                color: showSelected
+                    ? colors.accent.withValues(alpha: 0.35)
+                    : colors.border,
+              ),
             ),
-          ),
-          child: Text(
-            label,
-            style: TextStyle(
-              color: selected ? colors.accent : colors.textSecondary,
-              fontSize: 12,
-              fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
+            child: Text(
+              label,
+              style: TextStyle(
+                color: showSelected ? colors.accent : colors.textSecondary,
+                fontSize: 12,
+                fontWeight: showSelected ? FontWeight.w600 : FontWeight.w500,
+              ),
             ),
           ),
         ),

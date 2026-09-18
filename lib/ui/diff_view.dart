@@ -17,23 +17,16 @@ class _DiffLine {
   final int? newNo;
 }
 
-enum _HunkDecision { pending, accepted, rejected }
-
 class _ChangeHunk {
   _ChangeHunk({
     required this.index,
     required this.start,
     required this.end,
-    required this.addCount,
-    required this.delCount,
   });
 
   final int index;
   final int start;
   final int end; // exclusive
-  final int addCount;
-  final int delCount;
-  _HunkDecision decision = _HunkDecision.pending;
 }
 
 List<_DiffLine> _parseUnifiedDiff(String diff) {
@@ -99,256 +92,35 @@ List<_ChangeHunk> _groupChangeHunks(List<_DiffLine> lines) {
       continue;
     }
     final start = i;
-    var adds = 0;
-    var dels = 0;
     while (i < lines.length &&
         (lines[i].kind == 'add' || lines[i].kind == 'del')) {
-      if (lines[i].kind == 'add') adds++;
-      if (lines[i].kind == 'del') dels++;
       i++;
     }
     hunks.add(_ChangeHunk(
-      index: hunks.length + 1,
+      index: hunks.length,
       start: start,
       end: i,
-      addCount: adds,
-      delCount: dels,
     ));
   }
   return hunks;
 }
 
-String mergeUnifiedDiff(
-  List<_DiffLine> lines,
-  List<_ChangeHunk> hunks, {
-  required bool acceptPendingAsAccepted,
-}) {
-  final decisions = <int, _HunkDecision>{};
-  for (final h in hunks) {
-    var d = h.decision;
-    if (d == _HunkDecision.pending) {
-      d = acceptPendingAsAccepted
-          ? _HunkDecision.accepted
-          : _HunkDecision.rejected;
-    }
-    for (var i = h.start; i < h.end; i++) {
-      decisions[i] = d;
-    }
-  }
-
-  final out = <String>[];
-  for (var i = 0; i < lines.length; i++) {
-    final line = lines[i];
-    if (line.kind == 'meta' || line.kind == 'hunk') continue;
-    if (line.kind == 'ctx') {
-      out.add(line.text);
-      continue;
-    }
-    final d = decisions[i] ?? _HunkDecision.accepted;
-    if (line.kind == 'add') {
-      if (d == _HunkDecision.accepted) out.add(line.text);
-    } else if (line.kind == 'del') {
-      if (d == _HunkDecision.rejected) out.add(line.text);
-    }
-  }
-  return out.join('\n');
-}
-
-/// GitHub review 风格 unified diff：红绿行 + 变更块审查气泡。
-class DiffView extends StatefulWidget {
+/// GitHub review 风格 unified diff：红绿行纯展示。
+/// 查看节点进入不需要气泡；不回退即视为接受，回退走对话回退入口。
+/// 对话入口如需单块回退，置 showRevertBubble=true，会在每个变更块右下角挂红色 N。
+class DiffView extends StatelessWidget {
   const DiffView({
     super.key,
     required this.diff,
-    this.controller,
-    this.reviewEnabled = true,
+    this.showRevertBubble = false,
+    this.onRevertHunk,
+    this.revertingIndex,
   });
 
   final String diff;
-  final DiffReviewController? controller;
-  /// 为 false 时仅展示红绿差异，不显示审查气泡。
-  final bool reviewEnabled;
-
-  @override
-  State<DiffView> createState() => _DiffViewState();
-}
-
-class DiffReviewController extends ChangeNotifier {
-  List<_DiffLine> _lines = const [];
-  List<_ChangeHunk> _hunks = const [];
-
-  void bind(List<_DiffLine> lines, List<_ChangeHunk> hunks) {
-    _lines = lines;
-    _hunks = hunks;
-  }
-
-  int get pendingCount =>
-      _hunks.where((e) => e.decision == _HunkDecision.pending).length;
-
-  void acceptAll() {
-    for (final h in _hunks) {
-      h.decision = _HunkDecision.accepted;
-    }
-    notifyListeners();
-  }
-
-  void rejectAll() {
-    for (final h in _hunks) {
-      h.decision = _HunkDecision.rejected;
-    }
-    notifyListeners();
-  }
-
-  String merged({bool acceptPending = true}) =>
-      mergeUnifiedDiff(_lines, _hunks, acceptPendingAsAccepted: acceptPending);
-
-  void refresh() => notifyListeners();
-}
-
-class _DiffViewState extends State<DiffView> {
-  late List<_DiffLine> _lines;
-  late List<_ChangeHunk> _hunks;
-
-  @override
-  void initState() {
-    super.initState();
-    _rebuild();
-  }
-
-  @override
-  void didUpdateWidget(covariant DiffView oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.diff != widget.diff) _rebuild();
-  }
-
-  void _rebuild() {
-    _lines = _parseUnifiedDiff(widget.diff);
-    _hunks = _groupChangeHunks(_lines);
-    widget.controller?.bind(_lines, _hunks);
-  }
-
-  _ChangeHunk? _hunkAt(int lineIndex) {
-    for (final h in _hunks) {
-      if (lineIndex >= h.start && lineIndex < h.end) return h;
-    }
-    return null;
-  }
-
-  Future<void> _openHunkMenu(BuildContext context, _ChangeHunk hunk) async {
-    final colors = IdeColors.of(context);
-    final box = context.findRenderObject() as RenderBox?;
-    if (box == null) return;
-    final overlay =
-        Overlay.of(context).context.findRenderObject() as RenderBox?;
-    if (overlay == null) return;
-    final topLeft = box.localToGlobal(Offset.zero, ancestor: overlay);
-    final picked = await showGeneralDialog<_HunkDecision>(
-      context: context,
-      barrierDismissible: true,
-      barrierLabel: 'dismiss',
-      barrierColor: Colors.transparent,
-      pageBuilder: (_, __, ___) => const SizedBox.shrink(),
-      transitionBuilder: (ctx, anim, _, __) {
-        return Stack(
-          children: [
-            Positioned.fill(
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: () => Navigator.of(ctx).pop(),
-              ),
-            ),
-            Positioned(
-              left: (topLeft.dx + 28).clamp(8.0, overlay.size.width - 168),
-              top: topLeft.dy,
-              width: 160,
-              child: Material(
-                color: Colors.transparent,
-                child: Container(
-                  decoration: BoxDecoration(
-                    color: colors.panelElevated,
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: colors.borderStrong),
-                    boxShadow: [
-                      BoxShadow(
-                        color: colors.shadow,
-                        blurRadius: 16,
-                        offset: const Offset(0, 6),
-                      ),
-                    ],
-                  ),
-                  padding: const EdgeInsets.symmetric(vertical: 6),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      _menuItem(
-                        ctx,
-                        colors,
-                        icon: Icons.check_rounded,
-                        label: '接受此块',
-                        color: const Color(0xFF2F9E44),
-                        value: _HunkDecision.accepted,
-                      ),
-                      _menuItem(
-                        ctx,
-                        colors,
-                        icon: Icons.close_rounded,
-                        label: '拒绝此块',
-                        color: const Color(0xFFE5484D),
-                        value: _HunkDecision.rejected,
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ],
-        );
-      },
-    );
-    if (picked == null || !mounted) return;
-    setState(() => hunk.decision = picked);
-    widget.controller?.refresh();
-  }
-
-  Widget _menuItem(
-    BuildContext ctx,
-    IdeColors colors, {
-    required IconData icon,
-    required String label,
-    required Color color,
-    required _HunkDecision value,
-  }) {
-    return InkWell(
-      onTap: () => Navigator.of(ctx).pop(value),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
-        child: Row(
-          children: [
-            Icon(icon, size: 15, color: color),
-            const SizedBox(width: 8),
-            Text(
-              label,
-              style: TextStyle(
-                color: colors.textPrimary,
-                fontSize: 12.5,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Color _bubbleColor(_ChangeHunk hunk) {
-    switch (hunk.decision) {
-      case _HunkDecision.accepted:
-        return const Color(0xFF2F9E44);
-      case _HunkDecision.rejected:
-        return const Color(0xFF868E96);
-      case _HunkDecision.pending:
-        return const Color(0xFFE03131);
-    }
-  }
+  final bool showRevertBubble;
+  final ValueChanged<int>? onRevertHunk;
+  final int? revertingIndex;
 
   @override
   Widget build(BuildContext context) {
@@ -369,179 +141,178 @@ class _DiffViewState extends State<DiffView> {
     final gutterBg = colors.panel;
     final gutterFg = colors.textMuted;
 
-    return AnimatedBuilder(
-      animation: Listenable.merge([
-        if (widget.controller != null) widget.controller!,
-      ]),
-      builder: (context, _) {
-        return Container(
-          color: colors.panelElevated,
-          child: ListView.builder(
-            padding: EdgeInsets.zero,
-            itemCount: _lines.length,
-            itemBuilder: (context, index) {
-              final line = _lines[index];
-              Color? bg;
-              Color fg = colors.textPrimary;
-              String mark = ' ';
-              switch (line.kind) {
-                case 'add':
-                  bg = addBg;
-                  fg = addFg;
-                  mark = '+';
-                  break;
-                case 'del':
-                  bg = delBg;
-                  fg = delFg;
-                  mark = '-';
-                  break;
-                case 'hunk':
-                  bg = hunkBg;
-                  fg = colors.textMuted;
-                  mark = ' ';
-                  break;
-                case 'meta':
-                  fg = metaFg;
-                  mark = ' ';
-                  break;
-                default:
-                  break;
-              }
+    final lines = _parseUnifiedDiff(diff);
+    final hunks = showRevertBubble ? _groupChangeHunks(lines) : <_ChangeHunk>[];
+    final hunkEndAt = <int, _ChangeHunk>{
+      for (final h in hunks) h.end - 1: h,
+    };
 
-              final hunk =
-                  widget.reviewEnabled ? _hunkAt(index) : null;
-              final showBubble = hunk != null && index == hunk.start;
-
-              return Container(
-                color: bg,
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    if (widget.reviewEnabled)
-                      SizedBox(
-                        width: 34,
-                        child: showBubble
-                            ? Padding(
-                                padding:
-                                    const EdgeInsets.only(top: 2, left: 4),
-                                child: Builder(
-                                  builder: (btnCtx) {
-                                    return GestureDetector(
-                                      onTap: () =>
-                                          _openHunkMenu(btnCtx, hunk),
-                                      child: _ReviewBubble(
-                                        label:
-                                            '${hunk.addCount > 0 ? hunk.addCount : hunk.delCount}',
-                                        color: _bubbleColor(hunk),
-                                      ),
-                                    );
-                                  },
-                                ),
-                              )
-                            : null,
-                      ),
-                    Container(
-                      width: 46,
-                      color: gutterBg.withValues(alpha: 0.55),
-                      padding: const EdgeInsets.only(right: 6),
-                      child: Text(
-                        line.oldNo?.toString() ?? '',
-                        textAlign: TextAlign.right,
-                        style: TextStyle(
-                          color: gutterFg,
-                          fontSize: 11,
-                          height: 1.55,
-                          fontFamily: 'Menlo',
-                        ),
-                      ),
-                    ),
-                    Container(
-                      width: 46,
-                      color: gutterBg.withValues(alpha: 0.55),
-                      padding: const EdgeInsets.only(right: 6),
-                      child: Text(
-                        line.newNo?.toString() ?? '',
-                        textAlign: TextAlign.right,
-                        style: TextStyle(
-                          color: gutterFg,
-                          fontSize: 11,
-                          height: 1.55,
-                          fontFamily: 'Menlo',
-                        ),
-                      ),
-                    ),
-                    SizedBox(
-                      width: 18,
-                      child: Text(
-                        mark,
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          color: fg,
-                          fontSize: 12,
-                          height: 1.55,
-                          fontFamily: 'Menlo',
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                    ),
-                    Expanded(
-                      child: SelectableText(
-                        line.text.isEmpty ? ' ' : line.text,
-                        style: TextStyle(
-                          color: fg,
-                          fontSize: 12,
-                          height: 1.55,
-                          fontFamily: 'Menlo',
-                          decoration: hunk?.decision == _HunkDecision.rejected &&
-                                  line.kind == 'add'
-                              ? TextDecoration.lineThrough
-                              : null,
-                        ),
-                      ),
-                    ),
-                  ],
+    Widget lineRow(_DiffLine line) {
+      Color? bg;
+      Color fg = colors.textPrimary;
+      String mark = ' ';
+      switch (line.kind) {
+        case 'add':
+          bg = addBg;
+          fg = addFg;
+          mark = '+';
+          break;
+        case 'del':
+          bg = delBg;
+          fg = delFg;
+          mark = '-';
+          break;
+        case 'hunk':
+          bg = hunkBg;
+          fg = colors.textMuted;
+          mark = ' ';
+          break;
+        case 'meta':
+          fg = metaFg;
+          mark = ' ';
+          break;
+        default:
+          break;
+      }
+      return Container(
+        color: bg,
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              width: 46,
+              color: gutterBg.withValues(alpha: 0.55),
+              padding: const EdgeInsets.only(right: 6),
+              child: Text(
+                line.oldNo?.toString() ?? '',
+                textAlign: TextAlign.right,
+                style: TextStyle(
+                  color: gutterFg,
+                  fontSize: 11,
+                  height: 1.55,
+                  fontFamily: 'Menlo',
                 ),
-              );
-            },
-          ),
-        );
-      },
+              ),
+            ),
+            Container(
+              width: 46,
+              color: gutterBg.withValues(alpha: 0.55),
+              padding: const EdgeInsets.only(right: 6),
+              child: Text(
+                line.newNo?.toString() ?? '',
+                textAlign: TextAlign.right,
+                style: TextStyle(
+                  color: gutterFg,
+                  fontSize: 11,
+                  height: 1.55,
+                  fontFamily: 'Menlo',
+                ),
+              ),
+            ),
+            SizedBox(
+              width: 18,
+              child: Text(
+                mark,
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: fg,
+                  fontSize: 12,
+                  height: 1.55,
+                  fontFamily: 'Menlo',
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+            Expanded(
+              child: SelectableText(
+                line.text.isEmpty ? ' ' : line.text,
+                style: TextStyle(
+                  color: fg,
+                  fontSize: 12,
+                  height: 1.55,
+                  fontFamily: 'Menlo',
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return Container(
+      color: colors.panelElevated,
+      child: ListView.builder(
+        padding: EdgeInsets.zero,
+        itemCount: lines.length,
+        itemBuilder: (context, index) {
+          final line = lines[index];
+          final hunkEnd = hunkEndAt[index];
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              lineRow(line),
+              // 对话差异页：每个变更块结束后在右侧下方挂红色 N，点击回退该块。
+              if (showRevertBubble && hunkEnd != null)
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: Padding(
+                    padding: const EdgeInsets.only(
+                        right: 12, top: 2, bottom: 8),
+                    child: _RevertBubble(
+                      busy: revertingIndex == hunkEnd.index,
+                      onTap: onRevertHunk == null ||
+                              revertingIndex != null
+                          ? null
+                          : () => onRevertHunk!(hunkEnd.index),
+                    ),
+                  ),
+                ),
+            ],
+          );
+        },
+      ),
     );
   }
 }
 
-class _ReviewBubble extends StatelessWidget {
-  const _ReviewBubble({required this.label, required this.color});
+/// 红色 N 回退气泡：圆角矩形 + 顶部箭头一次成形，N 代表回退该变更块。
+class _RevertBubble extends StatelessWidget {
+  const _RevertBubble({this.onTap, this.busy = false});
 
-  final String label;
-  final Color color;
+  final VoidCallback? onTap;
+  final bool busy;
 
   @override
   Widget build(BuildContext context) {
-    return CustomPaint(
-      painter: _BubbleArrowPainter(color),
-      child: Container(
-        margin: const EdgeInsets.only(right: 4, bottom: 4),
-        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
-        decoration: BoxDecoration(
-          color: color,
-          borderRadius: BorderRadius.circular(8),
-          boxShadow: [
-            BoxShadow(
-              color: color.withValues(alpha: 0.35),
-              blurRadius: 6,
-              offset: const Offset(0, 2),
-            ),
-          ],
-        ),
-        child: Text(
-          label,
-          style: const TextStyle(
-            color: Colors.white,
-            fontSize: 11,
-            fontWeight: FontWeight.w800,
-            height: 1.1,
-            fontFamily: 'Menlo',
+    const color = Color(0xFFE03131);
+    return Tooltip(
+      message: '回退此块',
+      child: GestureDetector(
+        onTap: onTap,
+        child: CustomPaint(
+          painter: _IntegratedBubblePainter(color),
+          child: Container(
+            padding: const EdgeInsets.fromLTRB(9, 10, 9, 5),
+            child: busy
+                ? const SizedBox(
+                    width: 12,
+                    height: 12,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2,
+                      color: Colors.white,
+                    ),
+                  )
+                : const Text(
+                    'N',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w800,
+                      height: 1.1,
+                      fontFamily: 'Menlo',
+                    ),
+                  ),
           ),
         ),
       ),
@@ -549,58 +320,51 @@ class _ReviewBubble extends StatelessWidget {
   }
 }
 
-class _BubbleArrowPainter extends CustomPainter {
-  _BubbleArrowPainter(this.color);
+class _IntegratedBubblePainter extends CustomPainter {
+  _IntegratedBubblePainter(this.color);
   final Color color;
 
   @override
   void paint(Canvas canvas, Size size) {
+    const arrowH = 6.0;
+    const arrowW = 10.0;
+    const radius = 8.0;
     final paint = Paint()..color = color;
+    final body = RRect.fromRectAndRadius(
+      Rect.fromLTWH(0, arrowH, size.width, size.height - arrowH),
+      const Radius.circular(radius),
+    );
+    // 箭头靠右，指向它所属的变更块。
+    final ax = size.width - 16;
     final path = Path()
-      ..moveTo(size.width - 2, size.height * 0.45)
-      ..lineTo(size.width + 5, size.height * 0.55)
-      ..lineTo(size.width - 2, size.height * 0.7)
+      ..addRRect(body)
+      ..moveTo(ax - arrowW / 2, arrowH + 1)
+      ..lineTo(ax, 0)
+      ..lineTo(ax + arrowW / 2, arrowH + 1)
       ..close();
+    canvas.drawShadow(path, color.withValues(alpha: 0.35), 6, true);
     canvas.drawPath(path, paint);
   }
 
   @override
-  bool shouldRepaint(covariant _BubbleArrowPainter oldDelegate) =>
+  bool shouldRepaint(covariant _IntegratedBubblePainter oldDelegate) =>
       oldDelegate.color != color;
 }
 
-class DiffDialog extends StatefulWidget {
+class DiffDialog extends StatelessWidget {
   const DiffDialog({
     super.key,
     required this.title,
     required this.diff,
-    this.onApplyMerged,
-    this.reviewEnabled = true,
   });
 
   final String title;
   final String diff;
-  final ValueChanged<String>? onApplyMerged;
-  /// 分支页只读查看；对话入口才开启审查/合并。
-  final bool reviewEnabled;
-
-  @override
-  State<DiffDialog> createState() => _DiffDialogState();
-}
-
-class _DiffDialogState extends State<DiffDialog> {
-  final _review = DiffReviewController();
-
-  @override
-  void dispose() {
-    _review.dispose();
-    super.dispose();
-  }
 
   @override
   Widget build(BuildContext context) {
     final colors = IdeColors.of(context);
-    final lines = _parseUnifiedDiff(widget.diff);
+    final lines = _parseUnifiedDiff(diff);
     final adds = lines.where((e) => e.kind == 'add').length;
     final dels = lines.where((e) => e.kind == 'del').length;
     return Dialog(
@@ -615,7 +379,8 @@ class _DiffDialogState extends State<DiffDialog> {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
               decoration: BoxDecoration(
                 border: Border(
                   bottom: BorderSide(color: colors.border),
@@ -628,7 +393,7 @@ class _DiffDialogState extends State<DiffDialog> {
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(
-                      widget.title,
+                      title,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
                         color: colors.textPrimary,
@@ -646,33 +411,6 @@ class _DiffDialogState extends State<DiffDialog> {
                     label: '-$dels',
                     color: const Color(0xFFE5484D),
                   ),
-                  if (widget.reviewEnabled) ...[
-                    const SizedBox(width: 8),
-                    TextButton(
-                      onPressed: () {
-                        _review.acceptAll();
-                        setState(() {});
-                      },
-                      child: const Text('全部接受'),
-                    ),
-                    TextButton(
-                      onPressed: () {
-                        _review.rejectAll();
-                        setState(() {});
-                      },
-                      child: const Text('全部拒绝'),
-                    ),
-                    if (widget.onApplyMerged != null)
-                      FilledButton(
-                        onPressed: () {
-                          final merged =
-                              _review.merged(acceptPending: true);
-                          widget.onApplyMerged!(merged);
-                          Navigator.of(context).pop(true);
-                        },
-                        child: const Text('应用合并'),
-                      ),
-                  ],
                   IconButton(
                     visualDensity: VisualDensity.compact,
                     onPressed: () => Navigator.of(context).pop(),
@@ -683,11 +421,7 @@ class _DiffDialogState extends State<DiffDialog> {
               ),
             ),
             Expanded(
-              child: DiffView(
-                diff: widget.diff,
-                controller: widget.reviewEnabled ? _review : null,
-                reviewEnabled: widget.reviewEnabled,
-              ),
+              child: DiffView(diff: diff),
             ),
           ],
         ),

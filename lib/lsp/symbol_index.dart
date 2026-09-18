@@ -50,6 +50,10 @@ class SymbolIndex {
   int _symbolCount = 0;
   int _refCount = 0;
   String? _status;
+  /// 超时文件提示：超 maxFiles 后不被静默丢，状态里看得见。
+  int _skippedFiles = 0;
+  bool get hasSkipped => _skippedFiles > 0;
+  int get skippedFiles => _skippedFiles;
 
   bool get indexing => _indexing;
   int get symbolCount => _symbolCount;
@@ -124,7 +128,9 @@ class SymbolIndex {
         );
       _symbolCount = (result['count'] as num?)?.toInt() ?? 0;
       _refCount = (result['refCount'] as num?)?.toInt() ?? 0;
-      _status = '已索引 $_symbolCount 个符号 / $_refCount 处引用';
+      _skippedFiles = (result['skipped'] as num?)?.toInt() ?? 0;
+      _status = '已索引 $_symbolCount 个符号 / $_refCount 处引用'
+          '${_skippedFiles > 0 ? '（超时省略 $_skippedFiles 个超大/超量文件）' : ''}';
     } catch (e) {
       if (gen != _generation) return;
       _status = '索引失败：$e';
@@ -301,6 +307,7 @@ class SymbolIndex {
     final fileTexts = <String, String>{};
     var count = 0;
     var refCount = 0;
+    var skipped = 0;
     const maxFileBytes = 1024 * 1024;
     const maxFiles = 8000;
 
@@ -341,11 +348,17 @@ class SymbolIndex {
         if (rules == null) continue;
         try {
           final length = entity.lengthSync();
-          if (length <= 0 || length > maxFileBytes) continue;
+          if (length <= 0 || length > maxFileBytes) {
+            skipped++;
+            continue;
+          }
           final raf = entity.openSync();
           final sample = raf.readSync(min(512, length));
           raf.closeSync();
-          if (sample.contains(0)) continue;
+          if (sample.contains(0)) {
+            skipped++;
+            continue;
+          }
           final text = entity.readAsStringSync();
           hashes[entity.path] = sha1.convert(utf8.encode(text)).toString();
           fileTexts[entity.path] = text;
@@ -381,10 +394,12 @@ class SymbolIndex {
         );
       }
     }
-    for (final entry in fileTexts.entries) {
+    // 内存不常住全文：边遍历边遍，用完即清，避免常驻全量文本。
+    final refKeys = fileTexts.keys.toList();
+    for (final key in refKeys) {
       final found = extractReferences(
-        filePath: entry.key,
-        source: entry.value,
+        filePath: key,
+        source: fileTexts.remove(key)!,
         definedNames: definedNames,
         definitionKeys: definitionKeys,
       );
@@ -411,6 +426,7 @@ class SymbolIndex {
       'hashes': hashes,
       'count': count,
       'refCount': refCount,
+      'skipped': skipped,
     };
   }
 

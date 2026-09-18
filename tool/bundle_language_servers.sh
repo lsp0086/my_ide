@@ -87,9 +87,10 @@ EOF
     chmod +x "$dir/bin/npm"
   fi
   rm -rf "$STAGE/$name"
-  # 再砍 npm 里的 docs / man / 测试
-  find "$dir" -type d \( -name test -o -name tests -o -name docs -o -name man -o -name .github \) -prune -exec rm -rf {} + 2>/dev/null || true
-  find "$dir" -type f \( -name '*.md' -o -name '*.map' -o -name '*.ts' -o -name 'CHANGELOG*' \) -delete 2>/dev/null || true
+  # 仅删 build 类目录：保留 .ts/.d.ts/.map/.md/LICENSE 等代码相关文件，
+  # 避免 bundled 语言服务缺文件导致编辑器大面积飘红。
+  # 体积问题只靠删 build 目录解决。
+  find "$dir" -type d \( -name build -o -name dist -o -name out -o -name coverage \) -prune -exec rm -rf {} + 2>/dev/null || true
   echo "node slim: $(du -sh "$dir" | awk '{print $1}')"
 }
 
@@ -116,9 +117,8 @@ install_npm_pkg() {
     exit 1
   fi
 
-  # 精简 node_modules：删 docs/map/tests
-  find "$dir/node_modules" -type d \( -name test -o -name tests -o -name docs -o -name .github -o -name example -o -name examples \) -prune -exec rm -rf {} + 2>/dev/null || true
-  find "$dir/node_modules" -type f \( -name '*.md' -o -name '*.map' -o -name 'CHANGELOG*' -o -name 'LICENSE*' -o -name '*.ts' ! -name '*.d.ts' \) -delete 2>/dev/null || true
+  # 精简 node_modules：只删 build 类目录，保留 .ts/.d.ts/.map/.md/LICENSE 等代码相关文件
+  find "$dir/node_modules" -type d \( -name build -o -name dist -o -name out -o -name coverage \) -prune -exec rm -rf {} + 2>/dev/null || true
   # typescript 只需 lib/tsserver.js 及相关；保留 lib 即可
   if [[ "$folder" == "typescript" ]]; then
     if [[ ! -f "$dir/node_modules/typescript/lib/tsserver.js" ]]; then
@@ -191,8 +191,8 @@ install_clangd() {
   curl -fsSL "$url" -o "$dir/$name"
   unzip -qo "$dir/$name" -d "$dir"
   rm -f "$dir/$name"
-  # 只保留 bin/clangd，去掉 lib 里巨大无用资源可再增强；至少删掉 zip 与多余文档
-  find "$dir" -type f \( -name '*.md' -o -name '*.pdf' \) -delete 2>/dev/null || true
+  # 仅删 build 类目录，保留代码相关文件（避免 bundled 服务缺文件飘红）
+  find "$dir" -type d \( -name build -o -name dist -o -name out -o -name coverage \) -prune -exec rm -rf {} + 2>/dev/null || true
   local found
   found="$(find "$dir" -type f \( -name clangd -o -name clangd.exe \) | head -1)"
   test -n "$found"

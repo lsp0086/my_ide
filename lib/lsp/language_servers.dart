@@ -106,6 +106,9 @@ class DefinitionService {
 
   final Map<String, LspClient> _clients = {};
   final Map<String, bool> _availabilityCache = {};
+  final Map<String, DateTime> _lastUsed = {};
+  static const _ttl = Duration(minutes: 5);
+  static const _maxClients = 3;
 
   LanguageServerSpec? specForExtension(String ext) {
     final lower = ext.toLowerCase();
@@ -255,7 +258,22 @@ class DefinitionService {
 
     final key = '${spec.id}::$command::$rootPath';
     final existing = _clients[key];
-    if (existing != null && existing.running) return existing;
+    if (existing != null && existing.running) {
+      _lastUsed[key] = DateTime.now();
+      return existing;
+    }
+    // 超时淘汰：长久不用的旧 client 主动 stop 释放内存。
+    final now = DateTime.now();
+    _lastUsed.removeWhere((k, at) {
+      final evict = at.add(_ttl).isBefore(now) ||
+          (_clients.length >= _maxClients && k != key);
+      if (evict) {
+        final c = _clients.remove(k);
+        c?.stop();
+      }
+      return evict;
+    });
+    _lastUsed[key] = now;
 
     Map<String, dynamic>? initOptions;
     final checkJs = SettingsStore.instance.jsImplicitCheckJs;

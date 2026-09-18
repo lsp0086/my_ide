@@ -20,24 +20,11 @@ class DiagnosticsStore extends ChangeNotifier {
 
   int contentVersionOf(String path) => _contentVersion[path] ?? 0;
 
-  /// 文档内容变更时递增版本，并清掉该文件过期诊断。
+  /// 文档内容变更时递增版本；过期诊断不立即清空，保留展示直到新诊断回包覆盖。
+  /// 避免每次击键清空全文件诊断再闪回：LSP 慢回包期间仍显示上一版结果。
   int bumpContentVersion(String path) {
     final next = (_contentVersion[path] ?? 0) + 1;
     _contentVersion[path] = next;
-    final current = _byFile[path];
-    if (current != null && current.isNotEmpty) {
-      final kept = current
-          .where((d) => d.contentVersion == next)
-          .toList(growable: false);
-      if (kept.length != current.length) {
-        if (kept.isEmpty) {
-          _byFile.remove(path);
-        } else {
-          _byFile[path] = kept;
-        }
-        notifyListeners();
-      }
-    }
     return next;
   }
 

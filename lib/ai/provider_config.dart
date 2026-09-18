@@ -82,8 +82,10 @@ class AiModelOption {
 }
 
 /// 供应商请求协议。默认 OpenAI 兼容，旧配置无此字段时按 openaiCompatible 解析。
+/// 已有模型列表的供应商不再允许切换协议（UI 层锁定），避免历史对话与工具格式错乱。
 enum AiApiStyle {
   openaiCompatible,
+  openaiResponses,
   anthropic,
 }
 
@@ -97,7 +99,15 @@ class AiProviderConfig {
     this.apiStyle = AiApiStyle.openaiCompatible,
     this.anthropicVersion = '2023-06-01',
     List<AiModelOption>? models,
-  }) : models = models ?? [];
+    Map<String, String>? extraHeaders,
+    this.useApiKeyHeader = false,
+    this.responsesBackground = false,
+    this.responsesPreviousResponse = false,
+    this.responsesWebSearch = false,
+    this.responsesCodeInterpreter = false,
+    this.responsesToolChoice = 'auto',
+  })  : models = models ?? [],
+        extraHeaders = extraHeaders ?? {};
 
   final String id;
   String name;
@@ -110,8 +120,20 @@ class AiProviderConfig {
   /// Anthropic 必填版本头；仅 anthropic 协议使用。
   String anthropicVersion;
   List<AiModelOption> models;
+  /// 自定义附加请求头：OpenRouter 的 HTTP-Referer/X-Title、自建网关鉴权、代理标记等。
+  Map<String, String> extraHeaders;
+  /// Azure 风格：用 `api-key: <key>` 代替 `Authorization: Bearer`。
+  bool useApiKeyHeader;
+  /// Responses 完整参数（仅 openaiResponses 协议用）：后台运行、多轮 previous_response_id
+  /// 复用、内置 web_search / code_interpreter、tool_choice 模式。默认全关保持旧行为。
+  bool responsesBackground;
+  bool responsesPreviousResponse;
+  bool responsesWebSearch;
+  bool responsesCodeInterpreter;
+  String responsesToolChoice;
 
   bool get isAnthropic => apiStyle == AiApiStyle.anthropic;
+  bool get isResponses => apiStyle == AiApiStyle.openaiResponses;
 
   /// 去掉末尾斜杠。
   static String _trimSlash(String url) {
@@ -141,15 +163,21 @@ class AiProviderConfig {
   ///
   /// - Base 模式：填 `https://host` 或已含 `/v1` 的地址
   /// - 完整 chat（OpenAI）：填 `…/v1/chat/completions`，剥到 `…/v1`
+  /// - 完整 responses（OpenAI Responses）：填 `…/v1/responses`，剥到 `…/v1`
   /// - 完整 messages（Anthropic）：填 `…/v1/messages`，剥到 `…/v1`
+  /// - Azure（`…/openai/deployments/…`）、Gemini（`…/v1beta/openai/…`）等：
+  ///   路径已含版本/部署段时原样返回，不再无脑补 `/v1`。
   String get apiBase {
     var base = _trimSlash(baseUrl);
     if (fullUrl) {
       const chatSuffix = '/chat/completions';
+      const responsesSuffix = '/responses';
       const messagesSuffix = '/messages';
       final lower = base.toLowerCase();
       if (lower.endsWith(chatSuffix)) {
         base = base.substring(0, base.length - chatSuffix.length);
+      } else if (lower.endsWith(responsesSuffix)) {
+        base = base.substring(0, base.length - responsesSuffix.length);
       } else if (lower.endsWith(messagesSuffix)) {
         base = base.substring(0, base.length - messagesSuffix.length);
       } else {
@@ -159,10 +187,23 @@ class AiProviderConfig {
           while (segs.isNotEmpty &&
               (segs.last == 'chat' ||
                   segs.last == 'completions' ||
+                  segs.last == 'responses' ||
                   segs.last == 'messages')) {
             segs.removeLast();
           }
           base = _trimSlash(uri.replace(pathSegments: segs).toString());
+        }
+      }
+    }
+    // 路径任一段已含版本/部署标记（v1/v1beta/openai/deployments）→ 原样，不补 /v1。
+    final uri = Uri.tryParse(base);
+    if (uri != null && uri.pathSegments.isNotEmpty) {
+      for (final seg in uri.pathSegments) {
+        final s = seg.toLowerCase();
+        if (RegExp(r'^v\d+[a-z0-9]*$').hasMatch(s) ||
+            s == 'openai' ||
+            s == 'deployments') {
+          return base;
         }
       }
     }
@@ -177,12 +218,18 @@ class AiProviderConfig {
   /// POST 对话（OpenAI）：`{apiBase}/chat/completions`
   String get chatCompletionsUrl => joinEndpoint(apiBase, 'chat/completions');
 
+  /// POST 对话（OpenAI Responses）：`{apiBase}/responses`
+  String get responsesUrl => joinEndpoint(apiBase, 'responses');
+
   /// POST 对话（Anthropic）：`{apiBase}/messages`
   String get messagesUrl => joinEndpoint(apiBase, 'messages');
 
   /// 当前协议实际对话 URL。
-  String get chatUrl =>
-      isAnthropic ? messagesUrl : chatCompletionsUrl;
+  String get chatUrl {
+    if (isAnthropic) return messagesUrl;
+    if (isResponses) return responsesUrl;
+    return chatCompletionsUrl;
+  }
 
   Map<String, dynamic> toJson() => {
         'id': id,
@@ -193,12 +240,25 @@ class AiProviderConfig {
         'apiStyle': apiStyle.name,
         'anthropicVersion': anthropicVersion,
         'models': models.map((e) => e.toJson()).toList(),
+        if (extraHeaders.isNotEmpty) 'extraHeaders': extraHeaders,
+        if (useApiKeyHeader) 'useApiKeyHeader': true,
+        if (responsesBackground) 'responsesBackground': true,
+        if (responsesPreviousResponse) 'responsesPreviousResponse': true,
+        if (responsesWebSearch) 'responsesWebSearch': true,
+        if (responsesCodeInterpreter) 'responsesCodeInterpreter': true,
+        if (responsesToolChoice != 'auto')
+          'responsesToolChoice': responsesToolChoice,
       };
 
   static AiApiStyle apiStyleFromJson(dynamic raw) {
     final s = '$raw'.trim();
     if (s == AiApiStyle.anthropic.name || s == 'anthropic') {
       return AiApiStyle.anthropic;
+    }
+    if (s == AiApiStyle.openaiResponses.name ||
+        s == 'openaiResponses' ||
+        s == 'responses') {
+      return AiApiStyle.openaiResponses;
     }
     return AiApiStyle.openaiCompatible;
   }
@@ -215,9 +275,18 @@ class AiProviderConfig {
             .whereType<Map>()
             .map((e) => AiModelOption.fromJson(Map<String, dynamic>.from(e)))
             .toList(),
+        extraHeaders: ((j['extraHeaders'] as Map?) ?? {})
+            .map((k, v) => MapEntry('$k', '$v')),
+        useApiKeyHeader: j['useApiKeyHeader'] == true,
+        responsesBackground: j['responsesBackground'] == true,
+        responsesPreviousResponse: j['responsesPreviousResponse'] == true,
+        responsesWebSearch: j['responsesWebSearch'] == true,
+        responsesCodeInterpreter: j['responsesCodeInterpreter'] == true,
+        responsesToolChoice: '${j['responsesToolChoice'] ?? 'auto'}',
       );
 
   /// 标准化 API Key：去掉空白/引号/误粘贴的 `Bearer `、`Authorization:` 前缀。
+  /// 仅当剩余部分像真 key（长度>10）时才剥前缀，避免误伤本身含 bearer 字样的短 key。
   static String normalizeApiKey(String token) {
     var key = token.trim();
     // 去掉粘贴时的换行/零宽字符
@@ -228,7 +297,11 @@ class AiProviderConfig {
       caseSensitive: false,
     ).firstMatch(key);
     if (authMatch != null) {
-      key = authMatch.group(1)!.trim();
+      final candidate = authMatch.group(1)!.trim();
+      // 只有剥完还像 key 才采用，否则保留原文（防误剥）。
+      if (candidate.length > 10 || candidate.length == key.trim().length) {
+        key = candidate;
+      }
     }
     // 去掉包裹引号
     if ((key.startsWith('"') && key.endsWith('"')) ||
@@ -238,24 +311,62 @@ class AiProviderConfig {
     return key;
   }
 
-  /// 遮罩展示 key，便于排查是否传到请求里（不泄露全文）。
+  /// 密钥提示：只暴露长度与是否已配置，不再打前后缀，防泄漏。
   static String debugKeyHint(String raw) {
     final key = normalizeApiKey(raw);
     if (key.isEmpty) return 'empty';
-    if (key.length <= 8) return 'len=${key.length} value="$key"';
-    return 'len=${key.length} prefix="${key.substring(0, 4)}" suffix="${key.substring(key.length - 4)}"';
+    return 'len=${key.length} set=true';
+  }
+
+  /// 对话/拉表统一鉴权头：Anthropic 走 x-api-key；Azure 走 api-key；
+  /// 其余走 Authorization: Bearer；最后叠加 extraHeaders（不覆盖鉴权头）。
+  Map<String, String> authHeaders({String? anthropicVersionOverride}) {
+    final headers = <String, String>{};
+    final key = normalizeApiKey(token);
+    if (key.isNotEmpty) {
+      if (isAnthropic) {
+        headers['x-api-key'] = key;
+        headers['anthropic-version'] =
+            (anthropicVersionOverride ?? anthropicVersion).trim().isEmpty
+                ? '2023-06-01'
+                : (anthropicVersionOverride ?? anthropicVersion).trim();
+      } else if (useApiKeyHeader) {
+        headers['api-key'] = key;
+      } else {
+        headers['Authorization'] = 'Bearer $key';
+      }
+    }
+    for (final entry in extraHeaders.entries) {
+      final k = entry.key.trim();
+      if (k.isEmpty) continue;
+      final lower = k.toLowerCase();
+      if (lower == 'authorization' ||
+          lower == 'x-api-key' ||
+          lower == 'api-key' ||
+          lower == 'anthropic-version') {
+        continue;
+      }
+      headers[k] = entry.value;
+    }
+    return headers;
   }
 
   /// 拉模型列表。
-  /// - OpenAI：`Authorization: Bearer`
-  /// - Anthropic：`x-api-key` + `anthropic-version`
+  /// - OpenAI/Responses：`Authorization: Bearer`（Azure 用 `api-key`，见 useApiKeyHeader）
+  /// - Anthropic：官方无 `/v1/models` 拉表接口，直接抛错引导手动添加，不发必 404 的请求。
   static Future<List<String>> fetchModelIds({
     required String modelsUrl,
     required String token,
     AiApiStyle apiStyle = AiApiStyle.openaiCompatible,
     String anthropicVersion = '2023-06-01',
+    Map<String, String> extraHeaders = const {},
+    bool useApiKeyHeader = false,
   }) async {
-    final rawLen = token.length;
+    if (apiStyle == AiApiStyle.anthropic) {
+      throw Exception(
+        'Anthropic 官方无 /v1/models 拉表接口，请在下方手动添加模型（如 claude-opus-4-6）。',
+      );
+    }
     final key = normalizeApiKey(token);
     final uri = Uri.parse(modelsUrl);
     if (uri.scheme != 'http' && uri.scheme != 'https') {
@@ -266,26 +377,26 @@ class AiProviderConfig {
       'Accept': 'application/json',
       'Content-Type': 'application/json',
     };
-    final sentAuth = key.isNotEmpty;
-    String authDesc;
-    if (apiStyle == AiApiStyle.anthropic) {
-      if (sentAuth) {
-        headers['x-api-key'] = key;
-        headers['anthropic-version'] =
-            anthropicVersion.trim().isEmpty ? '2023-06-01' : anthropicVersion.trim();
-      }
-      authDesc = sentAuth
-          ? 'x-api-key: <${debugKeyHint(token)}>; anthropic-version: ${headers['anthropic-version']}'
-          : '(无 x-api-key 头)';
-    } else {
-      // 严格按官网：有 key 就必须带 Authorization: Bearer
-      if (sentAuth) {
+    if (key.isNotEmpty) {
+      if (useApiKeyHeader) {
+        headers['api-key'] = key;
+      } else {
         headers['Authorization'] = 'Bearer $key';
       }
-      authDesc = sentAuth
-          ? 'Authorization: Bearer <${debugKeyHint(token)}>'
-          : '(无 Authorization 头)';
     }
+    for (final entry in extraHeaders.entries) {
+      final k = entry.key.trim();
+      if (k.isEmpty) continue;
+      final lower = k.toLowerCase();
+      if (lower == 'authorization' || lower == 'api-key') continue;
+      headers[k] = entry.value;
+    }
+    final sentAuth = key.isNotEmpty;
+    final authDesc = sentAuth
+        ? (useApiKeyHeader
+            ? 'api-key: <${debugKeyHint(token)}>'
+            : 'Authorization: Bearer <${debugKeyHint(token)}>')
+        : '(无鉴权头)';
 
     final resp = await http
         .get(uri, headers: headers)
@@ -298,7 +409,6 @@ class AiProviderConfig {
       throw Exception(
         'GET $modelsUrl\n'
         'Header: $authDesc\n'
-        'rawTokenLen=$rawLen normalizedLen=${key.length}\n'
         '→ HTTP ${resp.statusCode}: $body',
       );
     }

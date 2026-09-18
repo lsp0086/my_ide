@@ -12,11 +12,14 @@ class ProblemsPanel extends StatelessWidget {
     required this.diagnostics,
     required this.workspace,
     this.onClose,
+    this.onAiFix,
   });
 
   final DiagnosticsStore diagnostics;
   final WorkspaceController workspace;
   final VoidCallback? onClose;
+  /// AI 修复入口：UI 侧注入，参数为要修复的诊断列表（空表示全部）。
+  final void Function(List<IdeDiagnostic> diagnostics)? onAiFix;
 
   @override
   Widget build(BuildContext context) {
@@ -52,6 +55,19 @@ class ProblemsPanel extends StatelessWidget {
                     style: TextStyle(color: colors.textMuted, fontSize: 11),
                   ),
                   const Spacer(),
+                  if (onAiFix != null && items.isNotEmpty)
+                    TextButton(
+                      style: TextButton.styleFrom(
+                        minimumSize: Size.zero,
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 8, vertical: 4),
+                        tapTargetSize:
+                            MaterialTapTargetSize.shrinkWrap,
+                      ),
+                      onPressed: () => onAiFix!(items),
+                      child: const Text('AI 修复全部',
+                          style: TextStyle(fontSize: 11)),
+                    ),
                   if (onClose != null)
                     IconButton(
                       tooltip: '关闭',
@@ -86,6 +102,9 @@ class ProblemsPanel extends StatelessWidget {
                               character: d.startChar,
                             );
                           },
+                          onAiFix: onAiFix == null
+                              ? null
+                              : () => onAiFix!([d]),
                         );
                       },
                     ),
@@ -102,11 +121,13 @@ class _ProblemTile extends StatelessWidget {
     required this.diagnostic,
     required this.rootPath,
     required this.onTap,
+    this.onAiFix,
   });
 
   final IdeDiagnostic diagnostic;
   final String? rootPath;
   final VoidCallback onTap;
+  final VoidCallback? onAiFix;
 
   @override
   Widget build(BuildContext context) {
@@ -147,6 +168,18 @@ class _ProblemTile extends StatelessWidget {
                 ],
               ),
             ),
+            if (onAiFix != null)
+              TextButton(
+                style: TextButton.styleFrom(
+                  minimumSize: Size.zero,
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 8, vertical: 4),
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                onPressed: onAiFix,
+                child: const Text('AI 修复',
+                    style: TextStyle(fontSize: 11)),
+              ),
           ],
         ),
       ),

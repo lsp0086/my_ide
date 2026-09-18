@@ -2,10 +2,11 @@ import 'package:flutter/material.dart';
 
 import '../theme/app_colors.dart';
 import '../version/checkpoint_store.dart';
+import '../workspace/workspace_controller.dart';
 import 'diff_view.dart';
 
-/// 版本页只做节点浏览：查看每次 checkpoint 改了哪些文件及行级 diff。
-/// 回退统一走对话回退入口，避免两个回退路径打架。
+/// 版本页：节点浏览 + 单节点 Restore + Redo。
+/// Restore 前当前现场自动入 Redo 栈（store 内最多 20 条），误恢复可一键回去。
 class VersionPanel extends StatelessWidget {
   const VersionPanel({super.key, this.onClose});
 
@@ -41,6 +42,17 @@ class VersionPanel extends StatelessWidget {
                     ),
                   ),
                   const Spacer(),
+                  if (store.canRedo)
+                    TextButton.icon(
+                      onPressed: store.busy
+                          ? null
+                          : () => _redo(context, store),
+                      icon: const Icon(Icons.redo_rounded, size: 14),
+                      label: Text(
+                        'Redo${store.redoLabels.isNotEmpty ? '（${store.redoLabels.length}）' : ''}',
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                    ),
                   IconButton(
                     tooltip: '刷新',
                     visualDensity: VisualDensity.compact,
@@ -65,6 +77,26 @@ class VersionPanel extends StatelessWidget {
         );
       },
     );
+  }
+
+  Future<void> _redo(BuildContext context, CheckpointStore store) async {
+    try {
+      final label = await store.redoLastRestore();
+      if (!context.mounted) return;
+      try {
+        await WorkspaceScope.maybeOf(context)?.notifyExternalChanges();
+      } catch (_) {}
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(label == null ? '无可 Redo 的现场' : '已 Redo 回到：$label'),
+        ),
+      );
+    } catch (e) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Redo 失败：$e')),
+      );
+    }
   }
 
   Widget _buildBody(BuildContext context, CheckpointStore store) {
@@ -119,6 +151,7 @@ class _VersionNodeCardState extends State<_VersionNodeCard> {
   bool _expanded = false;
   List<FileChange>? _changes;
   bool _loadingChanges = false;
+  bool _restoring = false;
 
   Future<void> _toggle() async {
     setState(() => _expanded = !_expanded);
@@ -131,6 +164,51 @@ class _VersionNodeCardState extends State<_VersionNodeCard> {
         _changes = changes;
         _loadingChanges = false;
       });
+    }
+  }
+
+  Future<void> _restore() async {
+    if (_restoring) return;
+    final store = CheckpointScope.of(context);
+    if (store.busy) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('恢复到该版本？'),
+        content: Text(
+          '将把工作区写成节点 ${widget.info.id} 的内容。\n'
+          '当前现场会自动入 Redo 栈，可一键回去。\n\n${widget.info.message}',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('恢复'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    setState(() => _restoring = true);
+    try {
+      await store.restoreWorkspaceTo(widget.info.id);
+      if (!mounted) return;
+      try {
+        await WorkspaceScope.maybeOf(context)?.notifyExternalChanges();
+      } catch (_) {}
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已恢复到 ${widget.info.id}，可用右上 Redo 回去')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('恢复失败：$e')),
+      );
+    } finally {
+      if (mounted) setState(() => _restoring = false);
     }
   }
 
@@ -186,6 +264,22 @@ class _VersionNodeCardState extends State<_VersionNodeCard> {
                       fontWeight: FontWeight.w600,
                     ),
                   ),
+                ),
+                TextButton(
+                  style: TextButton.styleFrom(
+                    minimumSize: Size.zero,
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                  onPressed: _restoring ? null : _restore,
+                  child: _restoring
+                      ? const SizedBox(
+                          width: 12,
+                          height: 12,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Text('恢复', style: TextStyle(fontSize: 12)),
                 ),
               ],
             ),
@@ -291,8 +385,6 @@ class _FileChangeRow extends StatelessWidget {
       builder: (context) => DiffDialog(
         title: '${change.path} @ $versionId',
         diff: diff.isEmpty ? '（无可显示的差异）' : diff,
-        // 分支页只读浏览，精细合并仅对话入口可用
-        reviewEnabled: false,
       ),
     );
   }

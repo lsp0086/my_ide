@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 桌面发布：本机可编的平台 → dist/ 扁平打包 → flutter clean
+# 桌面发布：本机可编的平台 → dist/ 扁平打包 → 只删 build（保留 .dart_tool，避免引用飘红）
 # 依赖 packages/clipboard（path），Windows 可直接 flutter build，无需再 patch。
 # 用法：
 #   ./scripts/release_desktop.command
@@ -189,11 +189,11 @@ ls -lh "$OUT_DIR" | sed 's/^/  /'
 echo
 
 if [[ "$NO_CLEAN" -eq 0 ]]; then
-  echo "==> 清理 build 缓存 (flutter clean)"
-  flutter clean
+  echo "==> 清理 build 目录（仅删 build，保留 .dart_tool 避免引用飘红）"
+  rm -rf "$ROOT/build"
   echo "完成。"
 else
-  echo "==> 已跳过 flutter clean (--no-clean)"
+  echo "==> 已跳过清理 build (--no-clean)"
 fi
 
 if [[ ${#fail[@]} -gt 0 ]]; then

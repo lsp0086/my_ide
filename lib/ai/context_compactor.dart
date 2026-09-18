@@ -4,29 +4,28 @@ import 'agent_client.dart';
 import 'chat_store.dart';
 import 'provider_config.dart';
 
-/// Token 估算：英文 ~4 字符/token，中文 ~1.5 字符/token。
-/// 不准但够做触发器，服务端 usage 回来后再校准。
+/// Token 估算：英文 ~4 字符/token，中文 ~1.5 字符/token，emoji 按 2 token 保守估。
+/// 不准但够做触发器，服务端 usage 回来后再校准；宁可高估提前压缩，不晚触发压爆 400。
 class TokenEstimator {
+  static bool _isCjk(int rune) {
+    return (rune >= 0x4E00 && rune <= 0x9FFF) ||
+        (rune >= 0x3400 && rune <= 0x4DBF) ||
+        (rune >= 0x20000 && rune <= 0x2A6DF) ||
+        (rune >= 0x3040 && rune <= 0x30FF) ||
+        (rune >= 0xAC00 && rune <= 0xD7AF) ||
+        (rune >= 0x2E80 && rune <= 0x2FFF);
+  }
+
   static int estimate(String text) {
     if (text.isEmpty) return 0;
     var ascii = 0;
     var cjk = 0;
-    for (var i = 0; i < text.length; i++) {
-      final c = text.codeUnitAt(i);
-      if (c > 0x2E7F &&
-          (c < 0x4E00 ||
-              c > 0x9FFF &&
-                  c < 0x3400 ||
-              c > 0x4DBF &&
-                  c < 0x20000 ||
-              c > 0x2A6DF)) {
-        // 非 CJK 走英文分支的近似：标点符号多，按英文算
-        ascii++;
-      } else if (c >= 0x4E00 && c <= 0x9FFF ||
-          c >= 0x3400 && c <= 0x4DBF ||
-          c >= 0x20000 && c <= 0x2A6DF ||
-          c >= 0x3040 && c <= 0x30FF) {
+    for (final rune in text.runes) {
+      if (_isCjk(rune)) {
         cjk++;
+      } else if (rune > 0xFFFF) {
+        // emoji / 扩展平面字符：保守按 2 token（8 英文字符）估，避免晚触发。
+        ascii += 8;
       } else {
         ascii++;
       }
@@ -34,10 +33,38 @@ class TokenEstimator {
     return (ascii / 4 + cjk / 1.5).ceil();
   }
 
+  /// 全量计数：content 字符串/多模态 List（含 image_url base64）、tool_calls、
+  /// role/name/tool_call_id、system 文本全部计入。
   static int estimateMessages(List<Map<String, dynamic>> messages) {
     var total = 0;
     for (final m in messages) {
-      total += estimate('${m['content'] ?? ''}');
+      total += estimate('${m['role'] ?? ''}') ~/ 4 + 4;
+      final content = m['content'];
+      if (content is String) {
+        total += estimate(content);
+      } else if (content is List) {
+        for (final part in content) {
+          if (part is Map) {
+            final type = '${part['type'] ?? ''}';
+            if (type == 'text') {
+              total += estimate('${part['text'] ?? ''}');
+            } else if (type == 'image_url') {
+              final imageUrl = part['image_url'];
+              final url = imageUrl is Map
+                  ? '${imageUrl['url'] ?? ''}'
+                  : '$imageUrl';
+              // base64 图片按实际字符估（含 data: 前缀），避免大图漏算超限。
+              total += estimate(url) + 64;
+            } else {
+              total += estimate('$part') + 16;
+            }
+          } else {
+            total += estimate('$part');
+          }
+        }
+      } else if (content != null) {
+        total += estimate('$content');
+      }
       // tool_calls 开销
       final toolCalls = m['tool_calls'];
       if (toolCalls is List) {
@@ -45,7 +72,20 @@ class TokenEstimator {
           total += estimate('$tc') + 20;
         }
       }
+      // tool 结果与名称开销
+      if (m['tool_call_id'] != null) total += 12;
+      if (m['name'] != null) total += estimate('${m['name']}') + 4;
       total += 8; // 每条消息固定开销
+    }
+    return total;
+  }
+
+  /// 工具 schemas 开销：shouldCompact 探针需加上，否则大工具集晚触发压爆。
+  static int estimateTools(List<Map<String, dynamic>>? tools) {
+    if (tools == null || tools.isEmpty) return 0;
+    var total = 0;
+    for (final t in tools) {
+      total += estimate('$t') + 24;
     }
     return total;
   }
@@ -58,6 +98,7 @@ class CompactionResult {
     required this.tokensBefore,
     required this.tokensAfter,
     required this.droppedCount,
+    this.untilMessageId,
   });
 
   final String summary;
@@ -65,6 +106,7 @@ class CompactionResult {
   final int tokensBefore;
   final int tokensAfter;
   final int droppedCount;
+  final String? untilMessageId;
 }
 
 /// 上下文压缩器：触发阈值 80%，保留 70% 给历史，20% 输出，10% 安全垫。
@@ -79,6 +121,36 @@ class ContextCompactor {
 
   int contextLimitOf(AiModelOption model) {
     return model.contextLength ?? 128000;
+  }
+
+  /// 切出「尚未摘要」与「最近窗口」。失败路径不改旧边界。
+  static ({
+    List<ChatMessage> toSummarize,
+    List<ChatMessage> kept,
+    int droppedCount,
+  }) sliceForCompaction({
+    required List<ChatMessage> history,
+    required int keepRecent,
+    String? previousUntilMessageId,
+  }) {
+    final dropCount =
+        history.length <= keepRecent ? 0 : history.length - keepRecent;
+    final kept = dropCount == 0 ? history : history.sublist(dropCount);
+    var toSummarize =
+        dropCount == 0 ? <ChatMessage>[] : history.sublist(0, dropCount);
+    if (previousUntilMessageId != null && toSummarize.isNotEmpty) {
+      final already = toSummarize.lastIndexWhere(
+        (m) => m.id == previousUntilMessageId,
+      );
+      if (already >= 0) {
+        toSummarize = toSummarize.sublist(already + 1);
+      }
+    }
+    return (
+      toSummarize: toSummarize,
+      kept: kept,
+      droppedCount: dropCount,
+    );
   }
 
   bool shouldCompact({
@@ -98,32 +170,66 @@ class ContextCompactor {
     required List<ChatMessage> history,
     required AiProviderConfig provider,
     required AiModelOption model,
+    String? previousSummary,
+    String? previousUntilMessageId,
   }) async {
     final tokensBefore = history.fold<int>(
         0, (sum, m) => sum + TokenEstimator.estimate(m.text));
-    if (history.length <= keepRecent + 2) {
+    if (history.length <= keepRecent + 2 &&
+        (previousSummary == null || previousSummary.isEmpty)) {
       return CompactionResult(
-        summary: '',
+        summary: previousSummary ?? '',
         keptMessages: history,
         tokensBefore: tokensBefore,
         tokensAfter: tokensBefore,
         droppedCount: 0,
+        untilMessageId: previousUntilMessageId,
       );
     }
 
-    final dropCount = history.length - keepRecent;
-    final toSummarize = history.sublist(0, dropCount);
-    final kept = history.sublist(dropCount);
+    final sliced = sliceForCompaction(
+      history: history,
+      keepRecent: keepRecent,
+      previousUntilMessageId: previousUntilMessageId,
+    );
+    final dropCount = sliced.droppedCount;
+    final kept = sliced.kept;
+    var toSummarize = sliced.toSummarize;
+    if (toSummarize.isEmpty &&
+        (previousSummary == null || previousSummary.isEmpty)) {
+      return CompactionResult(
+        summary: '',
+        keptMessages: kept,
+        tokensBefore: tokensBefore,
+        tokensAfter: tokensBefore,
+        droppedCount: 0,
+        untilMessageId: previousUntilMessageId,
+      );
+    }
 
     final summary = await _summarize(
       messages: toSummarize,
       provider: provider,
       model: model,
+      previousSummary: previousSummary,
     );
+    if (summary.isEmpty) {
+      return CompactionResult(
+        summary: previousSummary ?? '',
+        keptMessages: kept,
+        tokensBefore: tokensBefore,
+        tokensAfter: tokensBefore,
+        droppedCount: 0,
+        untilMessageId: previousUntilMessageId,
+      );
+    }
 
     final tokensAfter = TokenEstimator.estimate(summary) +
         kept.fold<int>(
             0, (sum, m) => sum + TokenEstimator.estimate(m.text));
+    final until = toSummarize.isNotEmpty
+        ? toSummarize.last.id
+        : previousUntilMessageId;
 
     return CompactionResult(
       summary: summary,
@@ -131,6 +237,7 @@ class ContextCompactor {
       tokensBefore: tokensBefore,
       tokensAfter: tokensAfter,
       droppedCount: dropCount,
+      untilMessageId: until,
     );
   }
 
@@ -138,8 +245,15 @@ class ContextCompactor {
     required List<ChatMessage> messages,
     required AiProviderConfig provider,
     required AiModelOption model,
+    String? previousSummary,
   }) async {
     final buf = StringBuffer();
+    if (previousSummary != null && previousSummary.trim().isNotEmpty) {
+      buf.writeln('【已有摘要，必须保留其中的目标、禁止项、已完成改动和测试结果】');
+      buf.writeln(previousSummary.trim());
+      buf.writeln();
+      buf.writeln('【尚未摘要的后续对话】');
+    }
     for (final m in messages) {
       final role = m.role == 'user' ? '用户' : '助手';
       buf.writeln('[$role] ${m.text}');
@@ -160,7 +274,8 @@ class ContextCompactor {
 - 待办事项
 - 关键文件列表
 - 用户偏好/拒绝过的操作
-控制在 500 字内。
+- 若有已有摘要，必须合并进新摘要，不得丢弃其中的约束和已完成事项
+控制在 800 字内。
 
 对话历史：
 $buf''';
