@@ -2283,7 +2283,7 @@ class AgentTools {
         .toList();
     final hasTest = paths.any((path) => path.contains('test'));
     final hasDocs = paths.any(
-      (path) => path.endsWith('.md') || path.endsWith('.txt'),
+      (path) => path.endsWith('.md') || path.endsWith('.markdown'),
     );
     final hasFix = paths.any(
       (path) => path.contains('fix') || path.contains('bug'),
