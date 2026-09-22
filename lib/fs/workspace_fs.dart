@@ -847,7 +847,6 @@ class CommandPolicy {
     final out = <String>[];
     final buf = StringBuffer();
     String? quote;
-    var escaped = false;
 
     void flush() {
       if (buf.isEmpty) return;
@@ -857,13 +856,47 @@ class CommandPolicy {
 
     for (var i = 0; i < command.length; i++) {
       final c = command[i];
-      if (escaped) {
-        buf.write(c);
-        escaped = false;
+      // 单引号内反斜杠按字面保留（POSIX）：不做转义。
+      if (quote == "'") {
+        if (c == quote) {
+          quote = null;
+        } else {
+          buf.write(c);
+        }
         continue;
       }
       if (c == '\\') {
-        escaped = true;
+        if (i + 1 >= command.length) return null;
+        final next = command[i + 1];
+        if (quote == '"') {
+          // 双引号内仅 \" \$ \` \\ 才转义，其余保留反斜杠
+          // （否则 Windows 路径 C:\Temp 会被洗成 C:Temp 误判区内）。
+          if (next == '"' || next == r'$' || next == '`' || next == '\\') {
+            buf.write(next);
+            i++;
+          } else {
+            buf.write(c);
+          }
+          continue;
+        }
+        // 引号外：仅转义空白/元字符/引号/反斜杠本身，其余保留反斜杠
+        // （同上，保护裸 Windows 路径）。
+        if (next.trim().isEmpty ||
+            next == ';' ||
+            next == '&' ||
+            next == '|' ||
+            next == '>' ||
+            next == '<' ||
+            next == "'" ||
+            next == '"' ||
+            next == r'$' ||
+            next == '`' ||
+            next == '\\') {
+          buf.write(next);
+          i++;
+        } else {
+          buf.write(c);
+        }
         continue;
       }
       if (quote != null) {
@@ -887,7 +920,7 @@ class CommandPolicy {
         buf.write(c);
       }
     }
-    if (quote != null || escaped) return null;
+    if (quote != null) return null;
     flush();
     return out;
   }
