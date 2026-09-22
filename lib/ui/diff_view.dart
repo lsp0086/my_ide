@@ -92,9 +92,29 @@ List<_ChangeHunk> _groupChangeHunks(List<_DiffLine> lines) {
       continue;
     }
     final start = i;
-    while (i < lines.length &&
-        (lines[i].kind == 'add' || lines[i].kind == 'del')) {
-      i++;
+    // 与 diff 生成一致：<7 行 ctx 的相邻变更在同一块里，
+    // 此前遇到一行 ctx 就分块，hunkIndex 与 checkpoint_store 侧错位。
+    while (i < lines.length) {
+      final k = lines[i].kind;
+      if (k == 'add' || k == 'del') {
+        i++;
+        continue;
+      }
+      if (k == 'ctx') {
+        var look = i;
+        var ctx = 0;
+        while (look < lines.length && lines[look].kind == 'ctx') {
+          ctx++;
+          look++;
+        }
+        if (ctx < 7 &&
+            look < lines.length &&
+            (lines[look].kind == 'add' || lines[look].kind == 'del')) {
+          i = look;
+          continue;
+        }
+      }
+      break;
     }
     hunks.add(_ChangeHunk(
       index: hunks.length,

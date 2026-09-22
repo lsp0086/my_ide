@@ -43,6 +43,7 @@ class LspClient {
   final Set<String> _openedDocs = {};
   /// didChange 增量节流：每文件只推最新一版，避免击键连发大文件全量。
   final Map<String, _PendingDoc> _pendingDidChange = {};
+  final Map<String, Timer> _didChangeTimers = {};
 
   bool get running => _process != null;
 
@@ -70,7 +71,12 @@ class LspClient {
       workingDirectory: rootPath,
     );
     _rootUri = Uri.file(rootPath).toString();
-    _stdoutSub?.cancel();
+    // 快速 start->stop->start 会残留旧订阅回调进新 _byteBuf：先 await 取消再覆盖。
+    final prevSub = _stdoutSub;
+    _stdoutSub = null;
+    try {
+      await prevSub?.cancel();
+    } catch (_) {}
     _stdoutSub = _process!.stdout.listen(_onBytes);
     // ignore stderr to avoid blocking
     _process!.stderr.drain<void>();
@@ -85,7 +91,12 @@ class LspClient {
         'textDocument': {
           'definition': {'dynamicRegistration': false},
           'hover': {
-            'contentFormat': ['plaintext']
+            'contentFormat': ['plaintext', 'markdown']
+          },
+          'signatureHelp': {
+            'signatureInformation': {
+              'documentationFormat': ['plaintext', 'markdown']
+            }
           },
           'publishDiagnostics': {'relatedInformation': false},
         },
@@ -207,6 +218,12 @@ class LspClient {
     _initialized = false;
     _openedDocs.clear();
     _pendingDidChange.clear();
+    for (final t in _didChangeTimers.values) {
+      try {
+        t.cancel();
+      } catch (_) {}
+    }
+    _didChangeTimers.clear();
     for (final c in _pending.values) {
       if (!c.isCompleted) c.completeError(StateError('LSP stopped'));
     }
@@ -255,6 +272,8 @@ class LspClient {
 
   void didClose(String filePath) {
     if (!_initialized) return;
+    _pendingDidChange.remove(filePath);
+    _didChangeTimers.remove(filePath)?.cancel();
     _openedDocs.remove(filePath);
     _sendNotification('textDocument/didClose', {
       'textDocument': {'uri': Uri.file(filePath).toString()},
@@ -328,6 +347,157 @@ class LspClient {
     return text.isEmpty ? null : text;
   }
 
+  /// references：返回引用位置列表，失败返回空（不抛错）。
+  Future<List<LspLocation>> references({
+    required String filePath,
+    required int line,
+    required int character,
+    bool includeDeclaration = true,
+  }) async {
+    if (!_initialized) return const [];
+    try {
+      final result = await _request('textDocument/references', {
+        'textDocument': {'uri': Uri.file(filePath).toString()},
+        'position': {'line': line, 'character': character},
+        'context': {'includeDeclaration': includeDeclaration},
+      });
+      return _parseLocations(result);
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  /// signatureHelp：返回签名帮助原始 map，失败返回 null（不抛错）。
+  Future<Map<String, dynamic>?> signatureHelp({
+    required String filePath,
+    required int line,
+    required int character,
+  }) async {
+    if (!_initialized) return null;
+    try {
+      final result = await _request('textDocument/signatureHelp', {
+        'textDocument': {'uri': Uri.file(filePath).toString()},
+        'position': {'line': line, 'character': character},
+      });
+      if (result is Map) return Map<String, dynamic>.from(result);
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// completion：返回补全条目原始 map 列表，失败返回空（不抛错）。
+  Future<List<Map<String, dynamic>>> completion({
+    required String filePath,
+    required int line,
+    required int character,
+  }) async {
+    if (!_initialized) return const [];
+    try {
+      final result = await _request('textDocument/completion', {
+        'textDocument': {'uri': Uri.file(filePath).toString()},
+        'position': {'line': line, 'character': character},
+      });
+      final items = result is List
+          ? result
+          : (result is Map ? result['items'] : null);
+      if (items is! List) return const [];
+      return items
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  /// rename：返回 WorkspaceEdit 原始 map，失败返回 null（不抛错）。
+  Future<Map<String, dynamic>?> rename({
+    required String filePath,
+    required int line,
+    required int character,
+    required String newName,
+  }) async {
+    if (!_initialized) return null;
+    try {
+      final result = await _request('textDocument/rename', {
+        'textDocument': {'uri': Uri.file(filePath).toString()},
+        'position': {'line': line, 'character': character},
+        'newName': newName,
+      });
+      if (result is Map) return Map<String, dynamic>.from(result);
+      return null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// format：返回 TextEdit 原始 map 列表，失败返回空（不抛错）。
+  Future<List<Map<String, dynamic>>> format({
+    required String filePath,
+    int tabSize = 2,
+    bool insertSpaces = true,
+  }) async {
+    if (!_initialized) return const [];
+    try {
+      final result = await _request('textDocument/formatting', {
+        'textDocument': {'uri': Uri.file(filePath).toString()},
+        'options': {'tabSize': tabSize, 'insertSpaces': insertSpaces},
+      });
+      if (result is! List) return const [];
+      return result
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  /// codeAction：返回 CodeAction/Command 原始 map 列表，失败返回空（不抛错）。
+  Future<List<Map<String, dynamic>>> codeAction({
+    required String filePath,
+    required int startLine,
+    required int endLine,
+    int startChar = 0,
+    int endChar = 0,
+    List<Map<String, dynamic>> diagnostics = const [],
+  }) async {
+    if (!_initialized) return const [];
+    try {
+      final result = await _request('textDocument/codeAction', {
+        'textDocument': {'uri': Uri.file(filePath).toString()},
+        'range': {
+          'start': {'line': startLine, 'character': startChar},
+          'end': {'line': endLine, 'character': endChar},
+        },
+        'context': {'diagnostics': diagnostics},
+      });
+      if (result is! List) return const [];
+      return result
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  /// workspaceSymbol：返回 SymbolInformation 原始 map 列表，失败返回空（不抛错）。
+  Future<List<Map<String, dynamic>>> workspaceSymbol(String query) async {
+    if (!_initialized) return const [];
+    try {
+      final result = await _request('workspace/symbol', {'query': query});
+      if (result is! List) return const [];
+      return result
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
   List<LspLocation> _parseLocations(dynamic result) {
     final locations = <LspLocation>[];
     final items = result is List ? result : (result == null ? [] : [result]);
@@ -362,7 +532,11 @@ class LspClient {
     _pending[id] = completer;
     _send({'jsonrpc': '2.0', 'id': id, 'method': method, 'params': params});
     return completer.future.timeout(const Duration(seconds: 10), onTimeout: () {
+      // 超时必须 complete 原 Completer：只 remove 不 complete 会永久挂起调用方。
       _pending.remove(id);
+      if (!completer.isCompleted) {
+        completer.completeError(TimeoutException('LSP $method timeout'));
+      }
       throw TimeoutException('LSP $method timeout');
     });
   }
@@ -380,6 +554,11 @@ class LspClient {
 
   void _onBytes(List<int> chunk) {
     _byteBuf.addAll(chunk);
+    // 无界缓冲兜底：异常 server 狂吐数据时丢弃旧缓冲，避免 OOM。
+    const maxBuf = 8 * 1024 * 1024;
+    if (_byteBuf.length > maxBuf) {
+      _byteBuf.removeRange(0, _byteBuf.length - maxBuf);
+    }
     while (true) {
       // 头部是 ASCII，在字节流里找 \r\n\r\n。
       var headerEnd = -1;
@@ -489,12 +668,43 @@ class LspClient {
   final Map<String, int> _lastSyncedVersion = {};
 
   /// 增量 didChange：大文件只发差异区间，小文件整文档下发，节流防击键轰炸。
+  /// throttle 生效：同文件高频调用合并为一次延迟下发，只推最新一版。
   void didChangeIncremental(
     String filePath,
     String newText, {
     required int version,
     String languageId = 'plaintext',
     Duration throttle = const Duration(milliseconds: 300),
+  }) {
+    if (!_initialized) return;
+    if (!_openedDocs.contains(filePath)) {
+      didOpen(filePath, languageId, newText, version: version);
+      return;
+    }
+    _pendingDidChange[filePath] = _PendingDoc(newText, version);
+    _didChangeTimers[filePath]?.cancel();
+    _didChangeTimers[filePath] = Timer(throttle, () {
+      _didChangeTimers.remove(filePath);
+      final pending = _pendingDidChange.remove(filePath);
+      if (pending == null || !_initialized) return;
+      if (!_openedDocs.contains(filePath)) {
+        didOpen(filePath, languageId, pending.text, version: pending.version);
+        return;
+      }
+      _flushDidChangeIncremental(
+        filePath,
+        pending.text,
+        version: pending.version,
+        languageId: languageId,
+      );
+    });
+  }
+
+  void _flushDidChangeIncremental(
+    String filePath,
+    String newText, {
+    required int version,
+    String languageId = 'plaintext',
   }) {
     if (!_initialized) return;
     if (!_openedDocs.contains(filePath)) {

@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#26262C"/>
+      <stop offset="1" stop-color="#0E0E10"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#93A8FF"/>
+      <stop offset="1" stop-color="#5B7CFF"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#6C8CFF" stop-opacity="0.42"/>
+      <stop offset="1" stop-color="#6C8CFF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <!-- 圆角底板：22.6% 圆角，贴合 macOS squircle 裁切 -->
+  <rect width="1024" height="1024" rx="232" fill="url(#bg)"/>
+  <rect x="2" y="2" width="1020" height="1020" rx="230" fill="none" stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="3"/>
+  <!-- 中央光晕 -->
+  <circle cx="512" cy="522" r="345" fill="url(#glow)"/>
+  <!-- 左尖括号 -->
+  <path d="M 392 368 L 232 512 L 392 656" fill="none" stroke="#E8E8EA" stroke-width="96" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- 右尖括号 -->
+  <path d="M 632 368 L 792 512 L 632 656" fill="none" stroke="#E8E8EA" stroke-width="96" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- 中央斜杠：AI 蓝 -->
+  <path d="M 564 316 L 460 708" fill="none" stroke="url(#accent)" stroke-width="92" stroke-linecap="round"/>
+  <!-- 右上 AI 星芒 -->
+  <path d="M 742 210 C 746.5 261 762.5 277 813 281.5 C 762.5 286 746.5 302 742 353 C 737.5 302 721.5 286 671 281.5 C 721.5 277 737.5 261 742 210 Z" fill="#8AA2FF"/>
+  <circle cx="742" cy="281.5" r="10" fill="#FFFFFF" opacity="0.92"/>
+</svg>

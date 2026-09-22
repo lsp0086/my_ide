@@ -1,0 +1,60 @@
+name: Test
+
+# R9：跨平台一致性验证。push/PR 自动跑 analyze + 全量单元测试，
+# 覆盖 windows/macos/ubuntu 三平台（此前只有 release 打包）。
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Analyze & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux desktop deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.38.6'
+          channel: stable
+          cache: true
+
+      - name: Flutter config & deps
+        shell: bash
+        run: |
+          flutter config --enable-windows-desktop --enable-linux-desktop --enable-macos-desktop
+          flutter --version
+          dart pub token remove https://pub.dev 2>/dev/null || true
+          dart pub token remove https://pub.dartlang.org 2>/dev/null || true
+          if ! flutter pub get; then
+            echo "pub.dev 拉取失败，改用国内镜像重试..."
+            export PUB_HOSTED_URL=https://pub.flutter-io.cn
+            export FLUTTER_STORAGE_BASE_URL=https://storage.flutter-io.cn
+            flutter pub get
+          fi
+
+      - name: Analyze
+        shell: bash
+        run: flutter analyze --no-fatal-infos
+
+      - name: Test
+        shell: bash
+        run: flutter test

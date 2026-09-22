@@ -23,10 +23,16 @@ void main() {
   test('terminateAll 终止命令及其子进程', () async {
     if (Platform.isWindows) return;
     final marker = File('${workspace.path}/child-finished');
-    await manager.start('/bin/sh', [
-      '-c',
-      '(sleep 2; echo escaped > child-finished) & wait',
-    ], workingDirectory: workspace.path);
+    await manager.start(
+      '/bin/sh',
+      [
+        '-c',
+        '(sleep 2; echo escaped > child-finished) & wait',
+      ],
+      workingDirectory: workspace.path,
+      // 独立成组后 kill -- -pgid 精确命中，不再依赖 pgrep 时序。
+      startNewSession: true,
+    );
 
     await Future<void>.delayed(const Duration(milliseconds: 200));
     expect(manager.activeCount, 1);

@@ -63,29 +63,38 @@ jobs:
             flutter pub get
           fi
 
+      - name: Analyze
+        shell: bash
+        run: flutter analyze --no-fatal-infos
+
+      - name: Test
+        shell: bash
+        run: flutter test
+
       - name: Build Windows
         if: matrix.target == 'windows'
         run: flutter build windows --release
 
       - name: Package Windows
         if: matrix.target == 'windows'
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          VERSION="$(grep -E '^version:' pubspec.yaml | head -1 | awk '{print $2}' | cut -d+ -f1)"
-          NAME="$(grep -E '^name:' pubspec.yaml | head -1 | awk '{print $2}')"
-          SRC="build/windows/x64/runner/Release"
-          if [[ ! -d "$SRC" ]]; then
-            SRC="$(find build/windows -type d -path '*/runner/Release' | head -1)"
-          fi
-          # 不预置语言包；清理可能残留目录
-          rm -rf "$SRC/language_archives" "$SRC/languages" || true
-          mkdir -p dist
-          (
-            cd "$(dirname "$SRC")"
-            powershell.exe -NoProfile -Command "Compress-Archive -Path '$(basename "$SRC")\\*' -DestinationPath '$GITHUB_WORKSPACE\\dist\\${NAME}-${VERSION}-windows-x64.zip' -Force"
-          )
-          ls -lh dist
+          $ErrorActionPreference = 'Stop'
+          $versionLine = (Select-String -Path pubspec.yaml -Pattern '^version:' | Select-Object -First 1).Line
+          $VERSION = ($versionLine -split '\s+')[1].Split('+')[0]
+          $nameLine = (Select-String -Path pubspec.yaml -Pattern '^name:' | Select-Object -First 1).Line
+          $NAME = ($nameLine -split '\s+')[1]
+          $SRC = 'build/windows/x64/runner/Release'
+          if (-not (Test-Path $SRC)) {
+            $SRC = (Get-ChildItem -Path build/windows -Directory -Recurse -Filter Release | Select-Object -First 1).FullName
+          }
+          if (-not (Test-Path $SRC)) { throw "找不到 windows Release 目录" }
+          Remove-Item -Recurse -Force (Join-Path $SRC 'language_archives'), (Join-Path $SRC 'languages') -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $zip = Join-Path $env:GITHUB_WORKSPACE "dist\${NAME}-${VERSION}-windows-x64.zip"
+          if (Test-Path $zip) { Remove-Item -Force $zip }
+          Compress-Archive -Path (Join-Path $SRC '*') -DestinationPath $zip -Force
+          Get-ChildItem dist
 
       - name: Build Linux
         if: matrix.target == 'linux'
@@ -103,6 +112,30 @@ jobs:
             SRC="$(find build/linux -type d -path '*/release/bundle' | head -1)"
           fi
           rm -rf "$SRC/data/language_archives" "$SRC/data/languages" || true
+          # 防御：桌面文件与图标应由 linux/CMakeLists.txt 自动装到 bundle/share/，
+          # 构建链变化兜底补拷一次。
+          mkdir -p "$SRC/share/applications" "$SRC/share/icons/hicolor/512x512/apps"
+          [[ -f "$SRC/share/applications/com.example.my_ide.desktop" ]] || \
+            cp "linux/com.example.my_ide.desktop" "$SRC/share/applications/"
+          [[ -f "$SRC/share/icons/hicolor/512x512/apps/my_ide.png" ]] || \
+            cp "linux/icons/hicolor/512x512/apps/my_ide.png" "$SRC/share/icons/hicolor/512x512/apps/"
+          # zip 根附带安装入口：解压后 ./install.sh 一键装图标与启动器。
+          cat > "$SRC/install.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          cd "$(dirname "$0")"
+          ROOT="$(pwd)"
+          sed "s|^Exec=.*|Exec=$ROOT/my_ide %U|" \
+            "$ROOT/share/applications/com.example.my_ide.desktop" \
+            > "$HOME/.local/share/applications/com.example.my_ide.desktop"
+          mkdir -p "$HOME/.local/share/icons/hicolor/512x512/apps"
+          cp "$ROOT/share/icons/hicolor/512x512/apps/my_ide.png" \
+            "$HOME/.local/share/icons/hicolor/512x512/apps/my_ide.png"
+          update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
+          gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+          echo "installed: launcher + icon"
+          EOF
+          chmod +x "$SRC/install.sh"
           mkdir -p dist
           (
             cd "$(dirname "$SRC")"
@@ -121,6 +154,7 @@ jobs:
           set -euo pipefail
           VERSION="$(grep -E '^version:' pubspec.yaml | head -1 | awk '{print $2}' | cut -d+ -f1)"
           NAME="$(grep -E '^name:' pubspec.yaml | head -1 | awk '{print $2}')"
+          ARCH="$(uname -m)"
           APP="$(find build/macos/Build/Products/Release -maxdepth 1 -name '*.app' | head -1)"
           test -n "$APP"
           rm -rf "$APP/Contents/Resources/language_archives" \
@@ -128,8 +162,21 @@ jobs:
           mkdir -p dist
           (
             cd "$(dirname "$APP")"
-            zip -qry "$GITHUB_WORKSPACE/dist/${NAME}-${VERSION}-macos.zip" "$(basename "$APP")"
+            zip -qry "$GITHUB_WORKSPACE/dist/${NAME}-${VERSION}-macos-${ARCH}.zip" "$(basename "$APP")"
           )
+          ls -lh dist
+
+      - name: Generate SHA256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in dist/*.zip; do
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$file" > "${file}.sha256"
+            else
+              shasum -a 256 "$file" > "${file}.sha256"
+            fi
+          done
           ls -lh dist
 
       - name: Upload artifacts

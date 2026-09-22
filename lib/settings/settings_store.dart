@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../ai/provider_config.dart';
+import 'secret_vault.dart';
 
 /// 全局设置落盘：主题、高亮、语言、供应商、当前模型。
 class SettingsStore extends ChangeNotifier {
@@ -19,6 +20,7 @@ class SettingsStore extends ChangeNotifier {
 
   static SettingsStore? _instance;
   static SettingsStore get instance => _instance!;
+  static SettingsStore? get maybeInstance => _instance;
 
   static Future<SettingsStore> init() async {
     final prefs = await SharedPreferences.getInstance();
@@ -43,11 +45,29 @@ class SettingsStore extends ChangeNotifier {
   List<Map<String, dynamic>> get providersRaw {
     try {
       final list = jsonDecode(_providersJson) as List;
-      return list
-          .whereType<Map>()
-          .map((e) => Map<String, dynamic>.from(e))
-          .toList();
-    } catch (_) {
+      return list.whereType<Map>().map((e) {
+        final m = Map<String, dynamic>.from(e);
+        if (m['token'] is String && (m['token'] as String).isNotEmpty) {
+          m['token'] = SecretVault.decrypt(m['token'] as String);
+        }
+        // 自定义请求头同样可能含密钥：解密 enc: 值。
+        final headers = m['extraHeaders'];
+        if (headers is Map) {
+          final decoded = <String, String>{};
+          headers.forEach((k, v) => decoded['$k'] = SecretVault.decrypt('$v'));
+          m['extraHeaders'] = decoded;
+        }
+        final mcpHeaders = m['mcpHeaders'];
+        if (mcpHeaders is Map) {
+          final decoded = <String, String>{};
+          mcpHeaders
+              .forEach((k, v) => decoded['$k'] = SecretVault.decrypt('$v'));
+          m['mcpHeaders'] = decoded;
+        }
+        return m;
+      }).toList();
+    } catch (e) {
+      if (e is SecretVaultException) rethrow;
       return [];
     }
   }
@@ -85,12 +105,39 @@ class SettingsStore extends ChangeNotifier {
     List<Map<String, dynamic>> providers, {
     bool notify = false,
   }) async {
-    _providersJson = jsonEncode(providers);
+    final encoded = providers.map((e) {
+      final m = Map<String, dynamic>.from(e);
+      if (m['token'] is String && (m['token'] as String).isNotEmpty) {
+        m['token'] = SecretVault.encrypt(m['token'] as String);
+      }
+      final headers = m['extraHeaders'];
+      if (headers is Map) {
+        final encodedHeaders = <String, String>{};
+        headers.forEach(
+            (k, v) => encodedHeaders['$k'] = SecretVault.encrypt('$v'));
+        m['extraHeaders'] = encodedHeaders;
+      }
+      final mcpHeaders = m['mcpHeaders'];
+      if (mcpHeaders is Map) {
+        final encodedMcp = <String, String>{};
+        mcpHeaders
+            .forEach((k, v) => encodedMcp['$k'] = SecretVault.encrypt('$v'));
+        m['mcpHeaders'] = encodedMcp;
+      }
+      return m;
+    }).toList();
+    _providersJson = jsonEncode(encoded);
     await _prefs.setString('aiProviders', _providersJson);
     if (notify) notifyListeners();
   }
 
-  String? getString(String key) => _prefs.getString(key);
+  String? getString(String key) {
+    final v = _prefs.getString(key);
+    if (key == 'webdav.password' && v != null && v.isNotEmpty) {
+      return SecretVault.decrypt(v);
+    }
+    return v;
+  }
   int? getInt(String key) => _prefs.getInt(key);
   bool? getBool(String key) => _prefs.getBool(key);
 
@@ -155,7 +202,10 @@ class SettingsStore extends ChangeNotifier {
   }
 
   Future<void> setString(String key, String value) async {
-    await _prefs.setString(key, value);
+    final v = key == 'webdav.password' && value.isNotEmpty
+        ? SecretVault.encrypt(value)
+        : value;
+    await _prefs.setString(key, v);
     notifyListeners();
   }
 
@@ -163,6 +213,13 @@ class SettingsStore extends ChangeNotifier {
     await _prefs.setInt(key, value);
     notifyListeners();
   }
+
+  /// 大仓上限：文件树 / 符号索引共用，默认 8000。
+  int get workspaceMaxFiles =>
+      _prefs.getInt('workspaceMaxFiles') ?? 8000;
+
+  Future<void> setWorkspaceMaxFiles(int value) =>
+      setInt('workspaceMaxFiles', value.clamp(500, 50000));
 
   /// 语言服务器可执行文件覆盖路径（空 = 用内置默认 command）。
   String? languageServerCommand(String serverId) {
@@ -179,6 +236,30 @@ class SettingsStore extends ChangeNotifier {
     } else {
       await _prefs.setString(key, value);
     }
+    notifyListeners();
+  }
+
+  /// R10：用户自定义 LSP 服务器列表（JSON 数组）。
+  /// 每项：{id, label, extensions:[.xx], command, args:[...]}。
+  List<Map<String, dynamic>> get customLanguageServers {
+    try {
+      final raw = _prefs.getString('lsp.custom') ?? '[]';
+      final list = jsonDecode(raw) as List;
+      return list
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .where((e) =>
+              '${e['id'] ?? ''}'.isNotEmpty &&
+              '${e['command'] ?? ''}'.isNotEmpty)
+          .toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  Future<void> setCustomLanguageServers(
+      List<Map<String, dynamic>> servers) async {
+    await _prefs.setString('lsp.custom', jsonEncode(servers));
     notifyListeners();
   }
 

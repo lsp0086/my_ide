@@ -7,29 +7,16 @@
 ## 版本更新
 
 ### 1.0.4
-- **用户编辑接入对话**：用户手动保存文件后记 `user-edit` 版本，并自动挂到最后一条对话气泡，方便回看自己改了什么
-- **差异页改造**：从查看节点进入只看红绿行，不再显示变更行数气泡；对话差异页每个变更块右下角新增红色 **N** 回退气泡，点击只回退该块、其余块保留；回退后本轮无剩余改动时提示并同时删除该轮对话
-- **单块回退落盘**：目标块留旧删新，其余块保持新文件；无剩余改动时从本轮移除
-- **Agent 交互重构**：关键逻辑改状态驱动，修复对话被 UI 移除后顶掉等 bug；审批弹窗改队列串行展示，不再死锁；取消信号级联到子 Agent、在途命令和工具调用
-- **多窗口支持**：原生多窗口 + 新进程启动（`open -n` / `--open=` 直达项目），文件树与最近项目加"新窗口打开"入口
-- **单项目打开锁**：跨进程 + 进程内双锁，防止多窗口重复打开同一项目；对话进行中锁死新建/删除对话
-- **MCP 工具接入**：内置 stdio / Streamable HTTP 两种协议，可增删配置、按工具设只读/可写/网络三级审批与开关，无需外部依赖即可扩展 IDE 能力；MCP 响应增加 deadline、空闲超时与内存上限，避免异常服务导致 Agent 失控运行
-- **Skills 管理**：兼容开源 Agent Skills（SKILL.md），多源自动发现（`.agents` / `.cursor` / `.claude` / 全局目录），可启用/禁用、粘贴导入，`/skill-name` 硬路由到技能
-- **OpenAI Responses 协议**：新增 `openaiResponses` 格式，支持 `previous_response_id` 多轮复用、内置 `web_search` / `code_interpreter` 工具；兼容 Azure（`api-key` 头）与自定义请求头；修正 `previous_response_id` 与完整 messages 同时下发造成的重复上下文
-- **图片多模态消息**：用户消息可带图片（粘贴/拖入），支持视觉模型原生多模态；非视觉模型给出切换提示
-- **贡献统计面板**：侧栏 GitHub 风格热力图，按日聚合对话轮次 / token 消耗 / 文件改动 / 耗时，点击某天查看当日详情
-- **版本 Redo**：Restore 前自动记当前状态，Redo 栈一键恢复；二进制文件（图片/附件）也纳入版本快照，可回滚；二进制 checkpoint 改用字节 blob 与差量链恢复，修复半恢复数据损坏
-- **外部文件冲突三向合并**：脏 tab 被外部改时弹冲突框，可选保留本地 / 载入磁盘 / 行级三向合并，不丢撤销栈
-- **问题面板 AI 修复**：每条诊断旁加"AI 修复"按钮，点击自动拼修复指令下发给 AI 面板
-- **子 Agent 派生**：`spawn_subagent` 工具让主 Agent 在只读上下文下启动独立子 Agent 执行调研任务，结果汇总返回，不烧主循环 token；主任务取消可级联终止子 Agent
-- **对话轮次元数据**：每轮新增 `durationMs`（耗时）、`stopReason`（完成/用户中断/最大步数）、`token` 计数
-- **命令沙箱词法级判定**：黑名单升级为分词级（去引号、展开 `$IFS`/`$VAR`/反引号），`rm${IFS}-rf`、`python -c` 等绕过手法不再可用；非白名单命令默认走沙箱审批；只读白名单改为固定 executable + argv，Shell 元字符、管道、重定向、命令替换和复合语句逐次审批
-- **命令进程生命周期**：统一 `Process.start` + Runner 级进程管理器持有句柄，超时、取消、会话结束、切换工作区和应用退出均终止整个进程树，避免后台进程继续修改文件或占用资源；后台任务管理器提升为长生命周期服务，修复启动后失联与孤儿进程问题
-- **LSP 修复**：字节流解析 `Content-Length`（修复中文长包截断）、`didChange` 增量节流防击键轰炸、客户端驱逐 TTL 防僵尸连接；Windows 命令执行、语言服务安装与 PATH 处理改为平台适配
-- **工具注册中心重构**：工具 schema 收敛到单源、审批门禁 FIFO 队列串行化、参数 JSON-Schema 校验+归一化，缺参拒收不落空文件；多文件补丁具备原子提交和失败回滚，只记录替换片段并统一删除/覆盖顺序
-- **外部内容隔离**：网页、MCP 与不可信工具结果增加 UNTRUSTED_DATA 围栏和来源标签，见过的外部数据会提升后续写入、命令、MCP 审批等级，阻断 prompt injection 静默写文件；`fetch_url` 默认审批并限制回环、私网、链路本地、组播、元数据地址与重定向
-- **会话持久化可靠性**：落盘失败设置 dirty / `lastSaveError` 并重试，AI 面板提示未保存，退出前 `flushUnsaved`，避免"界面成功但未落盘"
-- **上下文压缩滚动化**：长会话再次超预算时使用旧摘要 + 尚未摘要消息滚动压缩，避免中间历史永久遗忘；模型请求增加连接、空闲和总量 deadline
+- **版本管理**：手动保存记 `user-edit` 并挂气泡；版本页只看红绿行；支持单块/单文件/整轮回退；超 3 文件折叠；Restore 前自动记现场可 Redo；二进制纳入快照；版本库损坏直接报错；补记漂移与防抖版本；checkpoint 附 git 状态；回滚/快照恢复全走原子写；drop 持锁防并发（回退借位重入）；manifest 备份经 `.new` 原子转正；快照跳过口径对齐；恢复提交前复检；侧车名加随机
+- **写冲突与崩溃恢复**：写盘前查脏缓冲，保存前比 mtime 转冲突抉择，手动保存同样走冲突门禁 + 覆盖二次确认；每批次写 journal，重启恢复中断；脏编辑器定时落盘；落盘失败标 dirty 重试 + 退出 flush；随机侧车名原子写（含编辑器手动保存）；落盘前二次复检；乐观锁 + 后台冲突确认；快照超限强制确认；空白 `oldText` 直接拒绝防文件头误插；补丁同文件按绝对路径去重、提交重读限 1MB；移动/写/改预览补链检查；todos 侧车加随机；回收站命名加 pid/随机、恢复剥离对齐防错位
+- **Agent 与审批**：状态驱动 + 审批队列串行，超时按项移除，取消级联；子 Agent 按实例隔离、世代丢弃（含 progress 回调隔离）、同批并发不误拒，用量计入预算熔断（新轮按在途重建预占防空窗，子预算加回工具输出防低估）；只读可并行、写串行，超时熔断回填占位，只读批取消即回中断，重复 tool_call.id 首个 wins；`todo_write` 禁 Chat/Plan 落盘；安全命令本轮信任 + 自动审批规则；命令沙箱分词判定，终端状态变更强制再审；统一进程树管理；敏感路径永拒；密钥 v3 随机 nonce；docker 去硬编码用户；命令气泡随对话落盘；运行中会话锁定，回退/删除/清空/并发压缩在运行中拒绝；历史提级含压缩摘要与命令输出；中途裁剪扩至正文大段
+- **MCP / Skills / 规则**：MCP 内置 stdio/Streamable HTTP，三级审批与开关，resources/prompts 聚合为只读工具，工具聚合快照遍历防并发修改，重连加代际防禁用后复活；响应加 deadline/超时/内存上限（截断 + 节流）；Skills 兼容 SKILL.md，多源发现 + 硬路由，导入加名称规范与路径越界门禁、外链删除拦截、SKILL.md 原子写；子代理只读派生；`AGENTS.md` 每轮注入；composer 模板 chip；会话可分叉；`mcp_get_prompt` 支持带参；项目规则按改动文件自动挂载
+- **多窗口与外部打开**：原生多窗口 + 新进程直达项目；双锁防重复打开，对话运行中锁回退/删除/清空；支持 Finder/Dock 拖入；标签/活动态持久化，启动重开最近项目；工作区 dispose 后在途监听不再刷 UI
+- **模型与上下文**：OpenAI Responses（复用 + `web_search`/`code_interpreter`），兼容 Azure 与自定义头/参数；图片多模态，落盘为 `chat_assets` 引用；每轮记耗时/stopReason/token；超预算滚动压缩；请求加 deadline
+- **搜索/诊断/LSP**：`search_text` 重排；新增 `repo_map`/`semantic_search`/`lsp_definition`/`lsp_references` 只读工具并可并行；问题面板一键"AI 修复"；LSP 修截断、didChange 真节流合并、防僵尸连接、订阅取消 await，Windows 适配，支持自定义服务；外部 lint 聚合并做参数隔离与截断；诊断统一标不可信并提级；结构化日志
+- **编辑器**：大文件窗口化只读，支持"加载全部"/局部编辑两种放行路径
+- **发布**：Windows 打包改 `pwsh` 原生压缩，不再经 bash 调 powershell；CI 沿用三端 analyze + 全量测试
+- **其他**：贡献统计热力图；外部内容 UNTRUSTED_DATA 围栏 + 审批提级，`fetch_url` 限私网/元数据地址；WebDAV 恢复加版本校验、MCP 命令白名单、审批值白名单、skills 路径穿越过滤
 
 ### 1.0.3
 - 新增 **代码完整性 / 行号正确性检查**：本地括号与引号检查，JSON 可解析校验；统一 0-based 行号与文档版本失效
@@ -77,15 +64,17 @@
 
 ### AI 助手
 - 供应商协议：默认 OpenAI 兼容；可切换 Anthropic Messages；新增 OpenAI Responses（`previous_response_id` 多轮复用、内置 `web_search` / `code_interpreter`）；兼容 Azure（`api-key` 头）与自定义请求头
-- 配置 Base URL / Token（Anthropic 为 x-api-key）、拉取模型、上下文长度、思考档位
+- 配置 Base URL / Token（Anthropic 为 x-api-key）、拉取模型、上下文长度、思考档位、模型自定义参数（表格每行一对 key/value，均非空才保存）
 - **Chat**：普通对话；**Agent**：可读写工作区文件、搜索、执行命令（高危操作需审批）；`spawn_subagent` 可派生独立只读子 Agent 执行调研任务
+- 操作审批：区内写/区外写/删除/命令/MCP 五档全局 + 逐工具·路径自动审批规则（deny 优先），审批队列串行，取消级联子 Agent 与命令
 - 流式输出、思考内容展开、Markdown 渲染
-- 多会话切换；粘贴图片（支持 vision 的模型按多模态发送）；每轮记录耗时与终止原因
-- 请求失败可按设置静默重试；上下文过长时自动压缩；对话本地 gzip 落盘
+- 多会话切换；粘贴图片（支持 vision 的模型按多模态发送，气泡缩略展示）；每轮记录耗时与终止原因
+- 请求失败可按设置静默重试；上下文过长时自动压缩；对话本地 gzip 落盘，图片存 `.my_ide/chat_assets` 独立文件
 
 ### MCP 与 Skills
-- **MCP**：内置 stdio / Streamable HTTP 协议，可增删配置，按工具设只读/可写/网络三级审批与开关
+- **MCP**：内置 stdio / Streamable HTTP 协议，可增删配置，按工具设只读/可写/网络三级审批与开关；resources/prompts 聚合为只读 Agent 工具（输出标 untrusted，可并行）
 - **Skills**：兼容开源 Agent Skills（SKILL.md），多源自动发现，启用/禁用，`/skill-name` 硬路由
+- **规则**：工作区根 `AGENTS.md` 每轮注入（8K 截断）；**模板**：composer"模板" chip，内置 + 项目 `.my_ide/prompts/*.md`（`{{input}}` 占位）；**分叉**：从指定消息截断复制为新会话
 
 ### 统计
 - 侧栏 GitHub 风格贡献热力图：按日聚合对话轮次 / token 消耗 / 文件改动 / 耗时，点击某天查看当日详情
@@ -93,12 +82,19 @@
 ### 版本管理（非 Git）
 - 自研内容寻址快照（blob / tree / diff），记录用户编辑与 AI 改动；二进制文件也纳入快照可回滚
 - 版本面板浏览历史与文件差异（只读红绿行，无气泡）
-- 对话侧支持回撤轮次、单文件回退、红色 N 单块回退；无剩余改动时同步删除该轮对话
-- Restore 前自动记当前状态，Redo 栈一键恢复现场
+- 对话侧支持回撤轮次、单文件回退、红色 N 单块回退；超 3 个文件改动折叠 + 总览弹窗；无剩余改动时同步删除该轮对话
+- Restore 前自动记当前状态，Redo 栈一键恢复现场；版本库损坏缺 tree 即报错，不会清空工作区
+- 打开项目补记关闭后漂移，运行中外部改动防抖记 `user-edit`（AI 对话中跳过）；checkpoint 附带 git 分支/commit/脏状态
 
 ### 设置与备份
 - 主题、高亮、语言、供应商、最近项目、语言服务器路径等本地持久化
 - WebDAV：登录后备份 / 恢复设置与供应商配置
+- 工作区标签/活动态持久化，启动重开最近项目；macOS 支持 Finder/Dock 拖入外部打开
+- 诊断：内存 500 条 + `.my_ide/logs/app.log` 轮转；请求/上下文 deadline、失败重试与 dirty 提示
+- 跨平台 CI：push/PR 在 ubuntu/windows/macos 跑 analyze + 全量测试
+
+### 已知待办
+- 回退前对树外改动做隐式 checkpoint；"保留本地"后二次确认；未挂载脏 tab 缓冲取回；拖入语义（复制导入 vs 加入工作区）；git shadow 回退 / 遥测上报暂不做
 
 ## 技术栈
 
@@ -143,8 +139,7 @@ flutter build windows --release
 ```bash
 ./scripts/release_desktop.command
 ```
-
-默认将产物输出到 `dist/`，并执行 `flutter clean`。macOS 上通常只能打出 macOS 包；Windows / Linux 包需在对应主机或 GitHub Actions 的 Windows / Linux runner 上构建。
+默认将产物输出到 `dist/`，构建前执行 `flutter analyze --no-fatal-infos` 和 `flutter test`，并为每个压缩包生成 `.sha256` 校验文件；使用 `--skip-check` 可跳过检查，使用 `--no-clean` 可保留 `build/`。macOS 产物命名包含当前架构。macOS 上通常只能打出 macOS 包；Windows / Linux 包需在对应主机或 GitHub Actions 的 Windows / Linux runner 上构建。
 
 ### macOS：带语言服务的 Release（测诊断请用这个）
 

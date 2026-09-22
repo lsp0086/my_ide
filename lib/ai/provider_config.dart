@@ -12,7 +12,8 @@ class AiModelOption {
     this.thinkingLevel,
     /// 默认 false：拉列表后不自动对外暴露，需在设置里勾选。
     this.enabled = false,
-  });
+    Map<String, String>? customParams,
+  }) : customParams = customParams ?? {};
 
   final String id;
   String? displayName;
@@ -21,6 +22,9 @@ class AiModelOption {
   bool supportsVision;
   String? thinkingLevel;
   bool enabled;
+  /// 模型自定义请求参数：每行一对 key/value，均非空才保存，
+  /// 发请求时合并进 body（model/messages/input/stream 等结构字段除外）。
+  Map<String, String> customParams;
 
   /// 常见思考档位（OpenAI / Claude / Gemini / Qwen 等常见取值）。
   static const thinkingLevels = <String>[
@@ -67,6 +71,7 @@ class AiModelOption {
         'supportsVision': supportsVision,
         'thinkingLevel': thinkingLevel,
         'enabled': enabled,
+        if (customParams.isNotEmpty) 'customParams': customParams,
       };
 
   static AiModelOption fromJson(Map<String, dynamic> j) => AiModelOption(
@@ -78,6 +83,8 @@ class AiModelOption {
         thinkingLevel: j['thinkingLevel'] as String?,
         // 旧数据没有 enabled：已配置过的模型默认视为启用，避免突然消失
         enabled: j.containsKey('enabled') ? j['enabled'] == true : true,
+        customParams: ((j['customParams'] as Map?) ?? {})
+            .map((k, v) => MapEntry('$k', '$v')),
       );
 }
 
@@ -415,6 +422,42 @@ class AiProviderConfig {
 
     return _parseModelIds(resp.body);
   }
+
+  /// 预设模板：OpenAI 兼容地址，开箱即用。
+  static AiProviderConfig ollamaPreset() => AiProviderConfig(
+        id: 'ollama',
+        name: 'Ollama（本地）',
+        baseUrl: 'http://localhost:11434/v1',
+        fullUrl: false,
+      );
+
+  static AiProviderConfig lmstudioPreset() => AiProviderConfig(
+        id: 'lmstudio',
+        name: 'LM Studio（本地）',
+        baseUrl: 'http://localhost:1234/v1',
+        fullUrl: false,
+      );
+
+  static AiProviderConfig geminiOpenAiPreset() => AiProviderConfig(
+        id: 'gemini-openai',
+        name: 'Gemini（OpenAI 兼容）',
+        baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
+        fullUrl: false,
+      );
+
+  static AiProviderConfig deepseekPreset() => AiProviderConfig(
+        id: 'deepseek',
+        name: 'DeepSeek',
+        baseUrl: 'https://api.deepseek.com/v1',
+        fullUrl: false,
+      );
+
+  static AiProviderConfig qwenPreset() => AiProviderConfig(
+        id: 'qwen',
+        name: '通义千问（OpenAI 兼容）',
+        baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+        fullUrl: false,
+      );
 
   static List<String> _parseModelIds(String body) {
     final decoded = jsonDecode(body);

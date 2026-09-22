@@ -354,14 +354,22 @@ class SkillManager extends ChangeNotifier {
       'delete': 'delete_file',
       'move': 'move_file',
       'rename': 'move_file',
+      'mkdir': 'make_dir',
+      'copy': 'copy_file',
       'list': 'list_files',
       'search': 'search_text',
+      'semantic': 'semantic_search',
+      'repomap': 'repo_map',
+      'definition': 'lsp_definition',
+      'references': 'lsp_references',
+      'hover': 'lsp_hover',
       'fetch': 'fetch_url',
       'web': 'fetch_url',
       'todo': 'todo_write',
       'todos': 'todo_write',
       'task': 'todo_write',
       'bash': 'run_command',
+      'terminal': 'terminal_write',
       'question': 'ask_question',
       'subagent': 'spawn_subagent',
       'skill': 'load_skill',
@@ -386,6 +394,54 @@ class SkillManager extends ChangeNotifier {
       out.add(mapped);
     }
     return out;
+  }
+
+  /// 标准工具白名单：allowed-tools 未知条目校验用。
+  /// mcp__ 前缀为通配（服务端动态工具），不逐一枚举。
+  static const knownToolNames = <String>{
+    'read_file',
+    'list_files',
+    'search_text',
+    'ask_question',
+    'spawn_subagent',
+    'write_file',
+    'edit_file',
+    'apply_patch',
+    'todo_write',
+    'fetch_url',
+    'lsp_hover',
+    'lsp_definition',
+    'lsp_references',
+    'repo_map',
+    'semantic_search',
+    'get_diagnostics',
+    'delete_file',
+    'move_file',
+    'make_dir',
+    'copy_file',
+    'set_executable',
+    'read_media',
+    'terminal_create',
+    'terminal_write',
+    'terminal_poll',
+    'terminal_kill',
+    'run_command',
+    'poll_task',
+    'load_skill',
+    'mcp_list_resources',
+    'mcp_read_resource',
+    'mcp_list_prompts',
+    'mcp_get_prompt',
+  };
+
+  /// 校验 skill 的 allowed-tools：返回不在白名单的未知工具名。
+  /// skill 不存在/不限（null）时返回空列表。
+  List<String> validateAllowedTools(String skillName) {
+    final resolved = allowedToolNames(skillName);
+    if (resolved == null) return const [];
+    return resolved
+        .where((t) => !knownToolNames.contains(t) && !t.startsWith('mcp__'))
+        .toList(growable: false);
   }
 
   Future<String> loadSkillBody(String name) async {
@@ -514,10 +570,20 @@ class SkillManager extends ChangeNotifier {
       await md.readAsString(),
       directoryName: p.basename(src.path),
     );
+    // 路径穿越门禁：parsed.name 直接拼 dest 路径，非严格模式下 `../`、
+    // 绝对路径可逃出 targetRoot，且此前先递归删 dest。仅允许规范名。
+    if (!RegExp(r'^[a-z0-9]+(?:-[a-z0-9]+)*$').hasMatch(parsed.name)) {
+      throw StateError('skill 名称不合法，仅允许小写字母/数字/单连字符：${parsed.name}');
+    }
     final root = targetRoot ??
         _appGlobalSkillsDir ??
         (throw StateError('全局 skills 目录未就绪'));
     final dest = Directory(p.join(root, parsed.name));
+    if (p.normalize(dest.path) != p.join(p.normalize(root), parsed.name) ||
+        (!p.equals(p.normalize(root), p.normalize(dest.path)) &&
+            !p.isWithin(p.normalize(root), p.normalize(dest.path)))) {
+      throw StateError('skill 目标路径越界，已拒绝导入');
+    }
     if (await dest.exists()) {
       await dest.delete(recursive: true);
     }
@@ -531,19 +597,36 @@ class SkillManager extends ChangeNotifier {
   }
 
   /// 从单个 SKILL.md 文本导入（无附属文件）。
+  /// 原子写：SKILL.md 走 tmp+rename，避免崩溃半写。
   Future<AgentSkill> importSkillMdText(
     String raw, {
     String? targetRoot,
   }) async {
     final parsed = SkillMdParser.parse(raw);
+    if (!RegExp(r'^[a-z0-9]+(?:-[a-z0-9]+)*$').hasMatch(parsed.name)) {
+      throw StateError('skill 名称不合法，仅允许小写字母/数字/单连字符：${parsed.name}');
+    }
     final root = targetRoot ??
         _appGlobalSkillsDir ??
         (throw StateError('全局 skills 目录未就绪'));
     final dest = Directory(p.join(root, parsed.name));
+    if (p.normalize(dest.path) != p.join(p.normalize(root), parsed.name)) {
+      throw StateError('skill 目标路径越界，已拒绝导入');
+    }
     if (!await dest.exists()) {
       await dest.create(recursive: true);
     }
-    await File(p.join(dest.path, 'SKILL.md')).writeAsString(raw);
+    final skillFile = File(p.join(dest.path, 'SKILL.md'));
+    final tmp = File('${skillFile.path}.${DateTime.now().microsecondsSinceEpoch}.tmp');
+    await tmp.writeAsString(raw, flush: true);
+    try {
+      await tmp.rename(skillFile.path);
+    } catch (_) {
+      await skillFile.writeAsString(raw, flush: true);
+      try {
+        await tmp.delete();
+      } catch (_) {}
+    }
     await refresh();
     final loaded = findByName(parsed.name);
     if (loaded == null) {
@@ -574,6 +657,15 @@ class SkillManager extends ChangeNotifier {
         !p.isWithin(normalizedApp, skillDir)) {
       return false;
     }
+    // symlink 门禁：skillDir 若为外链，delete(recursive:true) 可能删出管控目录。
+    try {
+      if (FileSystemEntity.typeSync(skillDir, followLinks: false) ==
+          FileSystemEntityType.link) {
+        return false;
+      }
+    } catch (_) {
+      return false;
+    }
     final dir = Directory(skillDir);
     if (await dir.exists()) {
       await dir.delete(recursive: true);
@@ -582,5 +674,63 @@ class SkillManager extends ChangeNotifier {
     await _persistDisabled();
     await refresh();
     return true;
+  }
+
+  /// 校验 skill 目录：缺 SKILL.md / 缺 description / allowed-tools 未知项告警。
+  static Future<List<String>> validateSkillDir(
+    String dir, {
+    Set<String>? knownTools,
+  }) async {
+    final out = <String>[];
+    final d = Directory(dir);
+    if (!await d.exists()) return ['目录不存在：$dir'];
+    final md = File(p.join(d.path, 'SKILL.md'));
+    final alt = File(p.join(d.path, 'skill.md'));
+    final File? target = await md.exists()
+        ? md
+        : (await alt.exists() ? alt : null);
+    if (target == null) {
+      out.add('缺 SKILL.md');
+      return out;
+    }
+    String raw;
+    try {
+      raw = await target.readAsString();
+    } catch (e) {
+      return ['SKILL.md 不可读：$e'];
+    }
+    ParsedSkillMd parsed;
+    try {
+      parsed = SkillMdParser.parse(raw, directoryName: p.basename(d.path));
+    } catch (e) {
+      return ['SKILL.md 解析失败：$e'];
+    }
+    if (parsed.description.trim().isEmpty) out.add('缺 description');
+    final allowed = parsed.allowedTools;
+    if (allowed != null && allowed.trim().isNotEmpty) {
+      final tools = allowed
+          .split(RegExp(r'[\s,;|]+'))
+          .map((e) => e.trim())
+          .where((e) => e.isNotEmpty)
+          .toList();
+      final known = knownTools ?? knownToolNames;
+      for (final t in tools) {
+        final base = t.contains('(') ? t.substring(0, t.indexOf('(')) : t;
+        final lower = base.trim().toLowerCase();
+        if (lower.isEmpty || lower == '*') continue;
+        if (lower.startsWith('mcp__')) continue;
+        if (!known.contains(lower)) out.add('allowed-tools 未知项：$t');
+      }
+    }
+    if (parsed.warning != null && parsed.warning!.isNotEmpty) {
+      out.add(parsed.warning!);
+    }
+    return out;
+  }
+
+  /// 生成 skill 模板文本：含 frontmatter + 正文骨架。
+  static String skillTemplate(String name) {
+    final n = name.trim().isEmpty ? 'my-skill' : name.trim();
+    return '---\nname: $n\ndescription: TODO 一句话描述该 skill 的用途\nallowed-tools: read_file, edit_file\n---\n\n# $n\n\n## 用法\n\n- TODO 补充触发条件与步骤\n';
   }
 }

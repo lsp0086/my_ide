@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=my_ide
+GenericName=IDE
+Comment=Lightweight desktop IDE built with Flutter
+Exec=my_ide %U
+Icon=my_ide
+Terminal=false
+Categories=Development;IDE;TextEditor;
+Keywords=ide;editor;code;flutter;ai;agent;
+StartupNotify=true
+StartupWMClass=com.example.my_ide
+MimeType=text/plain;inode/directory;

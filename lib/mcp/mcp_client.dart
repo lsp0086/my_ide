@@ -151,14 +151,38 @@ class McpSession {
   bool _connected = false;
   String? _lastError;
   List<McpToolDef> _tools = const [];
+  final List<String> _logs = <String>[];
+  static const _maxLogs = 200;
 
   bool get connected => _connected;
   String? get lastError => _lastError;
   List<McpToolDef> get tools => List.unmodifiable(_tools);
+  List<String> get logs => List.unmodifiable(_logs);
+
+  void _appendLog(String text) {
+    final value = text.trim();
+    if (value.isEmpty) return;
+    _logs.add(value.length > 1000 ? value.substring(0, 1000) : value);
+    if (_logs.length > _maxLogs) {
+      _logs.removeRange(0, _logs.length - _maxLogs);
+    }
+  }
+
+  /// tools_changed 通知回调：接到 notifications/tools/list_changed 即回调，不崩。
+  /// 500ms 节流：恶意 server 高频推送不再致频繁 refresh。
+  void Function()? onToolsChanged;
+  DateTime? _lastToolsChangedAt;
+
+  /// progress 透出回调：接到 notifications/progress 即回调，不崩。
+  void Function(Map<String, dynamic> params)? onProgress;
+
+  /// logging 透出回调：接到 notifications/message 即回调，不崩。
+  void Function(Map<String, dynamic> params)? onLog;
 
   Future<void> connect() async {
     await disconnect();
     _lastError = null;
+    _appendLog('开始连接 ${config.name}');
     try {
       if (config.transport == McpTransportType.stdio) {
         await _connectStdio();
@@ -168,8 +192,10 @@ class McpSession {
       await _initialize();
       await _refreshTools();
       _connected = true;
+      _appendLog('连接成功');
     } catch (e) {
       _lastError = '$e';
+      _appendLog('连接失败：$e');
       await disconnect();
       rethrow;
     }
@@ -193,24 +219,73 @@ class McpSession {
     final proc = _process;
     _process = null;
     if (proc != null) {
+      // 组杀前先验 pgid 归属：未独立成组（与 IDE 同组）时跳过组杀，
+      // 只走逐进程信号，避免 `kill -- -pid` 误伤整个 IDE 进程组。
+      // 非 detached 老进程 kill -- -pid 会 ESRCH 失败，无副作用。
+      var groupIsolated = false;
+      try {
+        final targetPgid = await _pgidOf(proc.pid);
+        final myPgid = await _pgidOf(pid);
+        groupIsolated = targetPgid != null &&
+            targetPgid > 1 &&
+            (myPgid == null || targetPgid != myPgid);
+      } catch (_) {}
+      if (groupIsolated) {
+        try {
+          await Process.run('kill', [
+            '-TERM',
+            '--',
+            '-${proc.pid}',
+          ]).timeout(const Duration(seconds: 2));
+        } catch (_) {}
+      }
       try {
         proc.kill(ProcessSignal.sigterm);
+      } catch (_) {}
+      // 先关 stdin 再等退出：与 LspClient.stop() 同序，
+      // 等 stdin EOF 优雅退出的 server 不再必走 3s 超时+sigkill。
+      try {
+        await proc.stdin.close();
       } catch (_) {}
       try {
         await proc.exitCode.timeout(const Duration(seconds: 3));
       } catch (_) {
+        if (groupIsolated) {
+          try {
+            await Process.run('kill', [
+              '-KILL',
+              '--',
+              '-${proc.pid}',
+            ]).timeout(const Duration(seconds: 2));
+          } catch (_) {}
+        }
         try {
           proc.kill(ProcessSignal.sigkill);
         } catch (_) {}
       }
-      try {
-        await proc.stdin.close();
-      } catch (_) {}
     }
     _http?.close();
     _http = null;
     _sessionId = null;
     _stdoutBuf.clear();
+  }
+
+  /// 查询指定 pid 的进程组 id，失败返回 null（ps 不可用时调用方跳过组杀）。
+  Future<int?> _pgidOf(int queryPid) async {
+    try {
+      final result = await Process.run(
+        'ps',
+        ['-o', 'pgid=', '-p', '$queryPid'],
+      ).timeout(const Duration(seconds: 2));
+      if (result.exitCode != 0) return null;
+      final raw = '${result.stdout}'.trim().split(RegExp(r'\s+')).firstWhere(
+            (e) => e.isNotEmpty,
+            orElse: () => '',
+          );
+      return int.tryParse(raw);
+    } catch (_) {
+      return null;
+    }
   }
 
   Future<void> _connectStdio() async {
@@ -220,10 +295,12 @@ class McpSession {
     }
     // 环境最小化：不再合并全量 Platform.environment，只给 PATH + 必要项，
     // 密钥靠 config.env 显式传入，避免泄漏宿主全部环境变量。
+    // env/headers 支持 ${ENV:VAR} / ${VAR} 本地展开。
+    final expandedEnv = McpConfigImporter.expandEnvMap(config.env);
     final env = <String, String>{
       ..._desktopPathEnv(),
       ..._minimalEnv(),
-      ...config.env,
+      ...expandedEnv,
     };
     _process = await Process.start(
       command,
@@ -253,6 +330,7 @@ class McpSession {
       final text = utf8.decode(bytes, allowMalformed: true).trim();
       if (text.isNotEmpty) {
         _lastError = text.length > 400 ? text.substring(0, 400) : text;
+        _appendLog('stderr: $text');
       }
     });
   }
@@ -342,6 +420,11 @@ class McpSession {
     } catch (_) {
       return;
     }
+    // 无 id 的 notification：透出回调，不崩。
+    if (!msg.containsKey('id') && msg['method'] is String) {
+      _handleNotification('${msg['method']}', msg['params']);
+      return;
+    }
     final id = msg['id'];
     if (id is num) {
       final completer = _pending.remove(id.toInt());
@@ -353,7 +436,41 @@ class McpSession {
       } else {
         completer.complete(msg);
       }
+      return;
     }
+    // HTTP/SSE 响应里混入的 notification 同样透出。
+    if (msg['method'] is String) {
+      _handleNotification('${msg['method']}', msg['params']);
+    }
+  }
+
+  void _handleNotification(String method, dynamic params) {
+    try {
+      final map = params is Map ? Map<String, dynamic>.from(params) : <String, dynamic>{};
+      if (method == 'notifications/tools/list_changed') {
+        try {
+          final now = DateTime.now();
+          if (_lastToolsChangedAt == null ||
+              now.difference(_lastToolsChangedAt!) >= const Duration(milliseconds: 500)) {
+            _lastToolsChangedAt = now;
+            onToolsChanged?.call();
+          }
+        } catch (_) {}
+        return;
+      }
+      if (method == 'notifications/progress') {
+        try {
+          onProgress?.call(map);
+        } catch (_) {}
+        return;
+      }
+      if (method == 'notifications/message') {
+        _appendLog(jsonEncode(map));
+        try {
+          onLog?.call(map);
+        } catch (_) {}
+      }
+    } catch (_) {}
   }
 
   Future<Map<String, dynamic>> _rpc(
@@ -371,8 +488,12 @@ class McpSession {
     if (config.transport == McpTransportType.stdio) {
       final proc = _process;
       if (proc == null) throw StateError('stdio 未连接');
-      proc.stdin.writeln(jsonEncode(payload));
-      await proc.stdin.flush();
+      try {
+        proc.stdin.writeln(jsonEncode(payload));
+        await proc.stdin.flush();
+      } catch (e) {
+        throw StateError('MCP 发送失败（进程可能已退出）：$e');
+      }
       if (!expectResult) return const {};
       final completer = Completer<Map<String, dynamic>>();
       _pending[id] = completer;
@@ -389,10 +510,11 @@ class McpSession {
     final client = _http;
     if (client == null) throw StateError('HTTP 未连接');
     final uri = Uri.parse(config.url.trim());
+    final expandedHeaders = McpConfigImporter.expandEnvMap(config.headers);
     final headers = <String, String>{
       'Content-Type': 'application/json',
       'Accept': 'application/json, text/event-stream',
-      ...config.headers,
+      ...expandedHeaders,
       if (_sessionId != null) 'Mcp-Session-Id': _sessionId!,
     };
     http.Response response;
@@ -402,6 +524,27 @@ class McpSession {
           .timeout(_timeout);
     } on TimeoutException {
       throw TimeoutException('MCP 请求超时：$method');
+    }
+    // Streamable HTTP 失败时回退 SSE GET（Accept: text/event-stream）尝试一次。
+    if ((response.statusCode == 404 || response.statusCode == 405) &&
+        expectResult) {
+      try {
+        final sseHeaders = <String, String>{
+          'Accept': 'text/event-stream',
+          ...expandedHeaders,
+          if (_sessionId != null) 'Mcp-Session-Id': _sessionId!,
+        };
+        final sseResp = await client
+            .get(uri, headers: sseHeaders)
+            .timeout(const Duration(seconds: 10));
+        if (sseResp.statusCode >= 200 && sseResp.statusCode < 300) {
+          final parsed = _parseSseBody(
+            sseResp.body,
+            contentType: sseResp.headers['content-type'],
+          );
+          if (parsed != null) return parsed;
+        }
+      } catch (_) {}
     }
     final sid = response.headers['mcp-session-id'];
     if (sid != null && sid.isNotEmpty) _sessionId = sid;
@@ -419,26 +562,11 @@ class McpSession {
     }
     final body = response.body.trim();
     if (body.isEmpty) return const {};
-    // SSE：取最后一条 data JSON
-    if (body.contains('data:') ||
-        (response.headers['content-type'] ?? '').contains('text/event-stream')) {
-      Map<String, dynamic>? last;
-      for (final line in body.split('\n')) {
-        final t = line.trim();
-        if (!t.startsWith('data:')) continue;
-        final data = t.substring(5).trim();
-        if (data.isEmpty || data == '[DONE]') continue;
-        try {
-          final decoded = jsonDecode(data);
-          if (decoded is Map) last = Map<String, dynamic>.from(decoded);
-        } catch (_) {}
-      }
-      if (last == null) throw StateError('SSE 响应无有效 JSON');
-      if (last.containsKey('error')) {
-        throw StateError('MCP error: ${jsonEncode(last['error'])}');
-      }
-      return last;
-    }
+    final sseParsed = _parseSseBody(
+      body,
+      contentType: response.headers['content-type'],
+    );
+    if (sseParsed != null) return sseParsed;
     final decoded = jsonDecode(body);
     if (decoded is! Map) throw StateError('HTTP 响应不是 JSON 对象');
     final map = Map<String, dynamic>.from(decoded);
@@ -446,6 +574,37 @@ class McpSession {
       throw StateError('MCP error: ${jsonEncode(map['error'])}');
     }
     return map;
+  }
+
+  /// SSE 体解析：取最后一条 data JSON；非 SSE 返回 null 由调用方走纯 JSON。
+  /// 混入的 notification 在此透出回调，不影响主 result。
+  Map<String, dynamic>? _parseSseBody(String body, {String? contentType}) {
+    final isSse = body.contains('data:') ||
+        (contentType ?? '').contains('text/event-stream');
+    if (!isSse) return null;
+    Map<String, dynamic>? last;
+    for (final line in body.split('\n')) {
+      final t = line.trim();
+      if (!t.startsWith('data:')) continue;
+      final data = t.substring(5).trim();
+      if (data.isEmpty || data == '[DONE]') continue;
+      try {
+        final decoded = jsonDecode(data);
+        if (decoded is Map) {
+          final m = Map<String, dynamic>.from(decoded);
+          if (!m.containsKey('id') && m['method'] is String) {
+            _handleNotification('${m['method']}', m['params']);
+            continue;
+          }
+          last = m;
+        }
+      } catch (_) {}
+    }
+    if (last == null) throw StateError('SSE 响应无有效 JSON');
+    if (last.containsKey('error')) {
+      throw StateError('MCP error: ${jsonEncode(last['error'])}');
+    }
+    return last;
   }
 
   Future<void> _notify(String method, Map<String, dynamic> params) async {
@@ -457,8 +616,10 @@ class McpSession {
     if (config.transport == McpTransportType.stdio) {
       final proc = _process;
       if (proc == null) return;
-      proc.stdin.writeln(jsonEncode(payload));
-      await proc.stdin.flush();
+      try {
+        proc.stdin.writeln(jsonEncode(payload));
+        await proc.stdin.flush().timeout(const Duration(seconds: 5));
+      } catch (_) {}
       return;
     }
     final client = _http;
@@ -467,10 +628,15 @@ class McpSession {
     final headers = <String, String>{
       'Content-Type': 'application/json',
       'Accept': 'application/json, text/event-stream',
-      ...config.headers,
+      ...McpConfigImporter.expandEnvMap(config.headers),
       if (_sessionId != null) 'Mcp-Session-Id': _sessionId!,
     };
-    await client.post(uri, headers: headers, body: jsonEncode(payload));
+    // 初始化通知挂起会卡死整条 connect 退避链：加超时，失败吞掉继续。
+    try {
+      await client
+          .post(uri, headers: headers, body: jsonEncode(payload))
+          .timeout(const Duration(seconds: 10));
+    } catch (_) {}
   }
 
   Future<void> _initialize() async {
@@ -540,6 +706,85 @@ class McpSession {
     _tools = out;
   }
 
+  /// R7：列出服务器 resources（不支持的服务器返回空，不抛错）。
+  Future<List<Map<String, dynamic>>> listResources() async {
+    try {
+      final resp = await _rpc('resources/list', params: {});
+      final result = resp['result'];
+      final list = result is Map ? result['resources'] : null;
+      if (list is! List) return const [];
+      return list
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  /// R7：读取单个 resource，返回拼接后的文本内容。
+  Future<String> readResource(String uri) async {
+    final resp = await _rpc(
+      'resources/read',
+      params: {'uri': uri},
+    );
+    final result = resp['result'];
+    final contents = result is Map ? result['contents'] : null;
+    if (contents is! List) return '';
+    final buf = StringBuffer();
+    for (final c in contents) {
+      if (c is! Map) continue;
+      if (buf.length >= 64 * 1024) break;
+      final text = c['text'];
+      if (text is String && text.isNotEmpty) buf.writeln(text);
+    }
+    var out = buf.toString().trim();
+    if (buf.length >= 64 * 1024) out = '$out\n…（MCP 输出过长已截断）';
+    return out;
+  }
+
+  /// R7：列出服务器 prompts（不支持返回空）。
+  Future<List<Map<String, dynamic>>> listPrompts() async {
+    try {
+      final resp = await _rpc('prompts/list', params: {});
+      final result = resp['result'];
+      final list = result is Map ? result['prompts'] : null;
+      if (list is! List) return const [];
+      return list
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  /// R7：取 prompt 展开后的消息文本。
+  Future<String> getPrompt(
+    String name, [
+    Map<String, dynamic> args = const {},
+  ]) async {
+    final resp = await _rpc(
+      'prompts/get',
+      params: {'name': name, 'arguments': args},
+    );
+    final result = resp['result'];
+    final messages = result is Map ? result['messages'] : null;
+    if (messages is! List) return '';
+    final buf = StringBuffer();
+    for (final m in messages) {
+      if (m is! Map) continue;
+      if (buf.length >= 64 * 1024) break;
+      final content = m['content'];
+      if (content is Map && content['text'] is String) {
+        buf.writeln(content['text']);
+      }
+    }
+    var out = buf.toString().trim();
+    if (buf.length >= 64 * 1024) out = '$out\n…（MCP 输出过长已截断）';
+    return out;
+  }
+
   Future<McpCallResult> callTool(
     String toolName,
     Map<String, dynamic> arguments,
@@ -559,35 +804,50 @@ class McpSession {
       final isError = result['isError'] == true;
       final content = result['content'];
       final buf = StringBuffer();
+      // 总预算：恶意 server 无限 text 块可撑爆上下文，超 64k 截断。
+      const maxTotal = 64 * 1024;
+      var truncated = false;
+      void writeCapped(String s) {
+        if (truncated) return;
+        final rest = maxTotal - buf.length;
+        if (rest <= 0) {
+          truncated = true;
+          return;
+        }
+        buf.write(s.length <= rest ? s : s.substring(0, rest));
+        if (s.length > rest) truncated = true;
+      }
       if (content is List) {
         for (final c in content) {
           if (c is! Map) continue;
           final type = '${c['type'] ?? ''}';
           if (type == 'text') {
-            buf.writeln('${c['text'] ?? ''}');
+            writeCapped('${c['text'] ?? ''}\n');
           } else if (type == 'image') {
             // 多模态透传：保留 data/mimeType，不丢弃为 JSON 字符串。
+            // 同样记入总预算：此前直写绕过 64k 上限，千块 image 即撑爆上下文。
             final data = c['data'];
             final mime = c['mimeType'] ?? c['mime_type'] ?? 'image/png';
-            buf.writeln(
-                '[图片 $mime ${data is String ? '${data.length} 字符' : ''}]');
+            writeCapped(
+                '[图片 $mime ${data is String ? '${data.length} 字符' : ''}]\n');
             if (data is String && data.isNotEmpty) {
-              buf.writeln('data:$mime;base64,${_clipBase64(data)}');
+              writeCapped('data:$mime;base64,${_clipBase64(data)}\n');
             }
           } else if (type == 'audio') {
-            buf.writeln('[音频：${c['mimeType'] ?? c['mime_type'] ?? ''}]');
+            writeCapped('[音频：${c['mimeType'] ?? c['mime_type'] ?? ''}]\n');
           } else if (type == 'resource' || type == 'resource_link') {
-            buf.writeln('[资源：${c['uri'] ?? c['resource'] ?? ''}]');
+            writeCapped('[资源：${c['uri'] ?? c['resource'] ?? ''}]\n');
             final text = c['text'];
-            if (text is String && text.isNotEmpty) buf.writeln(text);
+            if (text is String && text.isNotEmpty) writeCapped('$text\n');
           } else {
-            buf.writeln(jsonEncode(c));
+            writeCapped('${jsonEncode(c)}\n');
           }
         }
       } else if (result['structuredContent'] != null) {
-        buf.writeln(jsonEncode(result['structuredContent']));
+        writeCapped('${jsonEncode(result['structuredContent'])}\n');
       }
-      final text = buf.toString().trim();
+      var text = buf.toString().trim();
+      if (truncated) text = '$text\n…（MCP 输出过长已截断）';
       return McpCallResult(
         ok: !isError,
         output: text.isEmpty ? (isError ? '工具返回错误' : '（无输出）') : text,

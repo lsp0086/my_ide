@@ -8,13 +8,52 @@ class AppDelegate: FlutterAppDelegate {
   /// 与截图里“新建窗口”一致。项目互斥由 Dart 侧双锁保证（文件 PID 锁 + 进程内内存锁）。
   private var windowControllers: [NSWindowController] = []
 
+  /// Finder 拖入 / "打开方式"：启动完成前先排队，避免与 MainMenu 首窗口时序竞争。
+  private var pendingOpenPaths: [String] = []
+  private var didFinishLaunchingFlag = false
+
   override func applicationDidFinishLaunching(_ notification: Notification) {
     // 首窗口由 MainMenu.xib 创建；这里只接管引用，便于后续新建窗口时错峰摆放。
     for window in NSApp.windows {
       if window.contentViewController is FlutterViewController {
         window.delegate = self
+        // xib 里 releasedWhenClosed=NO：关闭后窗口对象残留，系统认为“还有窗口”，
+        // applicationShouldTerminateAfterLastWindowClosed 永不触发。
+        // 改为 true 让关闭真正释放，配合下面的手动兜底退出。
+        window.isReleasedWhenClosed = true
       }
     }
+    didFinishLaunchingFlag = true
+    for path in pendingOpenPaths {
+      openExternalPath(path)
+    }
+    pendingOpenPaths.removeAll()
+  }
+
+  // 拖到 Dock 图标 / Finder "打开方式"。
+  override func application(_ sender: NSApplication, openFile filename: String) -> Bool {
+    handleExternalOpen([filename])
+    return true
+  }
+
+  override func application(_ sender: NSApplication, openFiles filenames: [String]) {
+    handleExternalOpen(filenames)
+  }
+
+  private func handleExternalOpen(_ paths: [String]) {
+    if didFinishLaunchingFlag {
+      for path in paths { openExternalPath(path) }
+    } else {
+      pendingOpenPaths.append(contentsOf: paths)
+    }
+  }
+
+  /// 目录直接作为工作区打开；文件则打开其所在目录（Dart 侧按工作区组织）。
+  private func openExternalPath(_ path: String) {
+    var isDir: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir) else { return }
+    let target = isDir.boolValue ? path : (path as NSString).deletingLastPathComponent
+    openNewWindow(openPath: target)
   }
 
   override func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -59,5 +98,16 @@ extension AppDelegate: NSWindowDelegate {
       flutterVC.engine.shutDownEngine()
     }
     windowControllers.removeAll { $0.window === window }
+    // 所有窗口（含 xib 首窗口）都是 isReleasedWhenClosed=false，
+    // 关闭后窗口对象仍残留在 NSApp.windows，系统会认为“还有窗口”，
+    // applicationShouldTerminateAfterLastWindowClosed 因此不会被触发，
+    // 表现为“没有窗口但 Dock 里进程还在”。下一 runloop 检查可见/最小化窗口，
+    // 为空则主动退出；windowWillClose 时窗口还没真正关掉，所以必须 async。
+    DispatchQueue.main.async {
+      let alive = NSApp.windows.contains { $0.isVisible || $0.isMiniaturized }
+      if !alive {
+        NSApp.terminate(nil)
+      }
+    }
   }
 }

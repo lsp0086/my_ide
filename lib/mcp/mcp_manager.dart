@@ -1,7 +1,9 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 
+import '../settings/secret_vault.dart';
 import '../settings/settings_store.dart';
 import 'mcp_client.dart';
 import 'mcp_config.dart';
@@ -15,17 +17,53 @@ class McpManager extends ChangeNotifier {
   final List<McpServerConfig> _servers = [];
   final Map<String, McpSession> _sessions = {};
   final Map<String, String> _status = {}; // id -> connected/error/idle/connecting
+  final Map<String, String> _lastFailure = {};
   bool _loaded = false;
 
   List<McpServerConfig> get servers => List.unmodifiable(_servers);
 
   String statusOf(String id) => _status[id] ?? 'idle';
 
+  String? lastFailureOf(String id) => _lastFailure[id];
+
   McpSession? sessionOf(String id) => _sessions[id];
+
+  /// R7：聚合已连接服务器的 resources（serverId -> 列表）。
+  Future<Map<String, List<Map<String, dynamic>>>> listAllResources() async {
+    final out = <String, List<Map<String, dynamic>>>{};
+    // 快照后遍历：await 间隙 upsert/remove 改 _servers 会抛 ConcurrentModificationError。
+    for (final s in List<McpServerConfig>.from(_servers)) {
+      if (!s.enabled) continue;
+      final session = _sessions[s.id];
+      if (session == null || !session.connected) continue;
+      try {
+        final list = await session.listResources();
+        if (list.isNotEmpty) out[s.id] = list;
+      } catch (_) {}
+    }
+    return out;
+  }
+
+  /// R7：聚合已连接服务器的 prompts（serverId -> 列表）。
+  Future<Map<String, List<Map<String, dynamic>>>> listAllPrompts() async {
+    final out = <String, List<Map<String, dynamic>>>{};
+    for (final s in List<McpServerConfig>.from(_servers)) {
+      if (!s.enabled) continue;
+      final session = _sessions[s.id];
+      if (session == null || !session.connected) continue;
+      try {
+        final list = await session.listPrompts();
+        if (list.isNotEmpty) out[s.id] = list;
+      } catch (_) {}
+    }
+    return out;
+  }
 
   List<McpToolDef> get allTools {
     final out = <McpToolDef>[];
-    for (final s in _servers) {
+    // 快照后遍历：与 listAllResources/listAllPrompts 同理，await 间隙
+    // upsert/remove 改 _servers 会抛 ConcurrentModificationError。
+    for (final s in List<McpServerConfig>.from(_servers)) {
       if (!s.enabled) continue;
       final session = _sessions[s.id];
       if (session == null || !session.connected) continue;
@@ -89,7 +127,7 @@ class McpManager extends ChangeNotifier {
   List<McpToolDef> filteredToolsForPrompt(String query, {int? budget}) {
     final all = allTools;
     var cap = budget ?? 40;
-    for (final s in _servers) {
+    for (final s in List<McpServerConfig>.from(_servers)) {
       if (!s.enabled) continue;
       if (s.maxTools < cap) cap = s.maxTools;
     }
@@ -132,6 +170,14 @@ class McpManager extends ChangeNotifier {
 
   Future<void> ensureLoaded() async {
     if (_loaded) return;
+    // 占位防并发重入：loadFuture 合并并发调用，此前 _loaded=true 先置位，
+    // 第二次并发直接返回读到半初始化 _servers。
+    return _loadFuture ??= _ensureLoadedInner();
+  }
+
+  Future<void>? _loadFuture;
+
+  Future<void> _ensureLoadedInner() async {
     _loaded = true;
     final raw = SettingsStore.instance.getString('mcpServers') ?? '[]';
     try {
@@ -139,10 +185,24 @@ class McpManager extends ChangeNotifier {
       _servers
         ..clear()
         ..addAll(list.whereType<Map>().map(
-              (e) => McpServerConfig.fromJson(Map<String, dynamic>.from(e)),
+              (e) => McpServerConfig.fromJson(
+                  _decodeSecrets(Map<String, dynamic>.from(e))),
             ));
     } catch (_) {
       _servers.clear();
+    }
+    final runtime = SettingsStore.instance.getString('mcpRuntimeState');
+    if (runtime != null) {
+      try {
+        final decoded = jsonDecode(runtime);
+        final failures = decoded is Map ? decoded['failures'] : null;
+        if (failures is Map) {
+          _lastFailure.addAll(failures.map((k, v) => MapEntry('$k', '$v')));
+          for (final entry in _lastFailure.entries) {
+            _status[entry.key] = 'error: ${entry.value}';
+          }
+        }
+      } catch (_) {}
     }
     notifyListeners();
     for (final s in List<McpServerConfig>.from(_servers)) {
@@ -153,11 +213,48 @@ class McpManager extends ChangeNotifier {
     }
   }
 
+  Future<void> _persistRuntimeState() async {
+    await SettingsStore.instance.setString(
+      'mcpRuntimeState',
+      jsonEncode({
+        'failures': _lastFailure,
+        'updatedAt': DateTime.now().toIso8601String(),
+      }),
+    );
+  }
+
   Future<void> _persist() async {
     await SettingsStore.instance.setString(
       'mcpServers',
-      jsonEncode(_servers.map((e) => e.toJson()).toList()),
+      jsonEncode(_servers.map((e) => _encodeSecrets(e.toJson())).toList()),
     );
+  }
+
+  /// MCP env/headers 可能含密钥：落盘加密 enc:，读取解密，兼容旧明文。
+  static Map<String, dynamic> _encodeSecrets(Map<String, dynamic> m) {
+    final out = Map<String, dynamic>.from(m);
+    for (final key in ['env', 'headers']) {
+      final v = out[key];
+      if (v is Map) {
+        final encoded = <String, String>{};
+        v.forEach((k, val) => encoded['$k'] = SecretVault.encrypt('$val'));
+        out[key] = encoded;
+      }
+    }
+    return out;
+  }
+
+  static Map<String, dynamic> _decodeSecrets(Map<String, dynamic> m) {
+    final out = Map<String, dynamic>.from(m);
+    for (final key in ['env', 'headers']) {
+      final v = out[key];
+      if (v is Map) {
+        final decoded = <String, String>{};
+        v.forEach((k, val) => decoded['$k'] = SecretVault.decrypt('$val'));
+        out[key] = decoded;
+      }
+    }
+    return out;
   }
 
   Future<void> upsert(McpServerConfig config) async {
@@ -173,9 +270,52 @@ class McpManager extends ChangeNotifier {
 
   Future<void> remove(String id) async {
     await disconnect(id);
+    _connectGen.remove(id);
+    final removed = _servers.where((e) => e.id == id).toList();
     _servers.removeWhere((e) => e.id == id);
+    for (final server in removed) {
+      await _cleanupInstallDirectory(server);
+    }
     await _persist();
     notifyListeners();
+  }
+
+  Future<void> _cleanupInstallDirectory(McpServerConfig server) async {
+    final dir = server.installDirectory?.trim();
+    if (dir == null || dir.isEmpty) return;
+    if (server.transport != McpTransportType.stdio) return;
+    try {
+      // 托管目录删除加固：相对路径/父目录穿越直接拒绝，避免误删工作区；
+      // 非绝对路径一律不删。realpath 消 symlink 后再判：预埋链接指向
+      // 工作区根时 startsWith 仍可绕过，必须按真实路径校验。
+      final type = FileSystemEntity.typeSync(dir, followLinks: false);
+      if (type == FileSystemEntityType.link) return;
+      final realDir = Directory(dir).resolveSymbolicLinksSync();
+      if (!realDir.startsWith('/')) return;
+      final normalized = Directory(realDir).absolute.path;
+      if (normalized == '/' ||
+          normalized == '/tmp' ||
+          normalized == '/Users' ||
+          normalized == '/home' ||
+          normalized == '/usr' ||
+          normalized == '/bin' ||
+          normalized == '/etc' ||
+          normalized == '/var') {
+        return;
+      }
+      // 用户家目录本身不删：仅允许家目录下至少两层子目录（如 ~/.cache/x）。
+      final home = Platform.environment['HOME'];
+      if (home != null && home.isNotEmpty) {
+        final realHome = Directory(home).resolveSymbolicLinksSync();
+        if (normalized == realHome) return;
+      }
+      final directory = Directory(realDir);
+      if (!await directory.exists()) return;
+      final marker = File('${directory.path}/.my_ide_mcp_managed');
+      if (!await marker.exists()) return;
+      // 仅删标记目录自身内容，目录不存在/标记缺失即停，不做递归上溯。
+      await directory.delete(recursive: true);
+    } catch (_) {}
   }
 
   Future<void> setEnabled(String id, bool enabled) async {
@@ -194,6 +334,10 @@ class McpManager extends ChangeNotifier {
   Future<List<McpServerConfig>> importRaw(String raw) async {
     final imported = McpConfigImporter.importJson(raw);
     for (final item in imported) {
+      // 导入默认禁用：JSON 可来自网页/分享，stdio command 即本地命令执行，
+      // 自动 enabled 会在 ensureLoaded/connect 时无审批直跑。用户在设置页
+      // 逐个启用（setEnabled→connect）即为明示同意。
+      item.enabled = false;
       final existing = _servers.indexWhere(
         (e) => e.name == item.name || e.id == item.id,
       );
@@ -218,10 +362,28 @@ class McpManager extends ChangeNotifier {
   /// 完整导出（含密钥）：仅用于本地备份，勿分享。
   String exportRawWithSecrets() => McpConfigImporter.exportJson(_servers);
 
-  Future<void> connect(String id) async {
+  final Map<String, Future<void>> _connecting = {};
+  // 重连代际：setEnabled(false)->disconnect 后，旧 _connectInner 退避
+  // （1s/2s/4s）期间的成功连接不应复活已禁用的 server。每次 connect 递增，
+  // disconnect/setEnabled(false)/remove 使旧代际失效。
+  final Map<String, int> _connectGen = {};
+
+  Future<void> connect(String id) {
+    // 同 server 并发 connect 合并：此前 disconnect+connect 交错可删掉
+    // 对方刚存的新 session，泄漏旧连接。
+    return _connecting.putIfAbsent(id, () => _connectInner(id)).whenComplete(
+      () => _connecting.remove(id),
+    );
+  }
+
+  Future<void> _connectInner(String id) async {
+    final gen = (_connectGen[id] ?? 0) + 1;
+    _connectGen[id] = gen;
     final idx = _servers.indexWhere((e) => e.id == id);
     if (idx < 0) return;
     final cfg = _servers[idx];
+    // 入口复检：禁用中的 server 不再发起连接。
+    if (!cfg.enabled) return;
     _status[id] = 'connecting';
     notifyListeners();
     // 指数退避重连：1s / 2s / 4s，最多 3 次，避免单次失败即标 error。
@@ -231,13 +393,31 @@ class McpManager extends ChangeNotifier {
         await Future<void>.delayed(
             Duration(seconds: 1 << (attempt - 1)));
       }
-      final session = McpSession(cfg.copy());
+      // 退避期间若被禁用/删除/新一轮 connect，旧代际直接放弃，不再复活。
+      if (_connectGen[id] != gen) return;
+      final cur = _servers.indexWhere((e) => e.id == id);
+      if (cur < 0 || !_servers[cur].enabled) return;
+      final session = McpSession(_servers[cur].copy());
       try {
         await session.connect();
-        await _sessions[id]?.disconnect();
+        if (_connectGen[id] != gen) {
+          try {
+            await session.disconnect();
+          } catch (_) {}
+          return;
+        }
+        // 旧 session 不在存新之前断：先存新再断旧，避免并发 disconnect
+        // 删掉刚存的新 session。
+        final old = _sessions[id];
         _sessions[id] = session;
         _status[id] = 'connected';
+        _lastFailure.remove(id);
+        await _persistRuntimeState();
         notifyListeners();
+        // 先存新再断旧：disconnect 并发时 remove 的是旧引用，不误删新 session。
+        try {
+          await old?.disconnect();
+        } catch (_) {}
         return;
       } catch (e) {
         lastErr = e;
@@ -246,13 +426,22 @@ class McpManager extends ChangeNotifier {
     }
     _sessions.remove(id);
     _status[id] = 'error: $lastErr';
+    _lastFailure[id] = '$lastErr';
+    await _persistRuntimeState();
     notifyListeners();
   }
 
   Future<void> disconnect(String id) async {
+    // 代际失效：在途 _connectInner 退避/连接成功后不再写回复活。
+    _connectGen[id] = (_connectGen[id] ?? 0) + 1;
     final session = _sessions.remove(id);
-    await session?.disconnect();
+    if (session == null) {
+      _status[id] = 'idle';
+      return;
+    }
+    await session.disconnect();
     _status[id] = 'idle';
+    await _persistRuntimeState();
     notifyListeners();
   }
 
@@ -271,7 +460,8 @@ class McpManager extends ChangeNotifier {
     }
     final serverKey = split.serverKey;
     final toolName = split.toolName;
-    for (final s in _servers) {
+    // 快照后遍历：await session.callTool 间隙 _servers 被改会抛并发修改。
+    for (final s in List<McpServerConfig>.from(_servers)) {
       if (!s.enabled) continue;
       final safe = McpToolDef.safeToken(s.name);
       if (safe != serverKey && s.name != serverKey) continue;

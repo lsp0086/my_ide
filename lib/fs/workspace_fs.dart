@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:math';
 
 import 'package:path/path.dart' as p;
 
@@ -10,6 +11,8 @@ class WorkspaceFs {
   WorkspaceFs({required this.rootPath});
 
   final String rootPath;
+
+  static final Random _random = Random.secure();
 
   /// 归一化并判定路径位置：解析 symlink（realpath），防 `../` + 链接逃逸。
   FsZone zoneOf(String rawPath) {
@@ -28,6 +31,44 @@ class WorkspaceFs {
   }
 
   /// 存在则解析符号链接得到真实路径；不存在则逐级向上找存在的父目录解析后拼接。
+  /// 公开给 AgentTools 审批后写侧复用：返回 realpath，
+  /// 避免校验用 realpath、落盘用 normalize 原路径的分离窗口。
+  static String realpathOf(String abs) => _realpathOr(abs);
+
+  /// 终点/父链链接检查（写侧用）：任一段为链接即真，读侧允许跟随不受影响。
+  static bool isWriteLink(String abs, String root) {
+    try {
+      if (FileSystemEntity.typeSync(abs, followLinks: false) ==
+          FileSystemEntityType.link) {
+        return true;
+      }
+      var dir = p.dirname(abs);
+      final rootNorm = p.normalize(root);
+      for (var i = 0; i < 32; i++) {
+        if (dir == rootNorm ||
+            !(dir == rootNorm ||
+                p.isWithin(rootNorm, dir) ||
+                p.isWithin(dir, rootNorm))) {
+          break;
+        }
+        try {
+          if (FileSystemEntity.typeSync(dir, followLinks: false) ==
+              FileSystemEntityType.link) {
+            return true;
+          }
+        } catch (_) {
+          break;
+        }
+        final parent = p.dirname(dir);
+        if (parent == dir) break;
+        dir = parent;
+      }
+      return false;
+    } catch (_) {
+      return false;
+    }
+  }
+
   static String _realpathOr(String abs) {
     try {
       final type = FileSystemEntity.typeSync(abs, followLinks: false);
@@ -62,15 +103,24 @@ class WorkspaceFs {
     return abs;
   }
 
+  String resolveApprovedRead(String rawPath) {
+    final abs = p.normalize(
+      p.isAbsolute(rawPath) ? rawPath : p.join(rootPath, rawPath),
+    );
+    return _realpathOr(abs);
+  }
+
   String resolveInside(String rawPath) {
     final zone = zoneOf(rawPath);
     if (zone != FsZone.inside) {
       throw FsDeniedException(rawPath, zone);
     }
+    // 检查与使用同一路径：zoneOf 已做 realpath 校验，此处返回解析后路径，
+    // 此前返回未解析的 normalize 路径，校验与落盘分离有 TOCTOU 窗口。
     final abs = p.normalize(
       p.isAbsolute(rawPath) ? rawPath : p.join(rootPath, rawPath),
     );
-    return abs;
+    return _realpathOr(abs);
   }
 
   Future<String> readText(String rawPath) async {
@@ -79,42 +129,190 @@ class WorkspaceFs {
   }
 
   Future<void> writeText(String rawPath, String content) async {
+    // 内部直调入口同样复检链接：此前仅 resolveInside，无终点/父链复检，
+    // 直调悬空链可跟随到区外。调用方仍以 AgentTools 为主入口。
+    final zoneAbs = p.normalize(
+      p.isAbsolute(rawPath) ? rawPath : p.join(rootPath, rawPath),
+    );
+    if (WorkspaceFs.isWriteLink(zoneAbs, rootPath)) {
+      throw FsDeniedException(rawPath, FsZone.sensitive);
+    }
     final abs = resolveInside(rawPath);
+    final real = _realpathOr(abs);
+    final root = _realpathOr(p.normalize(rootPath));
+    if (real != root && !p.isWithin(root, real)) {
+      throw FsDeniedException(rawPath, FsZone.outside);
+    }
     final file = File(abs);
     await file.parent.create(recursive: true);
-    await file.writeAsString(content);
+    // 原子写：唯一 tmp+flush+rename，与编辑器/checkpoint 同口径，不留半写文件。
+    // 固定 `.tmp` 名此前并发两写同一文件会互盖侧车。
+    // nonce 用 Random.secure：micros+hashCode&0xffff 仅 16bit 且非稳定，
+    // 并发同微秒可同名互盖。
+    final nonce =
+        '${DateTime.now().microsecondsSinceEpoch}-${_random.nextInt(1 << 32).toRadixString(36)}';
+    final tmp = File('${file.path}.$nonce.tmp');
+    try {
+      await tmp.writeAsString(content, flush: true);
+      try {
+        await tmp.rename(file.path);
+      } catch (_) {
+        await file.writeAsString(content, flush: true);
+      }
+    } finally {
+      try {
+        if (await tmp.exists()) await tmp.delete();
+      } catch (_) {}
+    }
   }
 
+  static bool isSensitiveRelative(String rel) => _isSensitiveRel(rel);
+
   static bool _isSensitiveRel(String rel) {
-    final lower = rel.toLowerCase();
-    const sensitiveNames = ['.ssh', '.gnupg', '.aws', '.env'];
-    for (final name in sensitiveNames) {
-      if (lower == name || lower.startsWith('$name/')) return true;
+    final lower = rel.replaceAll('\\', '/').toLowerCase();
+    // IDE 自身状态库：版本/对话/记忆由面板管理，Agent 写入口永拒，
+    // 内部恢复/回收站仍走专用通道（不经 zoneOf），不受影响。
+    if (lower == '.my_ide' || lower.startsWith('.my_ide/')) {
+      if (lower.startsWith('.my_ide/trash/')) return false;
+      return true;
     }
-    // .env.* / *.pem / id_rsa* / .git/config 等密钥与仓库配置：一律敏感。
+    final segments = lower.split('/');
+    const sensitiveNames = [
+      '.ssh',
+      '.gnupg',
+      '.aws',
+      '.azure',
+      '.kube',
+      '.docker',
+      '.env',
+      '.npmrc',
+      '.pypirc',
+      '.netrc',
+    ];
+    // 任意层级出现敏感目录名即敏感：此前只判顶层，sub/.ssh/id_rsa 会漏检。
+    for (final seg in segments) {
+      if (sensitiveNames.contains(seg)) return true;
+    }
+    // .env.* / *.pem / id_rsa* / id_ed25519* / .git/config 等密钥与仓库配置：一律敏感。
     final base = lower.split('/').last;
     if (base == '.env' ||
         base.startsWith('.env.') ||
         base == 'id_rsa' ||
         base.startsWith('id_rsa.') ||
+        base.startsWith('id_ecdsa') ||
+        base.startsWith('id_dsa') ||
         base == 'id_ed25519' ||
         base.startsWith('id_ed25519.') ||
+        base == 'id_ed25519_sk' ||
+        base.startsWith('id_ed25519_sk.') ||
+        base == 'id_ecdsa_sk' ||
+        base.startsWith('id_ecdsa_sk.') ||
         base.endsWith('.pem') ||
         base.endsWith('.key') ||
-        base == 'credentials.json') {
+        base.endsWith('.jks') ||
+        base.endsWith('.keystore') ||
+        base.endsWith('.srl') ||
+        base.endsWith('.p12') ||
+        base.endsWith('.pfx') ||
+        base.endsWith('.crt') ||
+        base.endsWith('.cer') ||
+        base == 'credentials.json' ||
+        base == 'credentials.xml' ||
+        base == 'secrets.json' ||
+        base == 'secret.json' ||
+        base == 'token.json') {
       return true;
     }
-    if (lower == '.git/config' || lower.startsWith('.git/refs/')) {
+    if (lower == '.git/config' ||
+        lower.startsWith('.git/refs/') ||
+        lower == '.git/head' ||
+        lower.startsWith('.git/logs/') ||
+        lower == '.git/index' ||
+        lower == '.git/orig_head' ||
+        lower == '.git/fetch_head' ||
+        lower == '.gitattributes' ||
+        lower == '.gitignore') {
       return true;
     }
-    // git hooks / vscode tasks 等可执行配置：区内写出要审批
-    if (lower.startsWith('.git/hooks/')) return true;
-    if (lower == '.vscode/settings.json' ||
+    // git hooks / vscode tasks 等可执行配置：区内写出要审批。
+    // 任意层级嵌套仓库同样敏感：sub/.git/hooks 与顶层同口径。
+    if (lower.startsWith('.git/hooks/') ||
+        lower.contains('/.git/hooks/')) {
+      return true;
+    }
+    // 嵌套 .git 元文件同样敏感：此前仅判顶层，sub/.git/config 可直写。
+    for (final seg in segments) {
+      if (seg == '.git') return true;
+    }
+    // CI 工作流与编辑器扩展配置可执行：写入同样审批。
+    // 任意层级嵌套仓库同样敏感：sub/.github/workflows 与顶层同口径。
+    if (lower == '.github/workflows' ||
+        lower.startsWith('.github/workflows/') ||
+        lower.contains('/.github/workflows/')) {
+      return true;
+    }
+    if (lower.endsWith('/.vscode/extensions.json') ||
+        lower == '.vscode/extensions.json') {
+      return true;
+    }
+    if (lower.endsWith('/.vscode/settings.json') ||
+        lower == '.vscode/settings.json' ||
+        lower.endsWith('/.vscode/tasks.json') ||
         lower == '.vscode/tasks.json' ||
-        lower == '.vscode/launch.json') {
+        lower.endsWith('/.vscode/launch.json') ||
+        lower == '.vscode/launch.json' ||
+        lower.endsWith('/.vscode/mcp.json') ||
+        lower == '.vscode/mcp.json') {
+      return true;
+    }
+    // 密钥与凭据文件：.git-credentials / 通用密钥容器 / PGP 私钥。
+    if (base == '.git-credentials' ||
+        base.endsWith('.kdbx') ||
+        base.endsWith('.p8') ||
+        base.endsWith('.asc') ||
+        base.endsWith('.gpg')) {
+      return true;
+    }
+    // IDE 私有配置目录：.cursor / .idea。注意 .my_ide/trash/ 包裹路径
+    // 在 .my_ide 分支已提前 return，此处只判真实工作区路径，不递归 trash。
+    // 任意层级同样敏感：sub/.cursor/mcp.json 与顶层同口径。
+    if (lower == '.cursor' ||
+        lower.startsWith('.cursor/') ||
+        lower.contains('/.cursor/') ||
+        lower == '.idea' ||
+        lower.startsWith('.idea/') ||
+        lower.contains('/.idea/')) {
       return true;
     }
     return false;
+  }
+
+  /// 回收站条目名剥离 `<stamp>_<pid-rand>[_<n>]_<原名>` 后复检敏感：
+  /// trash 包裹不能成为敏感绕过通道。调用方在 trashRestore 时使用。
+  static bool isSensitiveTrashEntry(String entryName) {
+    final lower = entryName.replaceAll('\\', '/').toLowerCase();
+    final parts = lower.split('_');
+    // 前缀判别：第二段含 '-' 即新格式 `<stamp>_<pid-rand>`；
+    // 纯数字即旧碰撞计数 `_<n>`；否则第二段起即原名（原名可含下划线）。
+    String candidate;
+    if (parts.length <= 1) {
+      candidate = lower;
+    } else if (parts[1].contains('-')) {
+      // 新格式 `<stamp>_<pid-rand>[_<n>]_<原名>`。
+      if (parts.length >= 4 && RegExp(r'^\d+$').hasMatch(parts[2])) {
+        candidate = parts.sublist(3).join('_');
+      } else {
+        candidate = parts.sublist(2).join('_');
+      }
+    } else if (parts.length >= 3 && RegExp(r'^\d+$').hasMatch(parts[1])) {
+      // 旧格式 `<stamp>_<n>_<原名>`。
+      candidate = parts.sublist(2).join('_');
+    } else {
+      // 旧格式 `<stamp>_<原名>`。
+      candidate = parts.sublist(1).join('_');
+    }
+    if (candidate.isEmpty) return false;
+    return _isSensitiveRel(candidate);
   }
 }
 
@@ -181,6 +379,14 @@ class CommandPolicy {
   }
 
   static CommandVerdict judge(String command, {String? rootPath}) {
+    // 多行命令一律走审批：_normalize 会压缩换行，不能让 `echo ok\ntouch x`
+    // 这类换行拼接绕过直放检查。
+    if (command.contains('\n') || command.contains('\r')) {
+      if (_isDangerousTokens(_tokenize(_normalize(command)))) {
+        return CommandVerdict.deny;
+      }
+      return CommandVerdict.approve;
+    }
     final normalized = _normalize(command);
     if (normalized.isEmpty) return CommandVerdict.deny;
     if (_dangerousSubstrings.any(normalized.contains)) {
@@ -202,6 +408,9 @@ class CommandPolicy {
     String command, {
     required String rootPath,
   }) {
+    // 多行命令一律不直放：_normalize 会把换行压缩成空格，
+    // `echo ok\ntouch x` 会被洗成干净 argv 误放行。
+    if (command.contains('\n') || command.contains('\r')) return null;
     final argv = _parsePlainArgv(command);
     if (argv == null || argv.isEmpty) return null;
     final executable = argv.first.toLowerCase();
@@ -211,24 +420,278 @@ class CommandPolicy {
       return const SafeCommandInvocation('pwd', []);
     }
     if (executable == 'echo') {
+      // _parsePlainArgv 已拒绝裸元字符/未闭合引号/展开，
+      // 引号内剥离出的文本（如 "safe; literal"）按普通文本执行，无需二次检查。
       return SafeCommandInvocation('echo', args);
     }
     if (_isExactVersionCommand(executable, args)) {
       return SafeCommandInvocation(executable, args);
     }
-    if (executable == 'git' && _isSafeGitArgs(args, rootPath)) {
-      return SafeCommandInvocation('git', args);
+    // git stash 只读子命令：list/show（push/pop/apply/drop/clear 走审批）。
+    // 不经 _isSafeGitArgs（其 forbidden 含 push，会误伤 stash show 的路径参数）。
+    if (executable == 'git' && args.isNotEmpty && args.first == 'stash') {
+      if (args.length == 1) {
+        return SafeCommandInvocation(executable, args);
+      }
+      if (args[1] == 'list' || args[1] == 'show') {
+        for (final arg in args.skip(1)) {
+          if (arg.startsWith('-')) continue;
+          if (p.isAbsolute(arg)) return null;
+          if (WorkspaceFs(rootPath: rootPath).zoneOf(arg) != FsZone.inside) {
+            return null;
+          }
+        }
+        return SafeCommandInvocation(executable, args);
+      }
+      return null;
+    }
+    if (executable == 'git' &&
+        (_isSafeGitArgs(args, rootPath) ||
+            _isSafeUtilityCommand(executable, args, rootPath))) {
+      return SafeCommandInvocation(executable, args);
     }
     if ((executable == 'dart' || executable == 'flutter') &&
         args.length == 1 &&
         args.first == 'analyze') {
       return SafeCommandInvocation(executable, args);
     }
+    // flutter/dart 只读子命令：test/build/lint/analyze 等本地常用命令。
+    // 社区 allowlist 高频项；install/pub get/deploy/run 等写/网操作走审批。
+    if (_isSafeFlutterDartArgs(executable, args, rootPath)) {
+      return SafeCommandInvocation(executable, args);
+    }
     if (const {'ls', 'cat', 'head', 'tail', 'wc'}.contains(executable) &&
         _hasOnlyWorkspacePaths(executable, args, rootPath)) {
       return SafeCommandInvocation(executable, args);
     }
+    // 开源对齐的合法命令集：Claude Code 内置只读集 + 社区 allowlist 交集
+    // （gh 读、find/grep/tree/less/file/which/diff/sort、tsc/eslint 等）。
+    // 仍要求：单行纯 argv、无展开/复合/重定向、仅区内路径。
+    if (_isSafeUtilityCommand(executable, args, rootPath)) {
+      return SafeCommandInvocation(executable, args);
+    }
     return null;
+  }
+
+  /// 开源社区广泛允许的合法命令（Claude Code / Cline / Roo 口径交集）。
+  /// 子命令白名单精确到动词：git 读写（push/commit/merge/rebase/reset…）、
+  /// npm install/publish、docker build/push 一律不在此列，继续走审批。
+  /// 所有含路径的参数必须落在工作区内，flags 只放行读型开关。
+  static bool _isSafeUtilityCommand(
+    String executable,
+    List<String> args,
+    String rootPath,
+  ) {
+    // 纯文本/文件查看类：无 flag 即只读，flag 只放行读型开关。
+    // awk/sed 不收录（易写盘），走审批。
+    const textUtils = {
+      'less',
+      'more',
+      'grep',
+      'rg',
+      'find',
+      'tree',
+      'file',
+      'which',
+      'where',
+      'diff',
+      'comm',
+      'sort',
+      'uniq',
+      'cut',
+      'tr',
+      'stat',
+      'du',
+      'df',
+      'ps',
+      'pgrep',
+    };
+    if (textUtils.contains(executable)) {
+      return _hasOnlyWorkspacePaths(executable, args, rootPath);
+    }
+    // 目录/环境查看：mkdir 只放行 -p（社区 allowlist 口径），其余走审批。
+    if (executable == 'mkdir') {
+      if (args.isEmpty) return false;
+      var seenP = false;
+      for (final arg in args) {
+        if (arg == '-p' || arg == '--parents') {
+          if (seenP) return false;
+          seenP = true;
+          continue;
+        }
+        if (arg.startsWith('-')) return false;
+        if (WorkspaceFs(rootPath: rootPath).zoneOf(arg) != FsZone.inside) {
+          return false;
+        }
+      }
+      return seenP;
+    }
+    if (executable == 'dirname' ||
+        executable == 'basename' ||
+        executable == 'realpath' ||
+        executable == 'readlink') {
+      if (args.isEmpty) return false;
+      return _hasOnlyWorkspacePaths('cat', args, rootPath);
+    }
+    // git 只读动词：show/blame/fetch/reflog/rev-list/ls-tree 等纯读；
+    // branch/tag/remote/stash 需动词级二次判定（创建/删除是写操作）。
+    if (executable == 'git') {
+      if (args.isEmpty) return false;
+      const safeVerbs = {
+        'show',
+        'blame',
+        'fetch',
+        'reflog',
+        'rev-list',
+        'rev-parse',
+        'ls-tree',
+        'ls-remote',
+        'check-ignore',
+        'ls-files',
+        'symbolic-ref',
+        'status',
+        'diff',
+        'log',
+      };
+      if (safeVerbs.contains(args.first)) {
+        return _isSafeGitArgs(args, rootPath);
+      }
+      const guardedVerbs = {'branch', 'tag', 'remote', 'stash'};
+      if (guardedVerbs.contains(args.first)) {
+        if (!_isReadOnlyBranchTagRemote(
+            args.first, args.skip(1).toList())) {
+          return false;
+        }
+        return _isSafeGitArgs(args, rootPath);
+      }
+      return false;
+    }
+    // gh 只读动词：issue/pr/repo/run/release view 系 + search helps。
+    if (executable == 'gh') {
+      if (args.length < 2) return false;
+      const groups = {'issue', 'pr', 'repo', 'run', 'release', 'search', 'help'};
+      const readVerbs = {
+        'view',
+        'list',
+        'status',
+        'checks',
+        'diff',
+        'search',
+        'help',
+      };
+      if (!groups.contains(args[0])) return false;
+      if (!readVerbs.contains(args[1])) return false;
+      // gh 读命令不接受本地路径：只放行 -/-- 开关与纯标识符。
+      for (final arg in args.skip(2)) {
+        if (arg.startsWith('-')) continue;
+        if (!RegExp(r'^[A-Za-z0-9_.\-/#:]+$').hasMatch(arg)) return false;
+      }
+      return true;
+    }
+    // 类型检查/lint/格式化：tsc、eslint、prettier、shellcheck、ruff。
+    // dart 另有 _isSafeFlutterDartArgs 动词白名单，此处不再整包放行
+    // （否则 `dart run` 被当路径参数放过）。
+    if (executable == 'tsc' ||
+        executable == 'eslint' ||
+        executable == 'prettier' ||
+        executable == 'shellcheck' ||
+        executable == 'ruff') {
+      // 写型开关同样走审批：prettier --write / eslint --fix 可静默改盘，
+      // 此前 `-` 开头一律放行，绕过写文件审批/乐观锁。
+      const writeFlags = {
+        '--write',
+        '--fix',
+        '--fix-dry-run',
+        '--write-dry-run',
+        '-w',
+      };
+      for (final arg in args) {
+        if (writeFlags.contains(arg.split('=').first)) return false;
+        if (arg.startsWith('-')) continue;
+        if (WorkspaceFs(rootPath: rootPath).zoneOf(arg) != FsZone.inside) {
+          return false;
+        }
+      }
+      return true;
+    }
+    // 包管理器只读查询：npm/pnpm view|list、npx eslint。
+    if (executable == 'npm' || executable == 'pnpm') {
+      if (args.isEmpty) return false;
+      if (args.first == 'view' || args.first == 'list') return true;
+      return false;
+    }
+    if (executable == 'npx' && args.isNotEmpty && args.first == 'eslint') {
+      return true;
+    }
+    // docker compose 只看不改：ps/logs（up/down/restart/build/push 走审批）。
+    if (executable == 'docker') {
+      if (args.length >= 2 && args[0] == 'compose') {
+        if (args[1] == 'ps' || args[1] == 'logs') return true;
+      }
+      return false;
+    }
+    return false;
+  }
+
+  /// flutter/dart 本地只读子命令：test/build/lint/analyze 等社区高频项。
+  /// pub/run/deploy 等写/网/执行操作不在此列，继续走审批。
+  /// `dart run` 易被误判为普通路径参数：在此显式拒绝，不进路径判定。
+  static bool _isSafeFlutterDartArgs(
+    String executable,
+    List<String> args,
+    String rootPath,
+  ) {
+    if (executable != 'flutter' && executable != 'dart') return false;
+    if (args.isEmpty) return false;
+    const safeVerbs = {'test', 'analyze', 'lint', 'build', 'assemble'};
+    if (!safeVerbs.contains(args.first)) return false;
+    for (final arg in args.skip(1)) {
+      // --no-pub 等纯开关放行；含路径的参数必须在区内。
+      if (arg.startsWith('-')) continue;
+      if (WorkspaceFs(rootPath: rootPath).zoneOf(arg) != FsZone.inside) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /// git 读写混合动词的读型判定：branch/tag 无写 flags 才放行；
+  /// remote/stash 只放行读型子命令。写型一律走审批。
+  static bool _isReadOnlyBranchTagRemote(String verb, List<String> rest) {
+    const writeFlags = {
+      '-d',
+      '-D',
+      '-m',
+      '-M',
+      '-c',
+      '-C',
+      '--delete',
+      '--remove',
+      '--add',
+      '--rename',
+    };
+    if (verb == 'branch' || verb == 'tag') {
+      // 无参数列分支才只读：`git branch new-name` 是创建分支，走审批。
+      if (rest.isEmpty) return true;
+      for (final arg in rest) {
+        if (writeFlags.contains(arg)) return false;
+        if (arg.startsWith('-')) continue;
+        // 位置参数（分支名）出现即视为创建/指向操作，不自动放行。
+        return false;
+      }
+      return true;
+    }
+    if (verb == 'remote') {
+      if (rest.isEmpty) return true;
+      const readSubs = {'get-url', '-v', '--verbose', 'show'};
+      return readSubs.contains(rest.first);
+    }
+    if (verb == 'stash') {
+      if (rest.isEmpty) return true;
+      const readSubs = {'list', 'show'};
+      return readSubs.contains(rest.first);
+    }
+    return false;
   }
 
   static bool _isExactVersionCommand(String executable, List<String> args) {
@@ -245,7 +708,29 @@ class CommandPolicy {
   }
 
   static bool _isSafeGitArgs(List<String> args, String rootPath) {
-    if (args.isEmpty || !const {'status', 'diff', 'log'}.contains(args.first)) {
+    if (args.isEmpty) return false;
+    // 只读动词白名单：社区 allowlist 交集（status/diff/log + show/blame/
+    // branch/remote/tag/fetch/reflog/rev-list/ls-tree/ls-remote/…）。
+    // push/commit/merge/rebase/reset/checkout/add 等写操作一律不在此列。
+    if (!const {
+      'status',
+      'diff',
+      'log',
+      'show',
+      'blame',
+      'branch',
+      'remote',
+      'tag',
+      'fetch',
+      'reflog',
+      'rev-list',
+      'rev-parse',
+      'ls-tree',
+      'ls-remote',
+      'check-ignore',
+      'ls-files',
+      'symbolic-ref',
+    }.contains(args.first)) {
       return false;
     }
     const forbidden = {
@@ -259,6 +744,17 @@ class CommandPolicy {
       '--paginate',
       '-p',
       '--no-index',
+      // 命令执行类开关：--upload-pack/--receive-pack 可在远端/本地执行任意命令，
+      // 必须走审批（git fetch --upload-pack=<cmd> 即本地命令执行）。
+      '--upload-pack',
+      '--receive-pack',
+      // remote/stash 子命令级拦截：add/remove/push 等写操作不放行。
+      'add',
+      'remove',
+      'rename',
+      'push',
+      'set-url',
+      'set-branches',
     };
     var pathsOnly = false;
     for (final arg in args.skip(1)) {
@@ -270,11 +766,23 @@ class CommandPolicy {
         pathsOnly = true;
         continue;
       }
-      if (pathsOnly &&
-          WorkspaceFs(rootPath: rootPath).zoneOf(arg) != FsZone.inside) {
+      if (pathsOnly) {
+        if (WorkspaceFs(rootPath: rootPath).zoneOf(arg) != FsZone.inside) {
+          return false;
+        }
+        continue;
+      }
+      // B7：无 -- 时同样拦相对 ../ 越界，不只拦绝对路径。
+      if (p.isAbsolute(arg)) return false;
+      // git branch/tag 的位置参数即创建分支：不在此放行，走审批。
+      if ((args.first == 'branch' || args.first == 'tag') &&
+          !arg.startsWith('-')) {
         return false;
       }
-      if (!pathsOnly && p.isAbsolute(arg)) return false;
+      if (arg.startsWith('-')) continue;
+      if (WorkspaceFs(rootPath: rootPath).zoneOf(arg) != FsZone.inside) {
+        return false;
+      }
     }
     return true;
   }
@@ -316,6 +824,21 @@ class CommandPolicy {
       'head' ||
       'tail' => RegExp(r'^-(?:[qv]+|[nc]\d+[kKmMbB]?)$').hasMatch(arg),
       'wc' => RegExp(r'^-(?:[clmwL]+)$').hasMatch(arg),
+      // 社区 allowlist 文本工具：读型开关放行，写型（-i/-o/-w/-e 等）拒绝。
+      'grep' || 'rg' => RegExp(r'^-(?:[invrclEFPRwqHhov]+)$').hasMatch(arg),
+      'find' => RegExp(
+        r'^-(?:name|iname|type|maxdepth|mindepth|print|print0|not|and|or)$',
+      ).hasMatch(arg),
+      'tree' => RegExp(r'^-(?:[aCdDfhilLoppstu]+)$').hasMatch(arg),
+      'diff' => RegExp(r'^-(?:[qsubBNUr]+|unified.*)$').hasMatch(arg),
+      'less' || 'more' => RegExp(r'^-(?:[NSRXFK]+)$').hasMatch(arg),
+      'file' => RegExp(r'^-(?:[bziL]+)$').hasMatch(arg),
+      'stat' => RegExp(r'^-(?:[cLt]+)$').hasMatch(arg),
+      'du' => RegExp(r'^-(?:[shcm]+)$').hasMatch(arg),
+      'ps' => RegExp(r'^-(?:[auxefj]+)$').hasMatch(arg),
+      'sort' || 'uniq' || 'cut' || 'tr' || 'comm' || 'pgrep' => false,
+      // awk/sed 太易写盘：社区仅个别 allowlist 收录，此处不自动放行，走审批。
+      'df' => RegExp(r'^-(?:[hHTk]+)$').hasMatch(arg),
       _ => false,
     };
   }
@@ -449,6 +972,25 @@ class CommandPolicy {
   /// - curl/wget 管道进 shell（`curl … | sh`）
   /// - 重定向覆盖系统/设备路径（`> /dev/*`、`> /etc/*`、`2>/dev/*`）
   static bool _isDangerousTokens(List<String> tokens) {
+    // 链式命令逐段判定：此前只看首命令，`echo ok; rm -rf ~` 首段无害
+    // 即整体放过，恶意段藏在 `;`/`&&`/`||`/`|` 后静默执行。
+    // 按段切分后任一段危险即整体拒绝。
+    final segments = <List<String>>[[]];
+    for (final t in tokens) {
+      if (t == ';' || t == '&' || t == '|' || t == '`') {
+        segments.add([]);
+        continue;
+      }
+      segments.last.add(t);
+    }
+    for (final seg in segments) {
+      if (seg.isEmpty) continue;
+      if (_isDangerousSegment(seg)) return true;
+    }
+    return false;
+  }
+
+  static bool _isDangerousSegment(List<String> tokens) {
     final first = tokens.firstWhere(
       (t) => t != ';' && t != '&' && t != '|' && t != '`',
       orElse: () => '',
@@ -502,8 +1044,10 @@ class CommandPolicy {
             joined.contains(' rd '))) {
       return true;
     }
-    // chown 递归系统路径
-    if (first == 'chown' && has('-r') && hasPrefix('/')) return true;
+    // chown 递归系统路径：flag 归一化大小写，`chown -R /` 同样拒绝。
+    final lowerTokens = tokens.map((t) => t.toLowerCase()).toList();
+    bool hasLower(String flag) => lowerTokens.any((t) => t == flag);
+    if (first == 'chown' && hasLower('-r') && hasPrefix('/')) return true;
     // curl/wget 管道进 shell：不再一刀切拒绝正常下载，仅拒 `| sh/bash`。
     if ((first == 'curl' || first == 'wget') &&
         (joined.contains('| sh') ||
@@ -518,6 +1062,78 @@ class CommandPolicy {
       return true;
     }
     return false;
+  }
+
+  /// 沙箱模式判定：仅 local/docker 两种取值，其它回退 local。
+  /// prefs agentSandboxMode == 'docker' 时 run_command 走 docker 包裹执行。
+  static bool sandboxMode(String? raw) =>
+      (raw ?? '').trim().toLowerCase() == 'docker';
+
+  /// docker 包裹：在只读 ubuntu 容器内执行 [command]，工作区挂到 /work。
+  /// 高危命令不包裹——调用方必须先走 judge 拒绝。
+  /// 用户映射：优先 DOCKER_UID/GID 环境变量，否则去掉硬编码，
+  /// 用当前进程 uid/gid（Platform 无 uid 时回退 1000）；
+  /// /tmp 用 tmpfs，避免只读根下写临时文件失败。
+  static int? _processUid() {
+    if (Platform.isWindows) return null;
+    try {
+      final r = Process.runSync('id', ['-u']);
+      if (r.exitCode == 0) return int.tryParse('${r.stdout}'.trim());
+    } catch (_) {}
+    return null;
+  }
+
+  static int? _processGid() {
+    if (Platform.isWindows) return null;
+    try {
+      final r = Process.runSync('id', ['-g']);
+      if (r.exitCode == 0) return int.tryParse('${r.stdout}'.trim());
+    } catch (_) {}
+    return null;
+  }
+
+  static List<String> dockerWrap(String command, String root, {int? uid, int? gid}) {
+    final mountRoot = p.normalize(p.absolute(root));
+    if (mountRoot.contains('\u0000') ||
+        mountRoot.contains(',') ||
+        mountRoot.contains('\n') ||
+        mountRoot.contains('\r')) {
+      throw ArgumentError('Docker 工作区路径包含非法字符');
+    }
+    const fallbackUid = '1000';
+    const fallbackGid = '1000';
+    final resolvedUid = '${uid ?? int.tryParse(Platform.environment['DOCKER_UID'] ?? '') ?? _processUid() ?? fallbackUid}';
+    final resolvedGid = '${gid ?? int.tryParse(Platform.environment['DOCKER_GID'] ?? '') ?? _processGid() ?? fallbackGid}';
+    return [
+      'docker',
+      'run',
+      '--rm',
+      '--network',
+      'none',
+      '--read-only',
+      '--pids-limit',
+      '256',
+      '--memory',
+      '512m',
+      '--cpus',
+      '1.0',
+      '--cap-drop',
+      'ALL',
+      '--security-opt',
+      'no-new-privileges:true',
+      '--user',
+      '$resolvedUid:$resolvedGid',
+      '--tmpfs',
+      '/tmp:rw,noexec,nosuid,size=128m',
+      '--mount',
+      'type=bind,source=$mountRoot,target=/work,readonly=false',
+      '-w',
+      '/work',
+      'ubuntu',
+      'bash',
+      '-c',
+      command,
+    ];
   }
 
   /// 归一化：去首尾空格、转小写、压缩空白、剥掉 sudo / sh -c 包装，

@@ -164,7 +164,13 @@ open(sys.argv[1], "wb").write(bytes(data))
       }
     }
     final f = File(out);
-    if (!await f.exists()) return null;
+    if (!await f.exists()) {
+      // 文件未生成也要清临时目录，此前直接 return 导致 /tmp 残留。
+      try {
+        await tmp.delete(recursive: true);
+      } catch (_) {}
+      return null;
+    }
     final bytes = await f.readAsBytes();
     try {
       await tmp.delete(recursive: true);

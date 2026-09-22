@@ -17,8 +17,11 @@ class MainFlutterWindowController: NSWindowController {
       backing: .buffered,
       defer: false
     )
-    // Dock/窗口菜单可切换的关键：正常释放 + 可成为 key + 参与窗口层级。
-    window.isReleasedWhenClosed = false
+    // Dock/窗口菜单可切换的关键：可成为 key + 参与窗口层级。
+    // isReleasedWhenClosed=true：关闭真正释放，否则 NSApp.windows 残留，
+    // applicationShouldTerminateAfterLastWindowClosed 永不触发（见 AppDelegate）。
+    // Controller 从 windowControllers 数组移除即释放引用，无野指针风险。
+    window.isReleasedWhenClosed = true
     window.canBecomeVisibleWithoutLogin = false
     window.collectionBehavior = [.managed, .participatesInCycle, .fullScreenPrimary]
     window.title = "my_ide"

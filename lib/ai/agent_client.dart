@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:http/http.dart' as http;
 
@@ -51,6 +52,8 @@ class AgentClient {
 
   /// 中断当前流式请求：关闭底层连接，在用流会立即报错结束，
   /// Runner 捕获后按“用户已中断”收尾，不再空转浪费 token。
+  /// 中断标记由下一轮 _sendWithRetry 成功时自动清除：此前 _aborted 只在
+  /// 2xx 成功时清零，中断一次后若无新请求则后续永远抛 StateError 卡死。
   void abort() {
     _aborted = true;
     try {
@@ -59,11 +62,57 @@ class AgentClient {
     _http = http.Client();
   }
 
+  /// 新一轮开始前调用：上一轮 abort 后若尚未成功请求，允许重建连接，
+  /// 避免“中断一次就永久 StateError”。运行时机由 Runner.run 入口调用。
+  void resetAbort() {
+    _aborted = false;
+  }
+
   /// 非 2xx 时的额外重试次数（不含首次）。默认 5；0 表示不重试。
   int maxRetries;
 
   /// 对齐 Continue：相对 apiBase 拼对话端点。
   String chatUrl(AiProviderConfig provider) => provider.chatUrl;
+
+  /// 模型自定义参数合并进 body：key/value 均非空才生效；
+  /// 结构字段（model/messages/input/tools 等）不允许覆盖，避免破坏协议。
+  static const _customParamBlocked = <String>{
+    'model',
+    'messages',
+    'input',
+    'tools',
+    'tool_choice',
+    'stream',
+    'stream_options',
+    'system',
+    'max_tokens',
+    'previous_response_id',
+  };
+
+  static void applyCustomParams(
+    Map<String, dynamic> body,
+    AiModelOption model,
+  ) {
+    for (final entry in model.customParams.entries) {
+      final k = entry.key.trim();
+      if (k.isEmpty || _customParamBlocked.contains(k)) continue;
+      final v = entry.value.trim();
+      if (v.isEmpty) continue;
+      // 纯数字/布尔按 JSON 原类型透传，其余按字符串。
+      final lower = v.toLowerCase();
+      if (lower == 'true') {
+        body[k] = true;
+      } else if (lower == 'false') {
+        body[k] = false;
+      } else if (int.tryParse(v) != null) {
+        body[k] = int.parse(v);
+      } else if (double.tryParse(v) != null) {
+        body[k] = double.parse(v);
+      } else {
+        body[k] = entry.value;
+      }
+    }
+  }
 
   /// OpenAI reasoning_effort 白名单：仅 low/medium/high 透传，其它映射 medium 防 400。
   static String? openAiEffort(AiModelOption model) {
@@ -78,6 +127,32 @@ class AgentClient {
       default:
         return 'medium';
     }
+  }
+
+  /// 指数退避延迟：400ms 起步、上限 5s，带 ±25% jitter 避免雪崩；
+  /// 429/503 优先读 Retry-After（秒/HTTP 日期），读到即用。
+  static final _random = Random.secure();
+
+  Future<void> _backoffDelay(int attempt, {http.BaseResponse? response}) async {
+    var ms = (400 * (1 << attempt)).clamp(400, 5000);
+    try {
+      final raw = response?.headers['retry-after']?.trim();
+      if (raw != null && raw.isNotEmpty) {
+        final secs = int.tryParse(raw);
+        if (secs != null && secs >= 0) {
+          ms = (secs * 1000).clamp(0, 30000);
+        } else {
+          final date = DateTime.tryParse(raw);
+          if (date != null) {
+            ms = date.difference(DateTime.now()).inMilliseconds.clamp(0, 30000);
+          }
+        }
+      }
+    } catch (_) {}
+    final jitter = (ms * 0.25).round();
+    final delayed =
+        ms - jitter + (jitter > 0 ? _random.nextInt(jitter * 2 + 1) : 0);
+    await Future<void>.delayed(Duration(milliseconds: delayed.clamp(0, 30000)));
   }
 
   /// 发送流式请求：仅 429/5xx/网络错重试+指数退避，401/400 直接抛；
@@ -110,17 +185,12 @@ class AgentClient {
           break;
         }
         if (attempt >= rounds) break;
-        // 429/5xx 指数退避：400ms 起步，上限 5s。
-        final backoff =
-            Duration(milliseconds: (400 * (1 << attempt)).clamp(400, 5000));
-        await Future<void>.delayed(backoff);
+        await _backoffDelay(attempt, response: response);
       } catch (e) {
         if (_aborted || e is StateError) rethrow;
         lastError = e;
         if (attempt >= rounds) break;
-        final backoff =
-            Duration(milliseconds: (400 * (1 << attempt)).clamp(400, 5000));
-        await Future<void>.delayed(backoff);
+        await _backoffDelay(attempt);
       }
     }
     throw lastError ?? Exception('HTTP 请求失败');
@@ -206,6 +276,7 @@ class AgentClient {
     if (effort != null) {
       body['reasoning_effort'] = effort;
     }
+    AgentClient.applyCustomParams(body, model);
 
     final request = http.Request('POST', url);
     request.headers['Content-Type'] = 'application/json';
@@ -340,6 +411,7 @@ class AgentClient {
     if (provider.responsesBackground) {
       body['background'] = true;
     }
+    AgentClient.applyCustomParams(body, model);
 
     final request = http.Request('POST', url);
     request.headers['Content-Type'] = 'application/json';
@@ -539,6 +611,8 @@ class AgentClient {
         body['max_tokens'] = maxTokens;
       }
     }
+    // max_tokens 由上下文长度推导，自定义参数不覆盖结构字段。
+    AgentClient.applyCustomParams(body, model);
 
     final url = Uri.parse(provider.messagesUrl);
     final request = http.Request('POST', url);
@@ -976,13 +1050,9 @@ class AgentClient {
             },
           });
         } else if (url.startsWith('http://') || url.startsWith('https://')) {
-          blocks.add({
-            'type': 'image',
-            'source': {
-              'type': 'url',
-              'url': url,
-            },
-          });
+          // Anthropic 只接受 base64 source，不支持 url source：
+          // http(s) 图片降级为文本占位，避免整轮 400。
+          blocks.add({'type': 'text', 'text': '[图片：$url]'});
         }
       } else if (type == 'image') {
         blocks.add(Map<String, dynamic>.from(part));
@@ -1043,7 +1113,12 @@ class AgentClient {
       if (v is Map<String, dynamic>) return v;
       if (v is Map) return Map<String, dynamic>.from(v);
     } catch (_) {}
-    return <String, dynamic>{};
+    // 空参打标：截断/半包 JSON 不再静默变 {}，调用方靠该标记识别
+    // “幻觉 tool→空参→报错回填→再幻觉”循环，熔断更快停。
+    if (raw.trim().isEmpty || raw.trim() == '{}') {
+      return <String, dynamic>{};
+    }
+    return <String, dynamic>{'_parseError': '参数 JSON 解析失败，已按空参处理', '_rawLength': raw.length};
   }
 
   void dispose() {

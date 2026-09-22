@@ -23,6 +23,9 @@ Future<void> main(List<String> args) async {
       const String.fromEnvironment('MY_IDE_OPEN', defaultValue: '');
   InitialOpenPath.value =
       argOpen ?? (envOpen.isEmpty ? null : envOpen);
+  // 取消默认打开最近目录：启动一律空白，由用户手动打开项目或点最近列表。
+  // 原先无显式路径时自动恢复 recent.first，會让关闭窗口后重启又“复活”，
+  // 且 macOS 关最后一个窗口即退出、重开仍直达旧项目，不符合预期。
   // 后台加载 MCP 配置并尝试连接已启用服务器
   // ignore: unawaited_futures
   McpManager.instance.ensureLoaded();

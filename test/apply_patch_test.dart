@@ -36,6 +36,52 @@ void main() {
     expect(await File(p.join(workspace.path, 'b.txt')).exists(), isFalse);
   });
 
+  test('S8: delete 失败回滚可恢复原文件', () async {
+    final blocker = File(p.join(workspace.path, 'c.txt'));
+    await blocker.create(recursive: true);
+    await blocker.writeAsString('not-a-dir');
+
+    final result = await tools.execute('apply_patch', {
+      'patches': [
+        {'path': 'b.txt', 'delete': true},
+        {'path': 'c.txt/nested.txt', 'create': true, 'newText': 'nested'},
+      ],
+    });
+    expect(result.ok, isFalse);
+    // 修复后：delete 有内存备份，回滚可恢复，不再永久丢失。
+    expect(await File(p.join(workspace.path, 'b.txt')).readAsString(), 'bbb');
+  });
+
+  test('S8: edit 回滚整文件精确恢复，不受片段残留影响', () async {
+    await File(p.join(workspace.path, 'a.txt')).writeAsString('foo bar foo');
+    final blocker = File(p.join(workspace.path, 'c.txt'));
+    await blocker.writeAsString('not-a-dir');
+
+    final result = await tools.execute('apply_patch', {
+      'patches': [
+        {'path': 'a.txt', 'oldText': 'foo', 'newText': 'BAZ'},
+        {'path': 'c.txt/nested.txt', 'create': true, 'newText': 'nested'},
+      ],
+    });
+    expect(result.ok, isFalse);
+    // 原内容含残留片段时反向 replaceFirst 会错位；整文件备份恢复是精确的。
+    expect(
+      await File(p.join(workspace.path, 'a.txt')).readAsString(),
+      'foo bar foo',
+    );
+  });
+
+  test('空白 oldText 直接拒绝，不误匹配文件头插入', () async {
+    final result = await tools.execute('apply_patch', {
+      'patches': [
+        {'path': 'a.txt', 'oldText': '   ', 'newText': 'INJECTED'},
+      ],
+    });
+    expect(result.ok, isFalse);
+    expect(result.output, contains('oldText'));
+    expect(await File(p.join(workspace.path, 'a.txt')).readAsString(), 'aaa');
+  });
+
   test('后续文件失败时全部回滚到补丁前状态', () async {
     final blocker = File(p.join(workspace.path, 'c.txt'));
     await blocker.create(recursive: true);

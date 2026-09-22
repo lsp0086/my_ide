@@ -15,6 +15,7 @@ class LanguageServerSpec {
     required this.args,
     required this.installHint,
     this.autoInstall = false,
+    this.enabledByDefault = true,
   });
 
   final String id;
@@ -25,6 +26,44 @@ class LanguageServerSpec {
   final List<String> args;
   final String installHint;
   final bool autoInstall;
+  /// 默认是否启用；java/kotlin/swift 占位默认关闭。
+  final bool enabledByDefault;
+
+  /// R10：用户自定义服务器（无自动安装/下载，一律走 PATH 或绝对路径 command）。
+  factory LanguageServerSpec.custom(Map<String, dynamic> j) {
+    final exts = ((j['extensions'] as List?) ?? [])
+        .map((e) => '$e'.trim().toLowerCase())
+        .where((e) => e.isNotEmpty)
+        .map((e) => e.startsWith('.') ? e : '.$e')
+        .toList();
+    final args = ((j['args'] as List?) ?? []).map((e) => '$e').toList();
+    final id = '${j['id'] ?? ''}'.trim();
+    return LanguageServerSpec(
+      id: id,
+      label: '${j['label'] ?? id}',
+      languageIds: const [],
+      extensions: exts,
+      command: '${j['command'] ?? ''}'.trim(),
+      args: args,
+      installHint: '用户自定义（PATH 或绝对路径）',
+    );
+  }
+}
+
+/// R10：内置 + 用户自定义的全部 spec。自定义 id 不得覆盖内置 id。
+List<LanguageServerSpec> allLanguageServerSpecs() {
+  final customs = SettingsStore.instance.customLanguageServers
+      .map((j) {
+        try {
+          return LanguageServerSpec.custom(j);
+        } catch (_) {
+          return null;
+        }
+      })
+      .whereType<LanguageServerSpec>()
+      .where((s) => !kLanguageServerSpecs.any((k) => k.id == s.id))
+      .toList();
+  return [...kLanguageServerSpecs, ...customs];
 }
 
 const kLanguageServerSpecs = [
@@ -98,6 +137,36 @@ const kLanguageServerSpecs = [
     installHint: '复用 TypeScript 语言包；首次打开时询问下载',
     autoInstall: true,
   ),
+  LanguageServerSpec(
+    id: 'jdtls',
+    label: 'JDT LS (Java，本地命令)',
+    languageIds: ['java'],
+    extensions: ['.java'],
+    command: 'jdtls',
+    args: [],
+    installHint: '需本地安装 Eclipse JDT Language Server，暂不支持应用目录自动下发',
+    enabledByDefault: false,
+  ),
+  LanguageServerSpec(
+    id: 'kotlin-ls',
+    label: 'Kotlin LS（本地命令）',
+    languageIds: ['kotlin'],
+    extensions: ['.kt', '.kts'],
+    command: 'kotlin-language-server',
+    args: [],
+    installHint: '需本地安装 kotlin-language-server，暂不支持应用目录自动下发',
+    enabledByDefault: false,
+  ),
+  LanguageServerSpec(
+    id: 'sourcekit-lsp',
+    label: 'SourceKit-LSP (Swift，本地命令）',
+    languageIds: ['swift'],
+    extensions: ['.swift'],
+    command: 'sourcekit-lsp',
+    args: [],
+    installHint: '需本地安装 SourceKit-LSP（Xcode 自带），暂不支持应用目录自动下发',
+    enabledByDefault: false,
+  ),
 ];
 
 class DefinitionService {
@@ -112,7 +181,7 @@ class DefinitionService {
 
   LanguageServerSpec? specForExtension(String ext) {
     final lower = ext.toLowerCase();
-    for (final spec in kLanguageServerSpecs) {
+    for (final spec in allLanguageServerSpecs()) {
       if (spec.extensions.contains(lower)) return spec;
     }
     return null;
@@ -263,16 +332,22 @@ class DefinitionService {
       return existing;
     }
     // 超时淘汰：长久不用的旧 client 主动 stop 释放内存。
+    // removeWhere 回调内不能 await，改为先收集 key 再串行 stop，
+    // 此前 c?.stop() 不 await 直接丢弃，进程残留。
     final now = DateTime.now();
+    final evictKeys = <String>[];
     _lastUsed.removeWhere((k, at) {
       final evict = at.add(_ttl).isBefore(now) ||
-          (_clients.length >= _maxClients && k != key);
-      if (evict) {
-        final c = _clients.remove(k);
-        c?.stop();
-      }
+          (_clients.length - evictKeys.length >= _maxClients && k != key);
+      if (evict) evictKeys.add(k);
       return evict;
     });
+    for (final k in evictKeys) {
+      final c = _clients.remove(k);
+      try {
+        await c?.stop();
+      } catch (_) {}
+    }
     _lastUsed[key] = now;
 
     Map<String, dynamic>? initOptions;
@@ -318,6 +393,21 @@ class DefinitionService {
   }
 
   void invalidateAvailabilityCache() => _availabilityCache.clear();
+
+  /// 停掉指定 root 下的旧 server：切项目时调用，避免旧 rootUri 常驻多 server 并存。
+  /// key 格式 `${spec.id}::$command::$rootPath`，按后缀匹配。
+  Future<void> disposeForRoot(String rootPath) async {
+    final keys = _clients.keys
+        .where((k) => k.endsWith('::$rootPath'))
+        .toList();
+    for (final k in keys) {
+      final c = _clients.remove(k);
+      _lastUsed.remove(k);
+      try {
+        await c?.stop();
+      } catch (_) {}
+    }
+  }
 
   Future<void> disposeAll() async {
     for (final c in _clients.values) {

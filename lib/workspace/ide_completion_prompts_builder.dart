@@ -10,6 +10,7 @@ class IdeCompletionPromptsBuilder implements CodeAutocompletePromptsBuilder {
     required this.languageId,
     required Mode? languageMode,
     required CodeLineEditingController controller,
+    this.lspPrompts = const [],
   })  : _controller = controller,
         _delegate = DefaultCodeAutocompletePromptsBuilder(
           language: languageMode,
@@ -18,6 +19,7 @@ class IdeCompletionPromptsBuilder implements CodeAutocompletePromptsBuilder {
         );
 
   final String languageId;
+  final List<CodePrompt> lspPrompts;
   final CodeLineEditingController _controller;
   final CodeAutocompletePromptsBuilder _delegate;
 
@@ -46,15 +48,17 @@ class IdeCompletionPromptsBuilder implements CodeAutocompletePromptsBuilder {
     if (symbolHits.isEmpty) return base;
 
     if (base == null) {
+      final lspHits = lspPrompts.where((p) => p.match(input)).toList();
       return CodeAutocompleteEditingValue(
         input: input,
-        prompts: symbolHits,
+        prompts: [...lspHits, ...symbolHits.where((p) => !lspHits.any((l) => l.word == p.word))],
         index: 0,
       );
     }
 
     final merged = <CodePrompt>[
-      ...base.prompts,
+      ...lspPrompts.where((p) => p.match(input)),
+      ...base.prompts.where((p) => !lspPrompts.any((l) => l.word == p.word)),
       for (final prompt in symbolHits)
         if (!base.prompts.any((e) => e.word == prompt.word)) prompt,
     ];

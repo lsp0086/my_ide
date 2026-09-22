@@ -9,7 +9,20 @@ class AgentToolSchemas {
     'read_file',
     'list_files',
     'search_text',
-    'fetch_url'
+    'read_media',
+    'git_status',
+    'git_diff',
+    'git_preflight',
+    'git_blame',
+    'fetch_url',
+    'mcp_list_resources',
+    'mcp_read_resource',
+    'mcp_list_prompts',
+    'mcp_get_prompt',
+    'repo_map',
+    'semantic_search',
+    'lsp_definition',
+    'lsp_references',
   };
 
   /// 主循环全量基础 schema（不含 MCP，MCP 由 Runner 动态追加）。
@@ -19,8 +32,7 @@ class AgentToolSchemas {
         'type': 'function',
         'function': {
           'name': 'read_file',
-          'description':
-              '读取文件内容。工作区内用相对路径；用户附件若给出相对路径可直接读。工作区外用绝对路径（需审批）。',
+          'description': '读取文件内容。工作区内用相对路径；用户附件若给出相对路径可直接读。工作区外用绝对路径（需审批）。',
           'parameters': {
             'type': 'object',
             'properties': {
@@ -36,8 +48,7 @@ class AgentToolSchemas {
         'type': 'function',
         'function': {
           'name': 'list_files',
-          'description':
-              '列出目录内容。工作区内用相对路径（默认根目录）；用户附件文件夹可用其路径，区外绝对路径需审批。',
+          'description': '列出目录内容。工作区内用相对路径（默认根目录）；用户附件文件夹可用其路径，区外绝对路径需审批。',
           'parameters': {
             'type': 'object',
             'properties': {
@@ -53,17 +64,23 @@ class AgentToolSchemas {
           'description':
               '全文搜索（走 isolate，不卡 UI）。query 为关键词/正则；'
               'include 按后缀或 glob 过滤如 .dart；regex=true 用正则；'
-              'caseSensitive/wholeWord 可选；contextLines 返回上下 N 行；maxResults 上限。',
+              'caseSensitive/wholeWord 可选；contextLines 返回上下 N 行；maxResults 上限；'
+              'excludeDirs 按目录名/相对路径排除如 ["build", "test/fixtures"]。',
           'parameters': {
             'type': 'object',
             'properties': {
               'query': {'type': 'string'},
+              'path': {'type': 'string'},
               'include': {'type': 'string'},
               'regex': {'type': 'boolean'},
               'caseSensitive': {'type': 'boolean'},
               'wholeWord': {'type': 'boolean'},
               'contextLines': {'type': 'integer'},
               'maxResults': {'type': 'integer'},
+              'excludeDirs': {
+                'type': 'array',
+                'items': {'type': 'string'},
+              },
             },
             'required': ['query'],
           },
@@ -72,16 +89,75 @@ class AgentToolSchemas {
       {
         'type': 'function',
         'function': {
-          'name': 'ask_question',
+          'name': 'git_status',
+          'description': '读取工作区本地 Git 状态，返回结构化的文件级变更与摘要。不执行写操作、不访问远程。',
+          'parameters': {
+            'type': 'object',
+            'properties': {
+              'path': {'type': 'string'},
+              'includeUntracked': {'type': 'boolean'},
+            },
+          },
+        },
+      },
+      {
+        'type': 'function',
+        'function': {
+          'name': 'git_diff',
+          'description': '读取工作区本地 Git diff，返回文件级与 hunk 级结构化变更。不执行写操作、不访问远程。',
+          'parameters': {
+            'type': 'object',
+            'properties': {
+              'path': {'type': 'string'},
+              'staged': {'type': 'boolean'},
+              'contextLines': {'type': 'integer'},
+            },
+          },
+        },
+      },
+      {
+        'type': 'function',
+        'function': {
+          'name': 'git_preflight',
           'description':
-              '向用户提问以澄清需求。question 为问题，options 为候选答案列表。',
+              '只读执行本地 Git 提交前检查，返回结构化统计、风险/敏感文件和提交信息建议。不会执行 commit 或 push。',
+          'parameters': {
+            'type': 'object',
+            'properties': {
+              'path': {'type': 'string'},
+              'staged': {'type': 'boolean'},
+            },
+          },
+        },
+      },
+      {
+        'type': 'function',
+        'function': {
+          'name': 'git_blame',
+          'description': '只读执行本地 git blame，返回指定文件行区间的变更归因。不执行写操作、不访问远程。',
+          'parameters': {
+            'type': 'object',
+            'properties': {
+              'path': {'type': 'string'},
+              'startLine': {'type': 'integer'},
+              'lineCount': {'type': 'integer'},
+            },
+            'required': ['path'],
+          },
+        },
+      },
+      {
+        'type': 'function',
+        'function': {
+          'name': 'ask_question',
+          'description': '向用户提问以澄清需求。question 为问题，options 为候选答案列表。',
           'parameters': {
             'type': 'object',
             'properties': {
               'question': {'type': 'string'},
               'options': {
                 'type': 'array',
-                'items': {'type': 'string'}
+                'items': {'type': 'string'},
               },
             },
             'required': ['question'],
@@ -93,14 +169,16 @@ class AgentToolSchemas {
         'function': {
           'name': 'spawn_subagent',
           'description':
-              '派生子 Agent 处理独立子任务。task 为任务描述，files 为相关文件。子任务只读文件并返回摘要，不直接写文件。',
+              '派生子 Agent 处理独立子任务。task 为任务描述，files 为相关文件。子任务只读文件并返回摘要，不直接写文件。'
+              '并行约束：同一批次的多个 spawn_subagent 会并发执行但共享同一文件读视图，'
+              '不要让多个子任务同时依赖同一文件的实时写入结果；写文件一律由主循环串行执行。',
           'parameters': {
             'type': 'object',
             'properties': {
               'task': {'type': 'string'},
               'files': {
                 'type': 'array',
-                'items': {'type': 'string'}
+                'items': {'type': 'string'},
               },
             },
             'required': ['task'],
@@ -111,8 +189,7 @@ class AgentToolSchemas {
         'type': 'function',
         'function': {
           'name': 'write_file',
-          'description':
-              '新建或覆盖写文件。path 为相对路径，content 为完整内容。执行前会弹窗请用户确认。',
+          'description': '新建或覆盖写文件。path 为相对路径，content 为完整内容。执行前会弹窗请用户确认。',
           'parameters': {
             'type': 'object',
             'properties': {
@@ -127,8 +204,7 @@ class AgentToolSchemas {
         'type': 'function',
         'function': {
           'name': 'edit_file',
-          'description':
-              '精确文本替换。oldText 必须完全一致。执行前会弹窗请用户确认。',
+          'description': '精确文本替换。oldText 必须完全一致。执行前会弹窗请用户确认。',
           'parameters': {
             'type': 'object',
             'properties': {
@@ -247,6 +323,69 @@ class AgentToolSchemas {
         },
       },
       {
+        // C1：仓库地图（目录树 + 符号表摘要），大仓冷启动先看全局再逐文件读。
+        'type': 'function',
+        'function': {
+          'name': 'repo_map',
+          'description':
+              '返回仓库地图：目录树 + 符号表摘要（最多 300 文件）。只读，无需审批。',
+          'parameters': {'type': 'object', 'properties': {}},
+        },
+      },
+      {
+        // C1：语义检索（本地 TF-IDF，无第三方依赖），按自然语言找相关文件。
+        'type': 'function',
+        'function': {
+          'name': 'semantic_search',
+          'description':
+              '按自然语言语义检索相关文件，返回路径 + 分数。只读，无需审批。query 必填，maxResults 可选。',
+          'parameters': {
+            'type': 'object',
+            'properties': {
+              'query': {'type': 'string'},
+              'maxResults': {'type': 'integer'},
+            },
+            'required': ['query'],
+          },
+        },
+      },
+      {
+        // C2：LSP 跳转定义（已实现未暴露，现补齐只读工具）。
+        'type': 'function',
+        'function': {
+          'name': 'lsp_definition',
+          'description':
+              '跳转符号定义，返回文件:行列表。path 为相对路径，line/character 为 0-based。只读，无需审批。',
+          'parameters': {
+            'type': 'object',
+            'properties': {
+              'path': {'type': 'string'},
+              'line': {'type': 'integer'},
+              'character': {'type': 'integer'},
+            },
+            'required': ['path', 'line', 'character'],
+          },
+        },
+      },
+      {
+        // C2：LSP 查引用（已实现未暴露，现补齐只读工具）。
+        'type': 'function',
+        'function': {
+          'name': 'lsp_references',
+          'description':
+              '查符号引用位置，返回文件:行列表。path 为相对路径，line/character 为 0-based。只读，无需审批。',
+          'parameters': {
+            'type': 'object',
+            'properties': {
+              'path': {'type': 'string'},
+              'line': {'type': 'integer'},
+              'character': {'type': 'integer'},
+            },
+            'required': ['path', 'line', 'character'],
+          },
+        },
+      },
+      {
         'type': 'function',
         'function': {
           'name': 'delete_file',
@@ -333,17 +472,182 @@ class AgentToolSchemas {
           },
         },
       },
+      {
+        'type': 'function',
+        'function': {
+          'name': 'mcp_list_resources',
+          'description':
+              '列出已连接 MCP 服务器的 resources（serverId -> uri 列表）。只读，无需审批。',
+          'parameters': {'type': 'object', 'properties': {}},
+        },
+      },
+      {
+        'type': 'function',
+        'function': {
+          'name': 'mcp_read_resource',
+          'description': '读取指定 MCP 服务器的 resource 文本。参数 serverId、uri。只读，无需审批。',
+          'parameters': {
+            'type': 'object',
+            'properties': {
+              'serverId': {'type': 'string'},
+              'uri': {'type': 'string'},
+            },
+            'required': ['serverId', 'uri'],
+          },
+        },
+      },
+      {
+        'type': 'function',
+        'function': {
+          'name': 'mcp_list_prompts',
+          'description': '列出已连接 MCP 服务器的 prompts（serverId -> 名称列表）。只读，无需审批。',
+          'parameters': {'type': 'object', 'properties': {}},
+        },
+      },
+      {
+        'type': 'function',
+        'function': {
+          'name': 'mcp_get_prompt',
+          // C4：带参 prompt 补齐 arguments（JSON 对象），无参可不传。
+          'description': '取指定 MCP 服务器 prompt 展开后的文本。参数 serverId、name，带参 prompt 可传 arguments 对象。只读，无需审批。',
+          'parameters': {
+            'type': 'object',
+            'properties': {
+              'serverId': {'type': 'string'},
+              'name': {'type': 'string'},
+              'arguments': {'type': 'object'},
+            },
+            'required': ['serverId', 'name'],
+          },
+        },
+      },
+      {
+        'type': 'function',
+        'function': {
+          'name': 'make_dir',
+          'description': '新建目录（含父级递归）。path 为相对路径。执行前会弹窗请用户确认。',
+          'parameters': {
+            'type': 'object',
+            'properties': {
+              'path': {'type': 'string'},
+            },
+            'required': ['path'],
+          },
+        },
+      },
+      {
+        'type': 'function',
+        'function': {
+          'name': 'copy_file',
+          'description':
+              '复制文件。from 为源相对路径，to 为目标相对路径（可跨目录）。同名目标直接拒绝，不覆盖。执行前会弹窗请用户确认。',
+          'parameters': {
+            'type': 'object',
+            'properties': {
+              'from': {'type': 'string'},
+              'to': {'type': 'string'},
+            },
+            'required': ['from', 'to'],
+          },
+        },
+      },
+      {
+        'type': 'function',
+        'function': {
+          'name': 'set_executable',
+          'description': '给文件置可执行位。path 为相对路径。执行前会弹窗请用户确认。',
+          'parameters': {
+            'type': 'object',
+            'properties': {
+              'path': {'type': 'string'},
+            },
+            'required': ['path'],
+          },
+        },
+      },
+      {
+        'type': 'function',
+        'function': {
+          'name': 'read_media',
+          'description':
+              '媒体/二进制转文本描述：图片返回尺寸+大小+base64长度；PDF 提取可读文本前4KB；其它二进制给 file 判定。path 为相对路径。只读。',
+          'parameters': {
+            'type': 'object',
+            'properties': {
+              'path': {'type': 'string'},
+            },
+            'required': ['path'],
+          },
+        },
+      },
+      {
+        'type': 'function',
+        'function': {
+          'name': 'terminal_create',
+          'description': '创建常驻交互终端会话，返回 sessionId。Agent 模式可用，Plan 禁用。',
+          'parameters': {'type': 'object', 'properties': {}},
+        },
+      },
+      {
+        'type': 'function',
+        'function': {
+          'name': 'terminal_write',
+          'description':
+              '向常驻终端写入 stdin（命令+回车）。sessionId 为 terminal_create 返回的 id；cols/rows 可选调整尺寸。',
+          'parameters': {
+            'type': 'object',
+            'properties': {
+              'sessionId': {'type': 'string'},
+              'input': {'type': 'string'},
+              'cols': {'type': 'integer'},
+              'rows': {'type': 'integer'},
+            },
+            'required': ['sessionId', 'input'],
+          },
+        },
+      },
+      {
+        'type': 'function',
+        'function': {
+          'name': 'terminal_poll',
+          'description': '轮询常驻终端增量输出。sessionId 必填，tail 可选。只读。',
+          'parameters': {
+            'type': 'object',
+            'properties': {
+              'sessionId': {'type': 'string'},
+              'tail': {'type': 'integer'},
+            },
+            'required': ['sessionId'],
+          },
+        },
+      },
+      {
+        'type': 'function',
+        'function': {
+          'name': 'terminal_kill',
+          'description': '结束常驻终端会话。sessionId 必填。',
+          'parameters': {
+            'type': 'object',
+            'properties': {
+              'sessionId': {'type': 'string'},
+            },
+            'required': ['sessionId'],
+          },
+        },
+      },
     ];
   }
 
   /// 只读子集，供子 Agent 使用。从 [base] 按名过滤，保证参数与主循环一致。
   static List<Map<String, dynamic>> readOnly() {
     final all = base();
-    return all.where((t) {
-      final fn = t['function'] as Map<String, dynamic>?;
-      final name = '${fn?['name'] ?? ''}';
-      return readOnlyNames.contains(name);
-    }).toList(growable: false);
+    return all
+        .where((t) {
+          final fn = t['function'] as Map<String, dynamic>?;
+          final name = '${fn?['name'] ?? ''}';
+          return readOnlyNames.contains(name);
+        })
+        .toList(growable: false);
   }
 
   static bool isReadOnly(String name) => readOnlyNames.contains(name);

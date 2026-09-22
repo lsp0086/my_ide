@@ -119,8 +119,38 @@ class ContextCompactor {
   double triggerRatio = 0.8;
   int keepRecent = 8;
 
+  /// 摘要模型 key（prefs agentSummaryModel，可空，为空则用主模型）。
+  String? summaryModelKey;
+
   int contextLimitOf(AiModelOption model) {
     return model.contextLength ?? 128000;
+  }
+
+  /// 分级摘要：文件列表只保留路径 + 数量，不贴内容。
+  static String compactFiles(List<String> files, {int maxShow = 20}) {
+    if (files.isEmpty) return '';
+    final shown = files.take(maxShow).join(', ');
+    final more = files.length > maxShow ? ' 等共 ${files.length} 个' : '';
+    return '【文件摘要】$shown$more';
+  }
+
+  /// 分级摘要：工具结果只保留首行/截断，避免大输出压爆上下文。
+  static String compactToolResults(List<String> outputs, {int maxChars = 2000}) {
+    if (outputs.isEmpty) return '';
+    final buf = StringBuffer();
+    for (var i = 0; i < outputs.length; i++) {
+      final text = outputs[i];
+      final first = text.split('\n').firstWhere(
+            (l) => l.trim().isNotEmpty,
+            orElse: () => '',
+          );
+      final snippet =
+          first.length > 200 ? '${first.substring(0, 200)}…' : first;
+      buf.writeln('- 结果${i + 1}：$snippet');
+    }
+    final s = buf.toString().trimRight();
+    if (s.length <= maxChars) return s;
+    return '${s.substring(0, maxChars)}\n…（工具结果过长已截断）';
   }
 
   /// 切出「尚未摘要」与「最近窗口」。失败路径不改旧边界。
@@ -153,6 +183,26 @@ class ContextCompactor {
     );
   }
 
+  /// 单条 ChatMessage 的 token 估算：文本+思考+文件开销+图片引用，
+  /// 与 Runner._budgetHistory 同口径，避免触发偏晚或视觉轮次低估 400。
+  /// 图片已资产化：`asset:` 只计路径小头；残留 dataUrl 仍按全量计。
+  static int estimateChatMessage(ChatMessage m) {
+    var total = TokenEstimator.estimate(m.text) +
+        TokenEstimator.estimate(m.thinking ?? '') +
+        m.files.length * 24 +
+        m.commands.length * 48 +
+        16;
+    for (final c in m.commands) {
+      total += TokenEstimator.estimate(c.command) + TokenEstimator.estimate(c.output);
+    }
+    for (final ref in m.images) {
+      // 资产引用与 dataUrl 当前同按字符计：引用路径短天然小头，
+      // dataUrl 长天然大头，无需分支，保持与 Runner 一致。
+      total += TokenEstimator.estimate(ref) + 64;
+    }
+    return total;
+  }
+
   bool shouldCompact({
     required List<Map<String, dynamic>> messages,
     required AiModelOption model,
@@ -173,8 +223,8 @@ class ContextCompactor {
     String? previousSummary,
     String? previousUntilMessageId,
   }) async {
-    final tokensBefore = history.fold<int>(
-        0, (sum, m) => sum + TokenEstimator.estimate(m.text));
+    final tokensBefore =
+        history.fold<int>(0, (sum, m) => sum + estimateChatMessage(m));
     if (history.length <= keepRecent + 2 &&
         (previousSummary == null || previousSummary.isEmpty)) {
       return CompactionResult(
@@ -225,8 +275,7 @@ class ContextCompactor {
     }
 
     final tokensAfter = TokenEstimator.estimate(summary) +
-        kept.fold<int>(
-            0, (sum, m) => sum + TokenEstimator.estimate(m.text));
+        kept.fold<int>(0, (sum, m) => sum + estimateChatMessage(m));
     final until = toSummarize.isNotEmpty
         ? toSummarize.last.id
         : previousUntilMessageId;
@@ -260,6 +309,25 @@ class ContextCompactor {
       if (m.files.isNotEmpty) {
         buf.writeln('操作文件：${m.files.join(', ')}');
       }
+      if (m.userEditedFiles.isNotEmpty) {
+        buf.writeln('用户编辑：${m.userEditedFiles.join(', ')}');
+      }
+      if (m.subAgents.isNotEmpty) {
+        for (final s in m.subAgents.take(5)) {
+          final out = s.output.length > 200 ? '${s.output.substring(0, 200)}…' : s.output;
+          buf.writeln('子Agent[${s.task}]：$out');
+        }
+      }
+      if (m.images.isNotEmpty) {
+        buf.writeln('图片：${m.images.length} 张');
+      }
+      if (m.stopReason != null && m.stopReason!.isNotEmpty) {
+        buf.writeln('终止原因：${m.stopReason}');
+      }
+      if (m.commands.isNotEmpty) {
+        buf.writeln(
+            '执行命令：${m.commands.take(5).map((c) => '${c.command}${c.exitCode == null ? '' : '（exit=${c.exitCode}）'}').join('；')}');
+      }
       if (m.afterVersionId != null || m.beforeVersionId != null) {
         buf.writeln(
             '版本：${m.afterVersionId ?? m.beforeVersionId}');
@@ -271,6 +339,7 @@ class ContextCompactor {
 要求：
 - 用户目标（一句话）
 - 已做改动：文件 + 版本ID（如 v3 改了 a.dart），不要贴代码
+- 已执行命令：命令 + exit 码（如 flutter test exit=0）
 - 待办事项
 - 关键文件列表
 - 用户偏好/拒绝过的操作
@@ -296,7 +365,8 @@ $buf''';
     }
     final text = reply.toString().trim();
     if (text.isEmpty) {
-      // 摘要失败时退化：只保留每条首行
+      // 摘要失败时退化：保留每条首行 + 操作文件 + 版本ID，
+      // 此前只留首行，files/afterVersionId 全丢，恢复后断链。
       final fallback = StringBuffer('【自动摘要失败，保留要点】\n');
       for (final m in messages.take(20)) {
         final first =
@@ -305,6 +375,31 @@ $buf''';
         if (first.isNotEmpty) {
           fallback.writeln(
               '- ${m.role == 'user' ? '用户' : '助手'}：${first.substring(0, math.min(80, first.length))}');
+        }
+        if (m.files.isNotEmpty) {
+          fallback.writeln('  操作文件：${m.files.join(', ')}');
+        }
+        if (m.userEditedFiles.isNotEmpty) {
+          fallback.writeln('  用户编辑：${m.userEditedFiles.join(', ')}');
+        }
+        if (m.subAgents.isNotEmpty) {
+          for (final s in m.subAgents.take(3)) {
+            fallback.writeln('  子Agent[${s.task}]：${s.output.substring(0, math.min(120, s.output.length))}');
+          }
+        }
+        if (m.images.isNotEmpty) {
+          fallback.writeln('  图片：${m.images.length} 张');
+        }
+        if (m.stopReason != null && m.stopReason!.isNotEmpty) {
+          fallback.writeln('  终止原因：${m.stopReason}');
+        }
+        if (m.commands.isNotEmpty) {
+          fallback.writeln(
+              '  执行命令：${m.commands.take(5).map((c) => c.command).join('；')}');
+        }
+        if (m.afterVersionId != null || m.beforeVersionId != null) {
+          fallback.writeln(
+              '  版本：${m.afterVersionId ?? m.beforeVersionId}');
         }
       }
       return fallback.toString();

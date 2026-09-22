@@ -4,6 +4,7 @@
 # 用法：
 #   ./scripts/release_desktop.command
 #   ./scripts/release_desktop.command --no-clean
+#   ./scripts/release_desktop.command --skip-check
 #   OUT_DIR=artifacts ./scripts/release_desktop.command
 set -euo pipefail
 
@@ -11,9 +12,11 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 NO_CLEAN=0
+SKIP_CHECK=0
 for arg in "$@"; do
   case "$arg" in
     --no-clean) NO_CLEAN=1 ;;
+    --skip-check) SKIP_CHECK=1 ;;
     -h|--help)
       sed -n '2,8p' "$0"
       exit 0
@@ -34,6 +37,9 @@ HOST="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_DIR="${OUT_DIR:-$ROOT/dist}"
+if [[ "$OUT_DIR" != /* ]]; then
+  OUT_DIR="$ROOT/$OUT_DIR"
+fi
 mkdir -p "$OUT_DIR"
 
 echo "==> 项目: $APP_NAME  版本: $VERSION+$BUILD_NUM  主机: $HOST/$ARCH"
@@ -52,7 +58,13 @@ zip_dir() {
   base="$(basename "$src")"
   rm -f "$dest_zip"
   (cd "$parent" && zip -qry "$dest_zip" "$base")
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$dest_zip" > "${dest_zip}.sha256"
+  else
+    shasum -a 256 "$dest_zip" > "${dest_zip}.sha256"
+  fi
   echo "    已生成: $dest_zip"
+  echo "    已生成: ${dest_zip}.sha256"
 }
 
 strip_language_bundles() {
@@ -133,6 +145,18 @@ try_platform() {
 echo "==> flutter pub get"
 flutter pub get
 echo
+
+if [[ "$SKIP_CHECK" -eq 0 ]]; then
+  echo "==> flutter analyze --no-fatal-infos"
+  flutter analyze --no-fatal-infos
+  echo
+  echo "==> flutter test"
+  flutter test
+  echo
+else
+  echo "==> 已跳过 analyze/test (--skip-check)"
+  echo
+fi
 
 case "$HOST" in
   darwin)

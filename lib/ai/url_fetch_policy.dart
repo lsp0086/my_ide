@@ -23,10 +23,17 @@ class UrlFetchPolicy {
     if (host == 'localhost' ||
         host.endsWith('.localhost') ||
         host.endsWith('.local') ||
-        host == 'metadata.google.internal') {
+        host.endsWith('.internal') ||
+        host.endsWith('.lan') ||
+        host == 'metadata.google.internal' ||
+        host.endsWith('.metadata.google.internal') ||
+        host == 'instance-data.compute.internal' ||
+        host.endsWith('.instance-data.compute.internal')) {
       return '拒绝本地域名：$host';
     }
-    final literal = InternetAddress.tryParse(host);
+    // 十六进制/八进制/整数 IP 字面量：tryParse 认不出，手动归一化再判。
+    final normalizedIp = _normalizeNumericIp(host);
+    final literal = InternetAddress.tryParse(normalizedIp ?? host);
     if (literal != null) {
       final why = rejectAddress(literal);
       if (why != null) return why;
@@ -42,6 +49,39 @@ class UrlFetchPolicy {
       if (host == allowed || host.endsWith('.$allowed')) return true;
     }
     return false;
+  }
+
+  /// 数字 IP 归一化：0x7f.0.0.1 / 0177.0.0.1 / 2130706433 / 尾点域名。
+  /// tryParse 认不出这些写法，手动转点分十进制再判，认不出返回 null。
+  static String? _normalizeNumericIp(String host) {
+    var h = host.trim().toLowerCase();
+    if (h.isEmpty) return null;
+    // 尾点 FQDN：metadata.google.internal. 与无点同义。
+    if (h.endsWith('.')) h = h.substring(0, h.length - 1);
+    // 纯整数：32 位 IPv4（如 2130706433 = 127.0.0.1）。
+    final asInt = int.tryParse(h);
+    if (asInt != null && asInt >= 0 && asInt <= 0xFFFFFFFF) {
+      return '${(asInt >> 24) & 0xFF}.${(asInt >> 16) & 0xFF}.${(asInt >> 8) & 0xFF}.${asInt & 0xFF}';
+    }
+    if (!h.contains('.')) return h == host.toLowerCase() ? null : h;
+    final parts = h.split('.');
+    if (parts.length != 4) return h == host.toLowerCase() ? null : h;
+    final out = <String>[];
+    for (final part in parts) {
+      int? v;
+      final p = part.trim();
+      if (p.startsWith('0x') || p.contains(RegExp(r'[a-f]'))) {
+        v = int.tryParse(p.startsWith('0x') ? p.substring(2) : p, radix: 16);
+      } else if (p.length > 1 && p.startsWith('0')) {
+        v = int.tryParse(p, radix: 8);
+      } else {
+        v = int.tryParse(p);
+      }
+      if (v == null || v < 0 || v > 255) return null;
+      out.add('$v');
+    }
+    final normalized = out.join('.');
+    return normalized;
   }
 
   String? rejectAddress(InternetAddress addr) {

@@ -5,6 +5,10 @@ import 'dart:math';
 import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
+import 'package:shared_preferences/shared_preferences.dart';
+
+import '../diagnostics/app_logger.dart';
+import '../fs/workspace_fs.dart';
 
 /// 自研版本底层：工作区是唯一完整文本；版本库只记差量。
 ///
@@ -24,6 +28,10 @@ class CheckpointInfo {
     required this.kind,
     required this.files,
     this.chatId,
+    // R3：记录时的 git 元信息（无仓库时全空），便于回退时核对外部 git 状态。
+    this.gitBranch,
+    this.gitCommit,
+    this.gitDirty,
   });
 
   final String id;
@@ -32,6 +40,9 @@ class CheckpointInfo {
   final String kind;
   final List<String> files;
   final String? chatId;
+  final String? gitBranch;
+  final String? gitCommit;
+  final bool? gitDirty;
 
   Map<String, dynamic> toJson() => {
         'id': id,
@@ -40,6 +51,9 @@ class CheckpointInfo {
         'kind': kind,
         'files': files,
         if (chatId != null) 'chatId': chatId,
+        if (gitBranch != null) 'gitBranch': gitBranch,
+        if (gitCommit != null) 'gitCommit': gitCommit,
+        if (gitDirty != null) 'gitDirty': gitDirty,
       };
 
   static CheckpointInfo fromJson(Map<String, dynamic> j) => CheckpointInfo(
@@ -50,7 +64,52 @@ class CheckpointInfo {
         kind: '${j['kind'] ?? 'auto'}',
         files: ((j['files'] as List?) ?? []).map((e) => '$e').toList(),
         chatId: j['chatId'] as String?,
+        gitBranch: j['gitBranch'] as String?,
+        gitCommit: j['gitCommit'] as String?,
+        gitDirty: j['gitDirty'] as bool?,
       );
+}
+
+/// R3：读取工作区 git 元信息（分支/commit/是否有未提交改动）。
+/// 非 git 仓库或 git 不可用时返回空记录，不抛错、不阻塞 checkpoint。
+class GitSnapshot {
+  const GitSnapshot({this.branch, this.commit, this.dirty});
+
+  final String? branch;
+  final String? commit;
+  final bool? dirty;
+
+  bool get hasRepo => branch != null || commit != null;
+
+  static Future<GitSnapshot> capture(String rootPath) async {
+    try {
+      final branchRes = await Process.run(
+        'git',
+        ['-C', rootPath, 'rev-parse', '--abbrev-ref', 'HEAD'],
+      ).timeout(const Duration(seconds: 3));
+      if (branchRes.exitCode != 0) return const GitSnapshot();
+      final commitRes = await Process.run(
+        'git',
+        ['-C', rootPath, 'rev-parse', '--short', 'HEAD'],
+      ).timeout(const Duration(seconds: 3));
+      final statusRes = await Process.run(
+        'git',
+        ['-C', rootPath, 'status', '--porcelain'],
+      ).timeout(const Duration(seconds: 5));
+      final branch = '${branchRes.stdout ?? ''}'.trim();
+      final commit = '${commitRes.stdout ?? ''}'.trim();
+      final dirty = statusRes.exitCode == 0
+          ? '${statusRes.stdout ?? ''}'.trim().isNotEmpty
+          : null;
+      return GitSnapshot(
+        branch: branch.isEmpty ? null : branch,
+        commit: commit.isEmpty ? null : commit,
+        dirty: dirty,
+      );
+    } catch (_) {
+      return const GitSnapshot();
+    }
+  }
 }
 
 class FileChange {
@@ -93,6 +152,9 @@ class CheckpointStore extends ChangeNotifier {
   final Map<String, List<FileChange>> _diffCache = {};
   final Map<String, Map<String, String>> _treeCache = {};
   bool _busy = false;
+  // drop 重入位：revertDropVersions 外层已占 _busy，内层 drop 借位重入，
+  // 外部并发仍抛错。直接调 drop 此前无 guard 会与 checkpoint 交错丢 manifest。
+  int _dropReentrancy = 0;
   final Random _rng = Random.secure();
   // Redo 栈：Restore 前把「目标 → 现场」的反向差量入栈，不保留完整文本。
   final List<List<FileChange>> _redoPatches = [];
@@ -143,6 +205,7 @@ class CheckpointStore extends ChangeNotifier {
       _versionsDir = null;
     }
     await _loadManifest();
+    await _loadRedoStack();
     notifyListeners();
   }
 
@@ -155,6 +218,48 @@ class CheckpointStore extends ChangeNotifier {
         await dir.create(recursive: true);
       }
     }
+  }
+
+  /// Redo 栈持久化：重启不再丢，bindProject 时恢复。
+  /// 此前纯内存，重启后 Restore 保险直接没了。
+  Future<void> _saveRedoStack() async {
+    final versions = _versionsDir;
+    if (versions == null) return;
+    try {
+      await _writeFileAtomic(
+        File(p.join(versions.path, 'redo.json')),
+        jsonEncode({
+          'labels': _redoLabels,
+          'patches': _redoPatches
+              .map((patch) => patch.map((e) => e.toJson()).toList())
+              .toList(),
+        }),
+      );
+    } catch (_) {}
+  }
+
+  Future<void> _loadRedoStack() async {
+    _redoPatches.clear();
+    _redoLabels.clear();
+    final versions = _versionsDir;
+    if (versions == null) return;
+    try {
+      final file = File(p.join(versions.path, 'redo.json'));
+      if (!await file.exists()) return;
+      final data = jsonDecode(await file.readAsString()) as Map<String, dynamic>;
+      final labels = (data['labels'] as List?) ?? const [];
+      final patches = (data['patches'] as List?) ?? const [];
+      for (var i = 0; i < patches.length && i < 20; i++) {
+        final raw = patches[i];
+        if (raw is! List) continue;
+        _redoPatches.add(raw
+            .whereType<Map>()
+            .map((e) => FileChange.fromJson(Map<String, dynamic>.from(e)))
+            .toList());
+        _redoLabels.add(
+            i < labels.length ? '${labels[i]}' : 'Redo');
+      }
+    } catch (_) {}
   }
 
   Future<void> _loadManifest() async {
@@ -177,6 +282,9 @@ class CheckpointStore extends ChangeNotifier {
             .whereType<Map>()
             .map((e) =>
                 CheckpointInfo.fromJson(Map<String, dynamic>.from(e)))
+            // manifest 毒化过滤：crafted id（如 ../../x）不进内存，
+            // 否则后续 _relinkDiffs/dropVersions 用 cp.id 拼路径穿越写盘外。
+            .where((e) => _isSafeVersionId(e.id))
             .toList();
         // manifest 数组顺序即时间线（新→旧），不再按 createdAt 重排，
         // 避免同毫秒/时钟回拨错乱。
@@ -190,24 +298,76 @@ class CheckpointStore extends ChangeNotifier {
   }
 
   /// 原子保存：tmp 写盘 + flush + rename，旧 manifest 留 .bak。
+  /// 先写 `.new` 再 rename 成 `.bak`：copy 非原子，崩溃可双坏；
+  /// `.new` 写坏只影响备份链，主文件仍可用。
   Future<void> _saveManifest() async {
     final versions = _versionsDir;
     if (versions == null) return;
     final manifest = File(p.join(versions.path, 'manifest.json'));
-    final tmp = File(p.join(versions.path, 'manifest.json.tmp'));
-    final bak = File(p.join(versions.path, 'manifest.json.bak'));
     final payload = jsonEncode({
       'format': 'cas-v2',
       'checkpoints': _checkpoints.map((e) => e.toJson()).toList(),
     });
-    await tmp.parent.create(recursive: true);
-    await tmp.writeAsString(payload, flush: true);
+    // 先把旧 manifest 拷到 .bak，再原子覆盖主文件，主备双读才有意义。
     try {
+      final bak = File(p.join(versions.path, 'manifest.json.bak'));
       if (await manifest.exists()) {
-        await manifest.copy(bak.path);
+        final bakNew = File(p.join(versions.path, 'manifest.json.bak.new'));
+        await manifest.copy(bakNew.path);
+        try {
+          await bakNew.rename(bak.path);
+        } catch (_) {
+          await bakNew.copy(bak.path);
+          try {
+            await bakNew.delete();
+          } catch (_) {}
+        }
       }
     } catch (_) {}
-    await tmp.rename(manifest.path);
+    await _writeFileAtomic(manifest, payload);
+  }
+
+  /// 通用原子写：唯一 tmp+flush+rename，崩溃不留半写文件。
+  /// trees/diffs/blob/session 统一走这里，不再直接 writeAsString。
+  /// 固定 `.tmp` 名此前并发写同目标会互盖侧车，改唯一名。
+  /// nonce 用 Random.secure（_rng）：micros+hashCode 仅 16bit 非稳定。
+  Future<void> _writeFileAtomic(File target, String content) async {
+    await target.parent.create(recursive: true);
+    final nonce =
+        '${DateTime.now().microsecondsSinceEpoch}-${_rng.nextInt(1 << 32).toRadixString(36)}';
+    final tmp = File('${target.path}.$nonce.tmp');
+    try {
+      await tmp.writeAsString(content, flush: true);
+      try {
+        await tmp.rename(target.path);
+      } catch (_) {
+        // Windows 占有时 rename 失败：回退直写（至少保证内容落地）。
+        await target.writeAsString(content, flush: true);
+      }
+    } finally {
+      try {
+        if (await tmp.exists()) await tmp.delete();
+      } catch (_) {}
+    }
+  }
+
+  /// 二进制原子写：blob/tree 二进制统一走这里。
+  Future<void> _writeBytesAtomic(File target, List<int> bytes) async {
+    await target.parent.create(recursive: true);
+    final nonce = '${DateTime.now().microsecondsSinceEpoch}-${_rng.nextInt(1 << 32).toRadixString(36)}';
+    final tmp = File('${target.path}.$nonce.tmp');
+    try {
+      await tmp.writeAsBytes(bytes, flush: true);
+      try {
+        await tmp.rename(target.path);
+      } catch (_) {
+        await target.writeAsBytes(bytes, flush: true);
+      }
+    } finally {
+      try {
+        if (await tmp.exists()) await tmp.delete();
+      } catch (_) {}
+    }
   }
 
   /// 时间线旧→新：以 manifest 数组顺序（新→旧）反转得到，不依赖 createdAt 排序。
@@ -220,17 +380,29 @@ class CheckpointStore extends ChangeNotifier {
   }
 
   File _blobFile(String hash) {
+    // B8：hash 必须为 hex，否则 crafted tree/diff 可经 ../../ 穿越到版本库外。
+    if (!_isHexHash(hash)) throw StateError('非法 blob hash');
     final versions = _versionsDir!;
     final prefix = hash.length >= 2 ? hash.substring(0, 2) : '00';
     final rest = hash.length >= 2 ? hash.substring(2) : hash;
     return File(p.join(versions.path, 'objects', 'blobs', prefix, rest));
   }
 
+  static bool _isHexHash(String hash) =>
+      hash.isNotEmpty &&
+      hash.length <= 128 &&
+      RegExp(r'^[0-9a-f]+$').hasMatch(hash);
+
+  /// 版本 id 门禁：12 hex（兼容旧 snapshots 目录名），防 `../` 穿越。
+  static bool _isSafeVersionId(String id) =>
+      id.isNotEmpty &&
+      id.length <= 64 &&
+      RegExp(r'^[0-9a-f]+$').hasMatch(id);
+
   Future<void> _writeBlob(String hash, List<int> bytes) async {
     final file = _blobFile(hash);
     if (await file.exists()) return;
-    await file.parent.create(recursive: true);
-    await file.writeAsBytes(bytes, flush: true);
+    await _writeBytesAtomic(file, bytes);
   }
 
   Future<bool> _blobExists(String hash) async {
@@ -272,20 +444,28 @@ class CheckpointStore extends ChangeNotifier {
     }
   }
 
-  bool _isTempSidecar(String rel) => p.basename(rel).endsWith('.myide-new');
+  bool _isTempSidecar(String rel) {
+    final base = p.basename(rel);
+    // 唯一侧车名形如 `a.txt.<micros>.myide-new` / `f.<micros>-<h>.tmp`：
+    // 后缀匹配会漏掉中间段，改含段匹配；正常文件名含该段概率极低。
+    // 落盘侧车形如 `f.<micros>-<h>.tmp` / `.myide-new`：后缀兜底，
+    // 避免并发两写的侧车污染 touchedFiles/快照。
+    return base.contains('.myide-new') || base.endsWith('.tmp');
+  }
 
-  String _stagingPath(String abs) => '$abs.myide-new';
+  String _stagingPath(String abs) =>
+      '$abs.${DateTime.now().microsecondsSinceEpoch}-${_rng.nextInt(1 << 32).toRadixString(36)}.myide-new';
 
   Future<void> _writeTree(String id, Map<String, String> files) async {
+    if (!_isSafeVersionId(id)) throw StateError('非法版本 id');
     final versions = _versionsDir!;
     final file = File(p.join(versions.path, 'trees', '$id.json'));
-    await file.parent.create(recursive: true);
     final sorted = Map.fromEntries(
         files.entries.toList()..sort((a, b) => a.key.compareTo(b.key)));
-    await file.writeAsString(jsonEncode({
+    await _writeFileAtomic(file, jsonEncode({
       'id': id,
       'files': sorted,
-    }), flush: true);
+    }));
     _treeCache[id] = Map<String, String>.from(sorted);
   }
 
@@ -303,7 +483,18 @@ class CheckpointStore extends ChangeNotifier {
   }) async {
     final root = _rootPath;
     final versions = _versionsDir;
-    if (root == null || versions == null || _busy) return null;
+    if (root == null || versions == null) return null;
+    // 4.2 并发排队替代抛错：_busy 时等待前一个 checkpoint 完成（最多 30s），
+    // 此前直接抛错，AI 单步与手动版本并发必掉一端节点。
+    if (_busy) {
+      final deadline = DateTime.now().add(const Duration(seconds: 30));
+      while (_busy && DateTime.now().isBefore(deadline)) {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      }
+      if (_busy) {
+        throw StateError('版本操作进行中，请稍后再试');
+      }
+    }
     _busy = true;
     notifyListeners();
     try {
@@ -330,13 +521,15 @@ class CheckpointStore extends ChangeNotifier {
       );
 
       final diffFile = File(p.join(versions.path, 'diffs', '$id.json'));
-      await diffFile.writeAsString(jsonEncode({
+      await _writeFileAtomic(diffFile, jsonEncode({
         'id': id,
         'prevId': prevId,
         'changes': changes.map((e) => e.toJson()).toList(),
-      }), flush: true);
+      }));
       _diffCache[id] = changes;
 
+      // R3：顺手记录 git 元信息（失败/无仓库则全空，不阻塞落盘）。
+      final git = await GitSnapshot.capture(root);
       final info = CheckpointInfo(
         id: id,
         message: message,
@@ -344,9 +537,15 @@ class CheckpointStore extends ChangeNotifier {
         kind: kind,
         files: changes.map((e) => e.path).toList(),
         chatId: chatId,
+        gitBranch: git.branch,
+        gitCommit: git.commit,
+        gitDirty: git.dirty,
       );
       _checkpoints.insert(0, info);
       await _saveManifest();
+      // 4.4 版本上限：只保留最近 100 个节点，超量删最旧的 ai 单步节点，
+      // manual/auto-backup 保留。无上限曾导致每 tool 一节点无限膨胀。
+      await _enforceVersionCap();
       notifyListeners();
       return info;
     } finally {
@@ -355,7 +554,48 @@ class CheckpointStore extends ChangeNotifier {
     }
   }
 
+  /// 版本数上限 GC：超限时只删 ai-edit-step，且每个 chatId 至少保留 1 个；
+  /// manual/auto-backup/user-edit/ai-edit 永不淘汰。上限读 prefs versionMaxNodes（默认100，20~500）。
+  Future<void> _enforceVersionCap({int? maxVersions}) async {
+    final max = maxVersions ?? await versionMaxNodes();
+    if (_checkpoints.length <= max) return;
+    final ordered = _orderedOldToNew();
+    // 每个 chatId 至少保留 1 个：先统计各 chat 最新节点（时间线最靠后=数组最靠前）。
+    final keepLatestByChat = <String>{};
+    final seenChat = <String>{};
+    for (final cp in _checkpoints) {
+      final chat = cp.chatId;
+      if (chat == null || chat.isEmpty) continue;
+      if (seenChat.add(chat)) keepLatestByChat.add(cp.id);
+    }
+    var need = _checkpoints.length - max;
+    final evictable = <String>{};
+    // 从最旧往新扫描，只淘汰 ai-edit-step，且跳过各 chat 最新保留节点。
+    for (final cp in ordered) {
+      if (need <= 0) break;
+      if (cp.kind != 'ai-edit-step') continue;
+      if (keepLatestByChat.contains(cp.id)) continue;
+      evictable.add(cp.id);
+      need--;
+    }
+    if (evictable.isEmpty) return;
+    try {
+      await dropVersions(evictable);
+    } catch (_) {}
+  }
+
+  /// 版本上限：prefs versionMaxNodes，默认 100，钳制 20~500。
+  static Future<int> versionMaxNodes() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return (prefs.getInt('versionMaxNodes') ?? 100).clamp(20, 500);
+    } catch (_) {
+      return 100;
+    }
+  }
+
   Future<List<FileChange>> changesOf(String id) async {
+    if (!_isSafeVersionId(id)) return [];
     if (_diffCache.containsKey(id)) return _diffCache[id]!;
     final versions = _versionsDir;
     if (versions == null) return [];
@@ -403,7 +643,10 @@ class CheckpointStore extends ChangeNotifier {
     if (payload.binary) return null;
     if (payload.text != null) return payload.text;
     final versions = _versionsDir;
-    if (versions == null) return null;
+    final root = _rootPath;
+    if (versions == null || root == null) return null;
+    // B8：遗留 snapshots 直读同样走恢复门禁，crafted id/relPath 不得穿越。
+    if (!_isSafeRestoreRel(root, relPath) || !_isSafeVersionId(id)) return null;
     final file = File(p.join(versions.path, 'snapshots', id, relPath));
     if (!await file.exists()) return null;
     try {
@@ -414,6 +657,36 @@ class CheckpointStore extends ChangeNotifier {
   }
 
   /// 扫描工作区：文本只记 hash，二进制才写 blob。
+  /// 快照忽略目录：与文件树/符号索引同口径，避免 node_modules 等大目录
+  /// 全量扫描爆内存。此前只忽略 .my_ide/.git，200MB log 照样读。
+  static const _snapshotSkipDirs = {
+    '.my_ide',
+    '.git',
+    'node_modules',
+    '.dart_tool',
+    'build',
+    'dist',
+    'out',
+    'coverage',
+    '.next',
+    'Pods',
+    'DerivedData',
+    '__pycache__',
+    '.venv',
+    'venv',
+    'vendor',
+    'target',
+  };
+
+  static bool _isSnapshotSkipped(String rel) {
+    // 与 AgentTools._snapshotSkipped 同口径：任一段命中即跳过，
+    // 此前只看首段，`a/node_modules` 不跳过致快照口径不一致。
+    for (final part in rel.split(RegExp(r'[/\\]'))) {
+      if (_snapshotSkipDirs.contains(part)) return true;
+    }
+    return false;
+  }
+
   Future<Map<String, String>> _captureWorkspace(String root) async {
     final result = <String, String>{};
     final rootDir = Directory(root);
@@ -421,18 +694,31 @@ class CheckpointStore extends ChangeNotifier {
         in rootDir.list(recursive: true, followLinks: false)) {
       if (entity is! File) continue;
       final rel = p.relative(entity.path, from: root);
-      if (rel.startsWith('.my_ide') || rel.startsWith('.git')) continue;
+      if (_isSnapshotSkipped(rel)) continue;
       if (p.basename(rel) == '.DS_Store') continue;
       if (_isTempSidecar(rel)) continue;
+      String? hash;
       try {
+        // 先判大小再读：此前 readAsBytes 后才判 2MB，大文件照样进内存。
+        final size = await entity.length();
+        if (size > 2 * 1024 * 1024) continue;
         final bytes = await entity.readAsBytes();
-        if (bytes.length > 2 * 1024 * 1024) continue;
-        final hash = sha1.convert(bytes).toString();
+        hash = sha1.convert(bytes).toString();
         if (_decodeText(bytes) == null) {
-          await _writeBlob(hash, bytes);
+          try {
+            await _writeBlob(hash, bytes);
+          } catch (_) {
+            // blob 落盘失败仍保留 hash：后续读取走 missing 报错路径，
+            // 不让文件从快照里静默消失导致差量算错。
+          }
         }
         result[rel] = hash;
-      } catch (_) {}
+      } catch (_) {
+        // 读失败才跳过；hash 已算出时上面已记录。
+        if (hash != null && !result.containsKey(rel)) {
+          result[rel] = hash;
+        }
+      }
     }
     return result;
   }
@@ -451,6 +737,11 @@ class CheckpointStore extends ChangeNotifier {
       return const _FilePayload(text: '', binary: false);
     }
     if (fromWorkspace && _rootPath != null) {
+      // 投毒 tree 防护：crafted relPath（如 ../../etc/passwd）不得读出区外，
+      // 此前直拼 root+path 把区外内容读进 redo/diff 持久化。
+      if (!_isSafeRestoreRel(_rootPath!, path)) {
+        return const _FilePayload(text: '', binary: false);
+      }
       final file = File(p.join(_rootPath!, path));
       if (!await file.exists()) {
         return const _FilePayload(text: '', binary: false);
@@ -530,7 +821,13 @@ class CheckpointStore extends ChangeNotifier {
     return present ? content : null;
   }
 
-  String _applyUnifiedDiff(String oldText, String diff) {
+  /// [validateContext] 为 true 时校验上下文/删除行与当前内容一致，
+  /// 防止把旧基线的差量硬套到已漂移的文件上（Redo 路径必须开启）。
+  String _applyUnifiedDiff(
+    String oldText,
+    String diff, {
+    bool validateContext = false,
+  }) {
     if (diff.isEmpty) return oldText;
     if (diff.startsWith('@@ binary') || diff.contains('\n@@ binary')) {
       throw StateError('binary diff cannot apply as text');
@@ -565,8 +862,14 @@ class CheckpointStore extends ChangeNotifier {
           if (l.startsWith('+')) {
             out.add(l.substring(1));
           } else if (l.startsWith('-')) {
+            if (validateContext) {
+              _expectLine(oldLines, oldIndex, l.substring(1));
+            }
             oldIndex++;
           } else if (l.startsWith(' ')) {
+            if (validateContext) {
+              _expectLine(oldLines, oldIndex, l.substring(1));
+            }
             out.add(l.substring(1));
             oldIndex++;
           }
@@ -583,12 +886,26 @@ class CheckpointStore extends ChangeNotifier {
     return out.join('\n');
   }
 
+  void _expectLine(List<String> lines, int index, String expected) {
+    if (index >= lines.length || lines[index] != expected) {
+      throw StateError('差量与工作区内容不匹配：文件在回退后被修改过，请重新检查后再操作');
+    }
+  }
+
+  /// tree 文件缺失时抛错，不静默返回空。
+  /// 空 tree 意味着"删光工作区"，静默会让版本库损坏时 restore 误删全部文件。
+  /// 调用方需区分：全新空仓库走 `_checkpoints.isEmpty` 判断，不调本方法。
   Future<Map<String, String>> _loadTree(String id) async {
+    if (!_isSafeVersionId(id)) {
+      throw StateError('非法版本 id：$id');
+    }
     if (_treeCache.containsKey(id)) {
       return Map<String, String>.from(_treeCache[id]!);
     }
     final versions = _versionsDir;
-    if (versions == null) return {};
+    if (versions == null) {
+      throw StateError('版本库不可用，无法读取版本 $id');
+    }
 
     final treeFile = File(p.join(versions.path, 'trees', '$id.json'));
     if (await treeFile.exists()) {
@@ -607,7 +924,9 @@ class CheckpointStore extends ChangeNotifier {
 
     // 兼容旧 snapshots/<id>/：现算 hash，不回写 blob（避免悄悄占空间）
     final dir = Directory(p.join(versions.path, 'snapshots', id));
-    if (!await dir.exists()) return {};
+    if (!await dir.exists()) {
+      throw StateError('版本数据缺失：找不到版本 $id 的 tree 记录');
+    }
     final result = <String, String>{};
     await for (final entity
         in dir.list(recursive: true, followLinks: false)) {
@@ -704,6 +1023,7 @@ class CheckpointStore extends ChangeNotifier {
   }
 
   Future<String> lineDiff(String id, String relPath) async {
+    if (!_isSafeVersionId(id)) return '';
     final changes = await changesOf(id);
     for (final c in changes) {
       if (c.path == relPath &&
@@ -930,13 +1250,28 @@ class CheckpointStore extends ChangeNotifier {
     return buf.toString();
   }
 
-  Future<void> _syncPathToLatest(String relativePath) async {
+  Future<void> _syncPathToLatest(
+    String relativePath, {
+    String? excludeId,
+  }) async {
     final root = _rootPath;
     if (root == null) return;
-    final ordered = _orderedOldToNew();
-    final latestTree = ordered.isEmpty
+    // 毒化 path 防护：diffs 里的 crafted path（如 ../../x）不得删出区外，
+    // 此前删除分支不走 _commitOps 门禁，直接拼接删除。
+    if (!_isSafeRestoreRel(root, relativePath)) return;
+    final ordered = _orderedOldToNew()
+        .where((e) => e.id != excludeId)
+        .toList(growable: false);
+    // 排除安全节点后有效历史为空：说明回退删光了版本链，
+    // 此时保持现场（安全节点内容）不动，不删文件，避免数据丢失。
+    final effective = ordered.isEmpty && excludeId != null
+        ? _orderedOldToNew()
+            .where((e) => e.id == excludeId)
+            .toList(growable: false)
+        : ordered;
+    final latestTree = effective.isEmpty
         ? <String, String>{}
-        : await _loadTree(ordered.last.id);
+        : await _loadTree(effective.last.id);
     if (!latestTree.containsKey(relativePath)) {
       final target = File(p.join(root, relativePath));
       if (await target.exists()) await target.delete();
@@ -945,7 +1280,7 @@ class CheckpointStore extends ChangeNotifier {
     final payload = await _filePayload(
       path: relativePath,
       hash: latestTree[relativePath],
-      versionId: ordered.last.id,
+      versionId: effective.last.id,
     );
     final bytes = payload.bytes ??
         (payload.text != null ? utf8.encode(payload.text!) : null);
@@ -992,7 +1327,10 @@ class CheckpointStore extends ChangeNotifier {
     await _commitOps(ops, reverseOnFailure: reverseOnFailure);
   }
 
-  Future<void> _applyChangesToWorkspace(List<FileChange> changes) async {
+  Future<void> _applyChangesToWorkspace(
+    List<FileChange> changes, {
+    List<FileChange> reverseOnFailure = const [],
+  }) async {
     final root = _rootPath;
     if (root == null) return;
     final ops = <_WsOp>[];
@@ -1018,21 +1356,90 @@ class CheckpointStore extends ChangeNotifier {
       final file = File(p.join(root, c.path));
       final current =
           await file.exists() ? await file.readAsString() : '';
-      final next = _applyUnifiedDiff(c.type == 'added' ? '' : current, c.diff);
+      final next = _applyUnifiedDiff(
+        c.type == 'added' ? '' : current,
+        c.diff,
+        validateContext: c.type != 'added',
+      );
       ops.add(_WsOp.write(c.path, utf8.encode(next)));
     }
     if (missing.isNotEmpty) {
       throw StateError(
           '版本数据缺失 ${missing.length} 个文件：${missing.take(5).join(', ')}');
     }
-    await _commitOps(ops);
+    await _commitOps(ops, reverseOnFailure: reverseOnFailure);
   }
 
   Future<void> _replaceOver(File tmp, File target) async {
+    // 权限保留：覆盖前记下可执行位，rename 后 chmod 回去，
+    // 此前全库无 mode 复制，脚本恢复后丢可执行位。
+    var executable = false;
+    try {
+      if (!Platform.isWindows && await target.exists()) {
+        final mode = (await target.stat()).mode;
+        executable = (mode & 0x49) != 0;
+      }
+    } catch (_) {}
     if (Platform.isWindows && await target.exists()) {
       await target.delete();
     }
     await tmp.rename(target.path);
+    if (executable && !Platform.isWindows) {
+      try {
+        await Process.run('chmod', ['+x', target.path]);
+      } catch (_) {}
+    }
+  }
+
+  /// 恢复路径门禁：拒绝对路径/`..` 越界/空路径/链接侧车文件，
+  /// 与 WorkspaceFs.zoneOf 基准一致。版本文件被篡改或拷贝不可信项目
+  /// 注入 `../../` 时在此拦截，不再直写区外。
+  /// 另拦截父目录链接逃逸、敏感路径、版本库自毁（.my_ide/versions）。
+  bool _isSafeRestoreRel(String root, String rel) {
+    if (rel.isEmpty) return false;
+    if (p.isAbsolute(rel)) return false;
+    if (_isTempSidecar(rel)) return false;
+    final normalized = p.normalize(rel);
+    if (normalized == '.' || normalized.startsWith('..')) return false;
+    if (normalized.split(p.separator).contains('..')) return false;
+    // 版本库自毁拦截：crafted tree/diff 此前可覆盖 manifest/redo/blob。
+    final lower = normalized.replaceAll('\\', '/').toLowerCase();
+    if (lower == '.my_ide' ||
+        lower.startsWith('.my_ide/versions/') ||
+        lower == '.my_ide/versions' ||
+        WorkspaceFs.isSensitiveRelative(normalized)) {
+      return false;
+    }
+    final abs = p.normalize(p.join(root, normalized));
+    final rootNorm = p.normalize(root);
+    if (abs != rootNorm && !p.isWithin(rootNorm, abs)) return false;
+    // 恢复拒 symlink：目标现为链接时读跟随、写替换分裂，此前行为不一致。
+    // 检测到链接直接中止，由用户手动处理，避免写到区外。
+    try {
+      final type = FileSystemEntity.typeSync(abs, followLinks: false);
+      if (type == FileSystemEntityType.link) return false;
+      // 父目录链同样拦截：a/link->/etc 时 `a/link/file` 词法在区内，
+      // 此前 parent.create+write 会跟随出狱。
+      var dir = Directory(p.dirname(abs));
+      final rootReal = WorkspaceFs.realpathOf(rootNorm);
+      for (var i = 0; i < 32; i++) {
+        if (dir.path == rootNorm || dir.path == rootReal) break;
+        try {
+          final t =
+              FileSystemEntity.typeSync(dir.path, followLinks: false);
+          if (t == FileSystemEntityType.link) return false;
+        } catch (_) {
+          break;
+        }
+        final parent = p.dirname(dir.path);
+        if (parent == dir.path) break;
+        dir = Directory(parent);
+        if (!p.isWithin(rootNorm, dir.path) && dir.path != rootNorm) {
+          return false;
+        }
+      }
+    } catch (_) {}
+    return true;
   }
 
   Future<void> _commitOps(
@@ -1041,6 +1448,13 @@ class CheckpointStore extends ChangeNotifier {
   }) async {
     if (ops.isEmpty) return;
     final root = _rootPath!;
+    // 恢复链统一门禁：tree/diff/manifest 被篡改注入 `../../` 时拒写区外，
+    // 与 WorkspaceFs.zoneOf 基准一致（拒绝对路径/越界/敏感路径）。
+    for (final op in ops) {
+      if (!_isSafeRestoreRel(root, op.rel)) {
+        throw StateError('版本数据含非法路径，已中止恢复：${op.rel}');
+      }
+    }
     final staged = <File>[];
     final committed = <_WsOp>[];
     try {
@@ -1048,18 +1462,29 @@ class CheckpointStore extends ChangeNotifier {
         if (op.delete) continue;
         final target = File(p.join(root, op.rel));
         await target.parent.create(recursive: true);
-        final tmp = File(_stagingPath(target.path));
+        // 唯一侧车名只生成一次存 op 上：此前 stage/commit 两次调用
+        // _stagingPath 生成不同名，commit 找不到 stage 文件直接 rename 失败。
+        op.stagedTmp = _stagingPath(target.path);
+        final tmp = File(op.stagedTmp!);
         await tmp.writeAsBytes(op.bytes!, flush: true);
         staged.add(tmp);
       }
       for (final op in ops) {
         if (op.delete) continue;
         final target = File(p.join(root, op.rel));
-        await _replaceOver(File(_stagingPath(target.path)), target);
+        // 门禁后复检：parent.create 跟随父链外链，create→rename 窗口换链即写出区外，
+        // 落盘前必须二次确认目标仍在区内且非链接。
+        if (!_isSafeRestoreRel(root, op.rel)) {
+          throw StateError('版本数据含非法路径，已中止恢复：${op.rel}');
+        }
+        await _replaceOver(File(op.stagedTmp!), target);
         committed.add(op);
       }
       for (final op in ops) {
         if (!op.delete) continue;
+        if (!_isSafeRestoreRel(root, op.rel)) {
+          throw StateError('版本数据含非法路径，已中止恢复：${op.rel}');
+        }
         final target = File(p.join(root, op.rel));
         if (await target.exists()) await target.delete();
         committed.add(op);
@@ -1093,6 +1518,8 @@ class CheckpointStore extends ChangeNotifier {
   Future<void> _applyOneChange(FileChange c) async {
     final root = _rootPath;
     if (root == null) return;
+    // 回滚单文件同样走恢复门禁：reverse 链被篡改注入 `../` 时拒写区外。
+    if (!_isSafeRestoreRel(root, c.path)) return;
     final target = File(p.join(root, c.path));
     if (c.type == 'deleted') {
       if (await target.exists()) await target.delete();
@@ -1103,16 +1530,24 @@ class CheckpointStore extends ChangeNotifier {
       final bytes = await _readBlobBytes(c.hash!);
       if (bytes == null) return;
       await target.parent.create(recursive: true);
-      await target.writeAsBytes(bytes, flush: true);
+      // 原子写：回滚直写崩溃会留半文件，与 _writeBytesAtomic 同口径。
+      await _writeBytesAtomic(target, bytes);
       return;
     }
     final current = await target.exists() ? await target.readAsString() : '';
-    final next = _applyUnifiedDiff(c.type == 'added' ? '' : current, c.diff);
+    // 回滚开 validateContext：漂移后硬套旧差量会误回滚，此前未开。
+    // 校验失败抛错由 _commitOps catch 吞掉跳过，不中断整批回滚。
+    final next = _applyUnifiedDiff(
+      c.type == 'added' ? '' : current,
+      c.diff,
+      validateContext: c.type != 'added',
+    );
     await target.parent.create(recursive: true);
-    await target.writeAsString(next, flush: true);
+    await _writeFileAtomic(target, next);
   }
 
   Future<void> restoreWorkspaceTo(String versionId) async {
+    if (!_isSafeVersionId(versionId)) throw StateError('非法版本 id');
     if (_busy) throw StateError('版本操作进行中，请稍后再试');
     final root = _rootPath;
     if (root == null) throw StateError('未打开项目');
@@ -1121,7 +1556,9 @@ class CheckpointStore extends ChangeNotifier {
     try {
       final current = await _captureWorkspace(root);
       final toFiles = await _loadTree(versionId);
-      var reverse = <FileChange>[];
+      // 先建立 Redo 保险，失败则中止恢复：
+      // 恢复会删除目标树之外的文件，没有 Redo 兜底会造成不可恢复丢失。
+      final List<FileChange> reverse;
       try {
         reverse = await _materializeDiffs(
           changes: _diffTrees(toFiles, current),
@@ -1130,14 +1567,18 @@ class CheckpointStore extends ChangeNotifier {
           prevId: versionId,
           currentFromWorkspace: true,
         );
-        _redoPatches.add(reverse);
-        _redoLabels.add(
-            'Restore 前现场 ${DateTime.now().hour.toString().padLeft(2, '0')}:${DateTime.now().minute.toString().padLeft(2, '0')}');
-        while (_redoPatches.length > 20) {
-          _redoPatches.removeAt(0);
-          _redoLabels.removeAt(0);
-        }
-      } catch (_) {}
+      } catch (e) {
+        AppLogger.instance.error('checkpoint', '建立回退保险失败，已中止恢复', e);
+        throw StateError('无法建立回退保险，已中止恢复：$e');
+      }
+      _redoPatches.add(reverse);
+      _redoLabels.add(
+          'Restore 前现场 ${DateTime.now().hour.toString().padLeft(2, '0')}:${DateTime.now().minute.toString().padLeft(2, '0')}');
+      while (_redoPatches.length > 20) {
+        _redoPatches.removeAt(0);
+        _redoLabels.removeAt(0);
+      }
+      await _saveRedoStack();
       await _applyTreeToWorkspace(
         toFiles,
         versionId: versionId,
@@ -1161,7 +1602,48 @@ class CheckpointStore extends ChangeNotifier {
       final patch = _redoPatches.removeLast();
       final label =
           _redoLabels.isNotEmpty ? _redoLabels.removeLast() : 'Redo';
-      await _applyChangesToWorkspace(patch);
+      await _saveRedoStack();
+      // Redo 前快照现场：半落盘时按快照直恢复，不再删成缺失。
+      final root = _rootPath!;
+      final snapshots = <String, List<int>?>{};
+      for (final c in patch) {
+        // 快照与回滚同样走恢复门禁：redo.json 被篡改注入 `../` 时，
+        // 此前快照直读、回滚直写可读写区外，旁路 _isSafeRestoreRel。
+        if (!_isSafeRestoreRel(root, c.path)) {
+          throw StateError('版本数据含非法路径，已中止恢复：${c.path}');
+        }
+        try {
+          final f = File(p.join(root, c.path));
+          snapshots[c.path] =
+              await f.exists() ? await f.readAsBytes() : null;
+        } catch (_) {
+          snapshots[c.path] = null;
+        }
+      }
+      try {
+        await _applyChangesToWorkspace(patch);
+      } catch (_) {
+        for (final entry in snapshots.entries) {
+          // 回滚同样复检门禁：快照 key 即 patch 路径，理论已验，双重保险。
+          if (!_isSafeRestoreRel(root, entry.key)) continue;
+          try {
+            final f = File(p.join(root, entry.key));
+            final bytes = entry.value;
+            if (bytes == null) {
+              if (await f.exists()) await f.delete();
+            } else {
+              await f.parent.create(recursive: true);
+              await _writeBytesAtomic(f, bytes);
+            }
+          } catch (_) {}
+        }
+        // 应用失败（如文件在回退后被修改导致差量失配），
+        // 将差量放回栈顶，避免丢失唯一的回退数据。
+        _redoPatches.add(patch);
+        _redoLabels.add(label);
+        await _saveRedoStack();
+        rethrow;
+      }
       notifyListeners();
       return label;
     } finally {
@@ -1188,11 +1670,11 @@ class CheckpointStore extends ChangeNotifier {
         currentId: cp.id,
       );
       final diffFile = File(p.join(versions.path, 'diffs', '${cp.id}.json'));
-      await diffFile.writeAsString(jsonEncode({
+      await _writeFileAtomic(diffFile, jsonEncode({
         'id': cp.id,
         'prevId': prevId,
         'changes': changes.map((e) => e.toJson()).toList(),
-      }), flush: true);
+      }));
       _diffCache[cp.id] = changes;
       prevId = cp.id;
     }
@@ -1200,6 +1682,7 @@ class CheckpointStore extends ChangeNotifier {
   }
 
   Future<void> _deleteVersionArtifacts(String id) async {
+    if (!_isSafeVersionId(id)) return;
     final versions = _versionsDir;
     if (versions == null) return;
     for (final rel in ['diffs/$id.json', 'trees/$id.json']) {
@@ -1249,40 +1732,61 @@ class CheckpointStore extends ChangeNotifier {
   /// 必须先用完整差量链重算剩余节点，再删被丢弃节点；否则文本无法从差量重建。
   Future<void> dropVersions(Set<String> ids) async {
     if (ids.isEmpty) return;
-    final remaining = _orderedOldToNew().where((e) => !ids.contains(e.id)).toList();
-    String? prevId;
-    for (final cp in remaining) {
-      final tree = await _loadTree(cp.id);
-      final prevTree =
-          prevId == null ? <String, String>{} : await _loadTree(prevId);
-      final changes = await _materializeDiffs(
-        changes: _diffTrees(prevTree, tree),
-        prevFiles: prevTree,
-        currentFiles: tree,
-        prevId: prevId,
-        currentId: cp.id,
-      );
-      final versions = _versionsDir;
-      if (versions != null) {
-        final diffFile = File(p.join(versions.path, 'diffs', '${cp.id}.json'));
-        await diffFile.writeAsString(jsonEncode({
-          'id': cp.id,
-          'prevId': prevId,
-          'changes': changes.map((e) => e.toJson()).toList(),
-        }), flush: true);
-      }
-      _diffCache[cp.id] = changes;
-      prevId = cp.id;
+    // revertDropVersions 借位调用：外层已占 _busy 并记了安全节点，
+    // 此时允许同栈重入继续重链；外部并发仍抛错。
+    final reentrant = _dropReentrancy > 0;
+    if (_busy && !reentrant) {
+      throw StateError('版本操作进行中，请稍后再试');
     }
-    for (final id in ids) {
-      await _deleteVersionArtifacts(id);
+    final owned = !_busy;
+    if (owned) {
+      _busy = true;
+      notifyListeners();
     }
-    _checkpoints.removeWhere((e) => ids.contains(e.id));
-    await _saveManifest();
     try {
-      await gcBlobs();
-    } catch (_) {}
-    notifyListeners();
+      // 非法 id 不进重链/删除路径：此前 crafted id 可穿越删版本库外 json。
+      final safeIds = ids.where(_isSafeVersionId).toSet();
+      final remaining =
+          _orderedOldToNew().where((e) => !safeIds.contains(e.id)).toList();
+      String? prevId;
+      for (final cp in remaining) {
+        final tree = await _loadTree(cp.id);
+        final prevTree =
+            prevId == null ? <String, String>{} : await _loadTree(prevId);
+        final changes = await _materializeDiffs(
+          changes: _diffTrees(prevTree, tree),
+          prevFiles: prevTree,
+          currentFiles: tree,
+          prevId: prevId,
+          currentId: cp.id,
+        );
+        final versions = _versionsDir;
+        if (versions != null) {
+          final diffFile = File(p.join(versions.path, 'diffs', '${cp.id}.json'));
+          await _writeFileAtomic(diffFile, jsonEncode({
+            'id': cp.id,
+            'prevId': prevId,
+            'changes': changes.map((e) => e.toJson()).toList(),
+          }));
+        }
+        _diffCache[cp.id] = changes;
+        prevId = cp.id;
+      }
+      for (final id in safeIds) {
+        await _deleteVersionArtifacts(id);
+      }
+      _checkpoints.removeWhere((e) => safeIds.contains(e.id));
+      await _saveManifest();
+      try {
+        await gcBlobs();
+      } catch (_) {}
+      notifyListeners();
+    } finally {
+      if (owned) {
+        _busy = false;
+        notifyListeners();
+      }
+    }
   }
 
   /// 取某版本在时间线上的前一个版本 id（旧→新）。
@@ -1295,9 +1799,12 @@ class CheckpointStore extends ChangeNotifier {
 
   /// 撤销若干版本对工作区的影响：若后续保留版本又改过同文件则保留后续结果。
   Future<Map<String, String>> _mergedWorkspaceWithout(
-    Set<String> dropIds,
-  ) async {
-    final ordered = _orderedOldToNew();
+    Set<String> dropIds, {
+    Set<String> excludeIds = const {},
+  }) async {
+    final ordered = _orderedOldToNew()
+        .where((e) => !excludeIds.contains(e.id))
+        .toList(growable: false);
     if (ordered.isEmpty) return {};
 
     // 从「第一个被删节点」之前的 tree 起步；若删的是最早节点则空 tree。
@@ -1380,17 +1887,56 @@ class CheckpointStore extends ChangeNotifier {
     return out;
   }
 
+  /// 回退前把磁盘漂移（未进版本的改动）先记一个安全节点，
+  /// 避免目标态由版本树推导时覆盖用户已落盘的编辑。
+  /// 无漂移时 checkpoint() 返回 null，开销只是一次目录扫描。
+  /// 返回新节点 id（无漂移返回 null）：调用方在重链/同步时必须排除它，
+  /// 否则"同步到最新"会把刚备份的现场又写回去，回退失效。
+  /// 安全节点保留在版本链中，可从版本面板再恢复。
+  /// [allowBusyOwner] 为 true 时允许在外层已占 _busy 的情况下记安全节点：
+  /// 外层先占位防并发，内层 checkpoint 借位执行后恢复占位，不真正释放。
+  Future<String?> _safetyCheckpointIfDrifted({bool allowBusyOwner = false}) async {
+    final owned = allowBusyOwner && _busy;
+    if (owned) _busy = false;
+    try {
+      final cp = await checkpoint(message: '回退前自动备份', kind: 'auto-backup');
+      return cp?.id;
+    } catch (_) {
+      return null;
+    } finally {
+      if (owned) _busy = true;
+    }
+  }
+
   /// 回退：按剩余节点差量重链后写回工作区。不另做整文件快照。
   /// 中途失败抛错不销账（盘已回但账未销由调用方重试）。
+  /// B9：借位窗口已收紧——外层先 _busy 占位，内层 checkpoint 不再临时清零，
+  /// 而是直接借位执行（_safetyCheckpointIfDrifted allowBusyOwner），
+  /// 窗口内第二个 revert/restore 见 _busy 直接抛错，不再交叉落盘。
   Future<void> revertDropVersions(Set<String> ids) async {
     if (ids.isEmpty) return;
+    // 非法 id 不进重链/工作区同步：此前 crafted id 可穿越。
+    final safeIds = ids.where(_isSafeVersionId).toSet();
+    if (safeIds.isEmpty) return;
     if (_busy) throw StateError('版本操作进行中，请稍后再试');
+    // 先占 _busy 再记安全节点：此前先 safetyCheckpoint（内部 checkpoint
+    // 也走 _busy）后才置位，两路并发可同过检查、同跑安全节点后交叉落盘。
     _busy = true;
     notifyListeners();
+    // 借位记安全节点：外层占位不释放，内层 checkpoint 临时借位执行。
+    final safetyId = await _safetyCheckpointIfDrifted(allowBusyOwner: true);
     try {
-      final desired = await _mergedWorkspaceWithout(ids);
+      final desired = await _mergedWorkspaceWithout(
+        safeIds,
+        excludeIds: safetyId == null ? const {} : {safetyId},
+      );
       await _applyTreeToWorkspace(desired);
-      await dropVersions(ids);
+      _dropReentrancy++;
+      try {
+        await dropVersions(safeIds);
+      } finally {
+        _dropReentrancy--;
+      }
     } finally {
       _busy = false;
       notifyListeners();
@@ -1403,14 +1949,19 @@ class CheckpointStore extends ChangeNotifier {
     required String versionId,
     required String relativePath,
   }) async {
+    // 非法 id 不进 _loadTree/路径拼接：此前 crafted id 可穿越读写版本库外。
+    if (!_isSafeVersionId(versionId)) return false;
     final root = _rootPath;
     final versions = _versionsDir;
     if (root == null || versions == null || _busy) return false;
+    // 毒化 path 不得经回退入口操作区外文件。
+    if (!_isSafeRestoreRel(root, relativePath)) return false;
     final index = _checkpoints.indexWhere((e) => e.id == versionId);
     if (index < 0) return false;
 
     _busy = true;
     notifyListeners();
+    final safetyId = await _safetyCheckpointIfDrifted(allowBusyOwner: true);
     try {
       final changesBefore = await changesOf(versionId);
       if (!changesBefore.any((c) => c.path == relativePath)) {
@@ -1444,11 +1995,11 @@ class CheckpointStore extends ChangeNotifier {
         await _writeTree(versionId, newTree);
         final diffFile =
             File(p.join(versions.path, 'diffs', '$versionId.json'));
-        await diffFile.writeAsString(jsonEncode({
+        await _writeFileAtomic(diffFile, jsonEncode({
           'id': versionId,
           'prevId': prevId,
           'changes': changes.map((e) => e.toJson()).toList(),
-        }), flush: true);
+        }));
         _diffCache[versionId] = changes;
         final still = _checkpoints.indexWhere((e) => e.id == versionId);
         if (still >= 0) {
@@ -1466,8 +2017,12 @@ class CheckpointStore extends ChangeNotifier {
 
       await _relinkDiffs();
       await _saveManifest();
+      // 单文件回退重写 tree/diff 后旧 blob 失引，顺手 GC，避免长期残留。
+      try {
+        await gcBlobs();
+      } catch (_) {}
 
-      await _syncPathToLatest(relativePath);
+      await _syncPathToLatest(relativePath, excludeId: safetyId);
 
       notifyListeners();
       return true;
@@ -1485,12 +2040,15 @@ class CheckpointStore extends ChangeNotifier {
     required String relativePath,
     required int hunkIndex,
   }) async {
+    if (!_isSafeVersionId(versionId)) return false;
     final root = _rootPath;
     final versions = _versionsDir;
     if (root == null || versions == null || _busy) return false;
+    if (!_isSafeRestoreRel(root, relativePath)) return false;
     if (_checkpoints.indexWhere((e) => e.id == versionId) < 0) return false;
     _busy = true;
     notifyListeners();
+    final safetyIdHunk = await _safetyCheckpointIfDrifted(allowBusyOwner: true);
     try {
       final newContent = await fileContentAt(versionId, relativePath);
       if (newContent == null) return false;
@@ -1521,6 +2079,8 @@ class CheckpointStore extends ChangeNotifier {
         }
       }
       final ordered = ops.reversed.toList();
+      // 分组规则必须与 _lineDiffText 生成一致：<7 行上下文的相邻变更合并为一块，
+      // 否则 diff_view 侧按"裸连续 +/-"分组会把该块再拆小，hunkIndex 错位。
       final runs = <List<int>>[];
       var k = 0;
       while (k < ordered.length) {
@@ -1529,9 +2089,27 @@ class CheckpointStore extends ChangeNotifier {
           continue;
         }
         final s = k;
-        while (k < ordered.length &&
-            (ordered[k].startsWith('+') || ordered[k].startsWith('-'))) {
-          k++;
+        while (k < ordered.length) {
+          final cur = ordered[k];
+          if (cur.startsWith('+') || cur.startsWith('-')) {
+            k++;
+            continue;
+          }
+          // 上下文：统计连续空格数，<7 且后面还有变更则并入本块继续。
+          var spaces = 0;
+          var look = k;
+          while (look < ordered.length && ordered[look].startsWith(' ')) {
+            spaces++;
+            look++;
+          }
+          if (spaces < 7 &&
+              look < ordered.length &&
+              (ordered[look].startsWith('+') ||
+                  ordered[look].startsWith('-'))) {
+            k = look;
+            continue;
+          }
+          break;
         }
         runs.add([s, k]);
       }
@@ -1586,11 +2164,11 @@ class CheckpointStore extends ChangeNotifier {
         await _writeTree(versionId, newTree);
         final diffFile =
             File(p.join(versions.path, 'diffs', '$versionId.json'));
-        await diffFile.writeAsString(jsonEncode({
+        await _writeFileAtomic(diffFile, jsonEncode({
           'id': versionId,
           'prevId': prevId,
           'changes': changes.map((e) => e.toJson()).toList(),
-        }), flush: true);
+        }));
         _diffCache[versionId] = changes;
         final still = _checkpoints.indexWhere((e) => e.id == versionId);
         if (still >= 0) {
@@ -1608,8 +2186,12 @@ class CheckpointStore extends ChangeNotifier {
 
       await _relinkDiffs();
       await _saveManifest();
+      // 单块回退同样清失引 blob。
+      try {
+        await gcBlobs();
+      } catch (_) {}
 
-      await _syncPathToLatest(relativePath);
+      await _syncPathToLatest(relativePath, excludeId: safetyIdHunk);
 
       notifyListeners();
       return true;
@@ -1658,6 +2240,9 @@ class _WsOp {
   final String rel;
   final List<int>? bytes;
   final bool delete;
+
+  /// stage 侧车实际路径：唯一名，避免两次 _stagingPath 调用生成不同名。
+  String? stagedTmp;
 }
 
 class CheckpointScope extends InheritedNotifier<CheckpointStore> {

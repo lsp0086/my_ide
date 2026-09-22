@@ -96,7 +96,11 @@ class _McpSettingsPanelState extends State<McpSettingsPanel> {
       final list = await _manager.importRaw(controller.text);
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('已导入 ${list.length} 个 MCP 服务器')),
+        SnackBar(
+          content: Text(
+            '已导入 ${list.length} 个 MCP 服务器（默认禁用，请在列表中启用）',
+          ),
+        ),
       );
     } catch (e) {
       if (!mounted) return;
@@ -134,6 +138,13 @@ class _McpSettingsPanelState extends State<McpSettingsPanel> {
     );
     final timeout = TextEditingController(text: '${draft.timeoutSeconds}');
     final maxTools = TextEditingController(text: '${draft.maxTools}');
+    final maxConcurrent =
+        TextEditingController(text: '${draft.maxConcurrent}');
+    final maxLogEntries =
+        TextEditingController(text: '${draft.maxLogEntries}');
+    final installDirectory =
+        TextEditingController(text: draft.installDirectory ?? '');
+    final version = TextEditingController(text: draft.version ?? '');
     final env = TextEditingController(
       text: draft.env.entries.map((e) => '${e.key}=${e.value}').join('\n'),
     );
@@ -285,6 +296,40 @@ class _McpSettingsPanelState extends State<McpSettingsPanel> {
                           isDense: true,
                         ),
                       ),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: maxConcurrent,
+                        keyboardType: TextInputType.number,
+                        decoration: const InputDecoration(
+                          labelText: '并发上限（1~32）',
+                          isDense: true,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: maxLogEntries,
+                        keyboardType: TextInputType.number,
+                        decoration: const InputDecoration(
+                          labelText: '日志保留（20~1000）',
+                          isDense: true,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: version,
+                        decoration: const InputDecoration(
+                          labelText: '版本（可选）',
+                          isDense: true,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: installDirectory,
+                        decoration: const InputDecoration(
+                          labelText: '本地安装目录（可选，仅托管目录可卸载清理）',
+                          isDense: true,
+                        ),
+                      ),
                     ],
                   ),
                 ),
@@ -352,6 +397,15 @@ class _McpSettingsPanelState extends State<McpSettingsPanel> {
       toolLevel: toolLevel,
       disabledTools: draft.disabledTools,
       maxTools: (int.tryParse(maxTools.text.trim()) ?? 40).clamp(1, 200),
+      maxConcurrent:
+          (int.tryParse(maxConcurrent.text.trim()) ?? 4).clamp(1, 32),
+      maxLogEntries:
+          (int.tryParse(maxLogEntries.text.trim()) ?? 200).clamp(20, 1000),
+      installDirectory: installDirectory.text.trim().isEmpty
+          ? null
+          : installDirectory.text.trim(),
+      version: version.text.trim().isEmpty ? null : version.text.trim(),
+      dependencies: draft.dependencies,
     );
     await _manager.upsert(next);
     if (next.enabled) {
@@ -510,7 +564,9 @@ class _McpSettingsPanelState extends State<McpSettingsPanel> {
               config: s,
               status: _manager.statusOf(s.id),
               tools: _manager.sessionOf(s.id)?.tools ?? const [],
-              lastError: _manager.sessionOf(s.id)?.lastError,
+              lastError: _manager.sessionOf(s.id)?.lastError ??
+                  _manager.lastFailureOf(s.id),
+              logs: _manager.sessionOf(s.id)?.logs ?? const [],
               onToggle: (v) => _manager.setEnabled(s.id, v),
               onConnect: () => _manager.reconnect(s.id),
               onDisconnect: () => _manager.disconnect(s.id),
@@ -548,6 +604,7 @@ class _McpServerTile extends StatelessWidget {
     required this.config,
     required this.status,
     required this.tools,
+    this.logs = const [],
     required this.onToggle,
     required this.onConnect,
     required this.onDisconnect,
@@ -560,6 +617,7 @@ class _McpServerTile extends StatelessWidget {
   final McpServerConfig config;
   final String status;
   final List<McpToolDef> tools;
+  final List<String> logs;
   final String? lastError;
   final ValueChanged<bool> onToggle;
   final VoidCallback onConnect;
@@ -635,6 +693,22 @@ class _McpServerTile extends StatelessWidget {
             ),
           ],
           const SizedBox(height: 8),
+          if (logs.isNotEmpty)
+            ExpansionTile(
+              tilePadding: EdgeInsets.zero,
+              title: const Text('日志', style: TextStyle(fontSize: 12)),
+              children: [
+                SizedBox(
+                  height: 120,
+                  child: ListView(
+                    children: logs.reversed.take(30).map((line) => Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(line, style: TextStyle(color: colors.textMuted, fontSize: 10)),
+                    )).toList(),
+                  ),
+                ),
+              ],
+            ),
           Row(
             children: [
               TextButton(

@@ -57,6 +57,7 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
   Mode? _languageMode;
   bool _gotoModifier = false;
   String? _gotoHint;
+
   /// 仅当前可跳转符号：行号 + 标识符起止列
   int? _gotoLine;
   int? _gotoStart;
@@ -70,9 +71,20 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
   String? _cachedHighlightLanguageId;
   final Set<String> _promptingPackIds = {};
 
-  /// 大文件只读横幅：超 1MB 只读打开，不提示输入（可手动 Ctrl+S 强制存）。
+  /// 大文件窗口化：超 1MB 默认只加载前 2000 行窗口，可按需扩展；
+  /// 仅在确认局部编辑后才允许保存窗口，避免整文件误写。
   static const _largeFileBytes = 1024 * 1024;
+  static const _largeFileWindowLines = 2000;
   bool _isLargeFile = false;
+  bool _largeFileEditMode = false;
+  // 大文件窗口“加载全部”开关：置 true 后下次 _open() 加载整文件，
+  // 与 _largeFileEditMode（局部编辑确认）共同构成保存放行条件。
+  bool _largeFileExpanded = false;
+  late final CodeFindController _findController;
+  bool _wordWrap = false;
+  bool _showMinimap = false;
+  Timer? _signatureDebounce;
+  String? _signatureHint;
 
   bool get isDirty => _dirty;
   bool get isSaving => _saving;
@@ -93,10 +105,10 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
     super.initState();
     _language = CodeLanguage.fromFileName(p.basename(widget.path));
     _languageMode = builtinAllLanguages[_language.id];
-    _controller = CodeLineEditingController(
-      spanBuilder: _gotoSpanBuilder,
-    );
+    _controller = CodeLineEditingController(spanBuilder: _gotoSpanBuilder);
+    _findController = CodeFindController(_controller);
     _focusNode = FocusNode();
+
     _controller.addListener(_onChanged);
     HardwareKeyboard.instance.addHandler(_onHardwareKey);
     _load();
@@ -395,20 +407,27 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
       }
       final children = <InlineSpan>[];
       if (localStart > 0) {
-        children.add(TextSpan(
-            text: text.substring(0, localStart), style: node.style ?? style));
+        children.add(
+          TextSpan(
+            text: text.substring(0, localStart),
+            style: node.style ?? style,
+          ),
+        );
       }
-      children.add(TextSpan(
-        text: text.substring(localStart, localEnd),
-        style: (node.style ?? style).copyWith(
-          decoration: TextDecoration.underline,
-          decorationColor: accent,
-          color: accent,
+      children.add(
+        TextSpan(
+          text: text.substring(localStart, localEnd),
+          style: (node.style ?? style).copyWith(
+            decoration: TextDecoration.underline,
+            decorationColor: accent,
+            color: accent,
+          ),
         ),
-      ));
+      );
       if (localEnd < text.length) {
-        children.add(TextSpan(
-            text: text.substring(localEnd), style: node.style ?? style));
+        children.add(
+          TextSpan(text: text.substring(localEnd), style: node.style ?? style),
+        );
       }
       return TextSpan(style: node.style, children: children);
     }
@@ -441,15 +460,19 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
 
     final selection = _controller.selection;
     final maxLine = _controller.codeLines.length - 1;
-    final useLine =
-        (line ?? _gotoLine ?? selection.extentIndex).clamp(0, maxLine);
+    final useLine = (line ?? _gotoLine ?? selection.extentIndex).clamp(
+      0,
+      maxLine,
+    );
     final lineText = _controller.codeLines[useLine].text;
-    final useChar = (character ??
-            ((_gotoStart != null && _gotoEnd != null)
-                ? ((_gotoStart! + _gotoEnd!) ~/ 2)
-                : selection.extentOffset))
-        .clamp(0, lineText.length);
-    final symbol = (_gotoStart != null &&
+    final useChar =
+        (character ??
+                ((_gotoStart != null && _gotoEnd != null)
+                    ? ((_gotoStart! + _gotoEnd!) ~/ 2)
+                    : selection.extentOffset))
+            .clamp(0, lineText.length);
+    final symbol =
+        (_gotoStart != null &&
             _gotoEnd != null &&
             _gotoLine == useLine &&
             _gotoStart! < lineText.length &&
@@ -464,7 +487,8 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
     setState(() => _gotoHint = '查找中…');
     try {
       // 点在定义本体 → 反向引用；否则 → 跳定义
-      final onDefinition = SymbolIndex.instance.definitionAt(
+      final onDefinition =
+          SymbolIndex.instance.definitionAt(
             filePath: widget.path,
             name: symbol,
             line: useLine,
@@ -501,10 +525,8 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
                 height: 320,
                 child: ListView.separated(
                   itemCount: refs.length,
-                  separatorBuilder: (_, _) => Divider(
-                    height: 1,
-                    color: colors.border,
-                  ),
+                  separatorBuilder: (_, _) =>
+                      Divider(height: 1, color: colors.border),
                   itemBuilder: (context, i) {
                     final r = refs[i];
                     final rel = p.isWithin(rootPath, r.filePath)
@@ -555,8 +577,9 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
 
       // 1) 优先 LSP（设置里可配命令路径）
       final settings = SettingsStore.instance;
-      final spec = DefinitionService.instance
-          .specForExtension(p.extension(widget.path).toLowerCase());
+      final spec = DefinitionService.instance.specForExtension(
+        p.extension(widget.path).toLowerCase(),
+      );
       if (spec != null) {
         final overrideCmd = settings.languageServerCommand(spec.id);
         final client = await DefinitionService.instance.clientFor(
@@ -568,12 +591,13 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
           final lspLang = spec.languageIds.contains(_language.id)
               ? _language.id
               : (spec.languageIds.isNotEmpty
-                  ? spec.languageIds.first
-                  : _language.id);
+                    ? spec.languageIds.first
+                    : _language.id);
           client.didChangeIncremental(
             widget.path,
             _controller.text,
-            version: (_diagnostics ?? DiagnosticsScope.maybeOf(context))
+            version:
+                (_diagnostics ?? DiagnosticsScope.maybeOf(context))
                     ?.contentVersionOf(widget.path) ??
                 1,
             languageId: lspLang,
@@ -609,9 +633,7 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
       }
 
       final sourceLabel = via == '内置'
-          ? (SymbolIndex.instance.symbolCount > 0
-              ? '内置索引'
-              : '内置规则')
+          ? (SymbolIndex.instance.symbolCount > 0 ? '内置索引' : '内置规则')
           : via;
       await _gotoLocation(workspace, loc, label: sourceLabel);
     } catch (e) {
@@ -657,6 +679,7 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
 
   @override
   void dispose() {
+    _signatureDebounce?.cancel();
     _localCheckTimer?.cancel();
     _diagnostics?.clearFile(widget.path);
     _workspace?.removeListener(_onWorkspaceChanged);
@@ -664,11 +687,17 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
     HardwareKeyboard.instance.removeHandler(_onHardwareKey);
     _controller.removeListener(_onChanged);
     _controller.dispose();
+    _findController.dispose();
     _focusNode.dispose();
     super.dispose();
   }
 
   void _onChanged() {
+    _signatureDebounce?.cancel();
+    _signatureDebounce = Timer(const Duration(milliseconds: 350), () {
+      if (!mounted) return;
+      if (_controller.text.contains('(')) _requestSignatureHelp();
+    });
     final dirty = _controller.text != _savedContent;
     if (_dirty != dirty) {
       setState(() => _dirty = dirty);
@@ -748,14 +777,12 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
     final settings = SettingsStore.instance;
     final overrideCmd = settings.languageServerCommand(spec.id);
     if (overrideCmd != null && overrideCmd.trim().isNotEmpty) return true;
-    final present =
-        await BundledLanguageServers.instance.binaryPathIfPresent(spec.id);
+    final present = await BundledLanguageServers.instance.binaryPathIfPresent(
+      spec.id,
+    );
     if (present != null) return true;
     // PATH 上已有命令也视为可用，不再下载。
-    final onPath = await service.isAvailable(
-      spec,
-      ensureBundled: false,
-    );
+    final onPath = await service.isAvailable(spec, ensureBundled: false);
     if (onPath) return true;
 
     final consent = service.packConsent(spec);
@@ -763,8 +790,7 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
     if (consent == false) return false;
     if (!mounted) return false;
 
-    final consentId =
-        spec.id == 'html-via-ts' ? 'typescript' : spec.id;
+    final consentId = spec.id == 'html-via-ts' ? 'typescript' : spec.id;
     if (_promptingPackIds.contains(consentId)) return false;
     _promptingPackIds.add(consentId);
     try {
@@ -775,10 +801,7 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
           final colors = IdeColors.of(ctx);
           return AlertDialog(
             backgroundColor: colors.panel,
-            title: Text(
-              '下载语言包？',
-              style: TextStyle(color: colors.textPrimary),
-            ),
+            title: Text('下载语言包？', style: TextStyle(color: colors.textPrimary)),
             content: Text(
               '检测到 ${spec.label} 尚未安装。\n'
               '下载后将保存到应用支持目录，用于代码诊断与跳转。\n'
@@ -801,11 +824,13 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
       );
       await service.setPackConsent(spec, ok == true);
       if (ok == true && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('正在下载 ${spec.label}…')),
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('正在下载 ${spec.label}…')));
+        final path = await BundledLanguageServers.instance.ensureInstalled(
+          consentId,
+          force: false,
         );
-        final path = await BundledLanguageServers.instance
-            .ensureInstalled(consentId, force: false);
         if (!mounted) return path != null;
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -813,7 +838,7 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
               path != null
                   ? '${spec.label} 已就绪'
                   : (BundledLanguageServers.instance.lastErrorFor(consentId) ??
-                      '下载失败'),
+                        '下载失败'),
             ),
           ),
         );
@@ -821,7 +846,10 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
         if (path != null) {
           final store = _diagnostics ?? DiagnosticsScope.maybeOf(context);
           final version = store?.contentVersionOf(widget.path) ?? _docVersion;
-          _runLocalTscCheck(version: version <= 0 ? 1 : version, text: _controller.text);
+          _runLocalTscCheck(
+            version: version <= 0 ? 1 : version,
+            text: _controller.text,
+          );
         }
         return path != null;
       }
@@ -835,8 +863,9 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
     final root = _workspace?.rootPath;
     if (root == null) return;
     final settings = SettingsStore.instance;
-    final spec = DefinitionService.instance
-        .specForExtension(p.extension(widget.path).toLowerCase());
+    final spec = DefinitionService.instance.specForExtension(
+      p.extension(widget.path).toLowerCase(),
+    );
     if (spec == null) return;
     final overrideCmd = settings.languageServerCommand(spec.id);
     // 首次打开：弹窗询问是否下载语言包（Zed 式按需，不预置进安装包）。
@@ -905,10 +934,12 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
       // 当前文件：用到达时的 contentVersion 写入，避免异步诊断被后续编辑误丢。
       final versionNow = store.contentVersionOf(path);
       final clamped = diagnostics
-          .map((d) => _clampDiagnostic(
-                d,
-                path == widget.path ? _controller.text : null,
-              ))
+          .map(
+            (d) => _clampDiagnostic(
+              d,
+              path == widget.path ? _controller.text : null,
+            ),
+          )
           .toList(growable: false);
       store.setForFileSource(
         path: path,
@@ -919,9 +950,10 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
     });
     // 同步最新文本；若上面安装较慢，用当前文档版本。
     final latestVersion =
-        (_diagnostics ?? DiagnosticsScope.maybeOf(context))
-                ?.contentVersionOf(widget.path) ??
-            version;
+        (_diagnostics ?? DiagnosticsScope.maybeOf(context))?.contentVersionOf(
+          widget.path,
+        ) ??
+        version;
     client.didChangeIncremental(
       widget.path,
       _controller.text,
@@ -936,8 +968,7 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
     final maxLine = (lines.length - 1).clamp(0, 1 << 30);
     final startLine = d.startLine.clamp(0, maxLine);
     final endLine = d.endLine.clamp(0, maxLine);
-    final startChar =
-        d.startChar.clamp(0, lines[startLine].length);
+    final startChar = d.startChar.clamp(0, lines[startLine].length);
     final endChar = d.endChar.clamp(0, lines[endLine].length);
     if (startLine == d.startLine &&
         endLine == d.endLine &&
@@ -980,6 +1011,7 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
       _error = null;
       _dirty = false;
       _isLargeFile = false;
+      _largeFileEditMode = false;
       _gotoLine = null;
       _gotoStart = null;
       _gotoEnd = null;
@@ -987,8 +1019,12 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
 
     try {
       final stat = await File(widget.path).stat();
-      final content = await _readText(widget.path);
+      final fullContent = await _readText(widget.path);
       if (!mounted) return;
+      final isLarge = stat.size > _largeFileBytes;
+      final content = isLarge && !_largeFileExpanded
+          ? fullContent.split('\n').take(_largeFileWindowLines).join('\n')
+          : fullContent;
       _savedContent = content;
       _controller.text = content;
       setState(() {
@@ -996,9 +1032,13 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
         _dirty = false;
         _isLargeFile = stat.size > _largeFileBytes;
       });
+      if (isLarge && !_largeFileExpanded && mounted) {
+        setState(() => _gotoHint = '大文件窗口化：仅加载前 $_largeFileWindowLines 行，保存前请先加载全部或确认局部编辑。');
+      }
       final workspace = WorkspaceScope.maybeOf(context);
       workspace?.setDirty(widget.path, false);
       workspace?.rememberDiskStamp(widget.path);
+      workspace?.clearOverwriteConfirm(widget.path);
       _scheduleLocalIntegrityCheck(immediate: true);
       await _applyRevealIfAny();
     } catch (error) {
@@ -1014,11 +1054,68 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
     if (widget.readOnly || _loading || _error != null || _saving) {
       return false;
     }
+    if (_isLargeFile && !_largeFileExpanded && !_largeFileEditMode) {
+      if (mounted) {
+        ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+          const SnackBar(content: Text('大文件窗口化：请先加载全部或开启局部编辑后再保存')),
+        );
+      }
+      return false;
+    }
     if (!_dirty) return true;
+
+    // 保存前冲突检测：自动保存/Agent/外部在加载后改过磁盘则转冲突，
+    // 不静默覆盖。手动保存同样走此门禁（此前仅自动保存跳过冲突文件）。
+    final workspace = WorkspaceScope.maybeOf(context);
+    if (workspace != null &&
+        (workspace.hasConflict(widget.path) ||
+            workspace.diskChangedSinceStamp(widget.path))) {
+      workspace.markConflict(widget.path);
+      if (mounted) {
+        ScaffoldMessenger.maybeOf(context)?.showSnackBar(
+          const SnackBar(content: Text('磁盘已被外部修改，已转冲突抉择，不覆盖保存')),
+        );
+      }
+      return false;
+    }
+    // 待覆盖确认：冲突选"保留本地"后下次手动保存前再确认一次。
+    if (workspace != null && workspace.needsOverwriteConfirm(widget.path)) {
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('覆盖磁盘改动？'),
+          content: const Text('磁盘已有外部改动，上次你选择了保留本地。确定用本地覆盖磁盘吗？'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('覆盖保存'),
+            ),
+          ],
+        ),
+      );
+      if (ok != true) return false;
+      workspace.clearOverwriteConfirm(widget.path);
+    }
 
     setState(() => _saving = true);
     try {
-      await File(widget.path).writeAsString(_controller.text, encoding: utf8);
+      // 原子写：tmp+flush+rename，避免与 Agent/自动保存并发时半写；
+      // 写后更新磁盘戳，避免外部监听把自写误判为冲突。
+      final target = File(widget.path);
+      final tmp = File('${widget.path}.${DateTime.now().microsecondsSinceEpoch}.tmp');
+      await tmp.writeAsString(_controller.text, encoding: utf8, flush: true);
+      try {
+        await tmp.rename(widget.path);
+      } catch (_) {
+        await target.writeAsString(_controller.text, encoding: utf8, flush: true);
+        try {
+          if (await tmp.exists()) await tmp.delete();
+        } catch (_) {}
+      }
       if (!mounted) return true;
       _savedContent = _controller.text;
       setState(() {
@@ -1029,18 +1126,15 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
       workspace?.setDirty(widget.path, false);
       workspace?.rememberDiskStamp(widget.path);
       // 保存后增量更新符号索引
-      SymbolIndex.instance.reindexFile(
-        widget.path,
-        content: _controller.text,
-      );
+      SymbolIndex.instance.reindexFile(widget.path, content: _controller.text);
       await widget.onSaved?.call(widget.path);
       return true;
     } catch (error) {
       if (!mounted) return false;
       setState(() => _saving = false);
-      ScaffoldMessenger.maybeOf(context)?.showSnackBar(
-        SnackBar(content: Text('保存失败：$error')),
-      );
+      ScaffoldMessenger.maybeOf(
+        context,
+      )?.showSnackBar(SnackBar(content: Text('保存失败：$error')));
       return false;
     }
   }
@@ -1123,8 +1217,9 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
       );
     }
 
-    final highlightTheme =
-        normalizeHighlightTheme(themeController.highlightTheme);
+    final highlightTheme = normalizeHighlightTheme(
+      themeController.highlightTheme,
+    );
     final languages = _buildHighlightLanguages();
 
     return Container(
@@ -1134,25 +1229,25 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
         children: [
           if (_isLargeFile)
             Container(
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
               decoration: BoxDecoration(
                 color: colors.panelHover,
-                border: Border(
-                  bottom: BorderSide(color: colors.borderStrong),
-                ),
+                border: Border(bottom: BorderSide(color: colors.borderStrong)),
               ),
               child: Row(
                 children: [
-                  Icon(Icons.warning_amber_rounded, size: 14, color: colors.accent),
+                  Icon(
+                    Icons.warning_amber_rounded,
+                    size: 14,
+                    color: colors.accent,
+                  ),
                   const SizedBox(width: 6),
                   Expanded(
                     child: Text(
-                      '文件较大，已按只读打开（${_largeFileBytes} 阈值）。可编辑另存为其它文件。',
-                      style: TextStyle(
-                        color: colors.textMuted,
-                        fontSize: 12,
-                      ),
+                      _largeFileEditMode
+                          ? '大文件局部编辑模式：保存前请确认。'
+                          : '文件较大，默认安全只读打开；可切换局部编辑模式。',
+                      style: TextStyle(color: colors.textMuted, fontSize: 12),
                     ),
                   ),
                 ],
@@ -1160,127 +1255,362 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
             ),
           if (_gotoHint != null)
             Container(
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
               decoration: BoxDecoration(
                 color: colors.accentSoft,
-                border: Border(
-                  bottom: BorderSide(color: colors.border),
-                ),
+                border: Border(bottom: BorderSide(color: colors.border)),
               ),
               child: Text(
                 _gotoHint!,
                 style: TextStyle(color: colors.textSecondary, fontSize: 12),
               ),
             ),
-          Expanded(
-            child: Listener(
-              onPointerDown: (event) {
-                if (!_gotoModifierPressed) return;
-                // 跟光标位置：先刷新目标词，再跳转
-                _updateGotoTargetFromSelection();
-                final line = _gotoLine ?? _controller.selection.extentIndex;
-                final character = (_gotoStart != null && _gotoEnd != null)
-                    ? ((_gotoStart! + _gotoEnd!) ~/ 2)
-                    : _controller.selection.extentOffset;
-                jumpToDefinitionAtCursor(line: line, character: character);
-              },
-              child: CodeAutocomplete(
-                  viewBuilder: (context, notifier, onSelected) {
-                    return IdeCodeAutocompleteListView(
-                      notifier: notifier,
-                      onSelected: onSelected,
-                    );
-                  },
-                  promptsBuilder: IdeCompletionPromptsBuilder(
-                    languageId: _language.id,
-                    languageMode: _languageMode,
-                    controller: _controller,
+          if (_isLargeFile)
+            Align(
+              alignment: Alignment.centerRight,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextButton(
+                    // 加载全部：置 expanded 后重载整文件，再次保存即放行。
+                    onPressed: widget.readOnly || _largeFileExpanded
+                        ? null
+                        : () {
+                            setState(() => _largeFileExpanded = true);
+                            // ignore: discarded_futures
+                            _load();
+                          },
+                    child: Text(_largeFileExpanded ? '已加载全部' : '加载全部'),
                   ),
-                  child: CodeEditor(
-                    controller: _controller,
-                    focusNode: _focusNode,
-                    readOnly: widget.readOnly || _isLargeFile,
-                    autofocus: false,
-                    wordWrap: false,
-                    padding: const EdgeInsets.only(left: 4, right: 12),
-                    style: CodeEditorStyle(
-                      fontSize: 12.5,
-                      fontFamily: 'Menlo',
-                      fontHeight: 1.55,
-                      textColor: colors.textPrimary,
-                      backgroundColor: colors.panelElevated,
-                      selectionColor: colors.accent.withValues(alpha: 0.28),
-                      cursorColor: colors.accent,
-                      cursorLineColor: colors.panelHover,
-                      codeTheme: languages.isEmpty
-                          ? null
-                          : CodeHighlightTheme(
-                              languages: languages,
-                              theme: highlightTheme,
-                            ),
-                    ),
-                    indicatorBuilder: (
-                      context,
-                      editingController,
-                      chunkController,
-                      notifier,
-                    ) {
-                      final store =
-                          _diagnostics ?? DiagnosticsScope.maybeOf(context);
-                      return Container(
-                        color: colors.panel,
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            DefaultCodeLineNumber(
-                              controller: editingController,
-                              notifier: notifier,
-                            ),
-                            SizedBox(
-                              width: 10,
-                              child: AnimatedBuilder(
-                                animation: Listenable.merge([
-                                  notifier,
-                                  if (store != null) store,
-                                ]),
-                                builder: (context, _) {
-                                  final map = store
-                                          ?.severitiesByLine(widget.path) ??
-                                      const <int, DiagnosticSeverity>{};
-                                  return CustomPaint(
-                                    size: Size(
-                                      10,
-                                      MediaQuery.sizeOf(context).height,
-                                    ),
-                                    painter: _DiagnosticGutterPainter(
-                                      notifier: notifier,
-                                      severities: map,
-                                    ),
-                                  );
-                                },
-                              ),
-                            ),
-                          ],
-                        ),
+                  TextButton(
+                    onPressed: widget.readOnly
+                        ? null
+                        : () => setState(
+                            () => _largeFileEditMode = !_largeFileEditMode,
+                          ),
+                    child: Text(_largeFileEditMode ? '恢复只读' : '局部编辑'),
+                  ),
+                ],
+              ),
+            ),
+          if (_signatureHint != null)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              decoration: BoxDecoration(
+                color: colors.panel,
+                border: Border(bottom: BorderSide(color: colors.border)),
+              ),
+              child: Text(
+                _signatureHint!,
+                style: TextStyle(color: colors.textMuted, fontSize: 12),
+              ),
+            ),
+          Row(
+            children: [
+              IconButton(
+                tooltip: '查找',
+                icon: const Icon(Icons.search, size: 16),
+                onPressed: _findController.findMode,
+              ),
+              IconButton(
+                tooltip: '替换',
+                icon: const Icon(Icons.find_replace, size: 16),
+                onPressed: _findController.replaceMode,
+              ),
+              const Spacer(),
+              TextButton(
+                onPressed: _requestSignatureHelp,
+                child: const Text('签名'),
+              ),
+              Switch.adaptive(
+                value: _wordWrap,
+                onChanged: (value) => setState(() => _wordWrap = value),
+              ),
+              const Text('软换行'),
+              Switch.adaptive(
+                value: _showMinimap,
+                onChanged: (value) => setState(() => _showMinimap = value),
+              ),
+              const Text('小地图'),
+            ],
+          ),
+          Expanded(
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Expanded(
+                  child: Listener(
+                    onPointerDown: (event) {
+                      if (!_gotoModifierPressed) return;
+                      // 跟光标位置：先刷新目标词，再跳转
+                      _updateGotoTargetFromSelection();
+                      final line =
+                          _gotoLine ?? _controller.selection.extentIndex;
+                      final character =
+                          (_gotoStart != null && _gotoEnd != null)
+                          ? ((_gotoStart! + _gotoEnd!) ~/ 2)
+                          : _controller.selection.extentOffset;
+                      jumpToDefinitionAtCursor(
+                        line: line,
+                        character: character,
                       );
                     },
-                    shortcutOverrideActions: {
-                      CodeShortcutSaveIntent:
-                          CallbackAction<CodeShortcutSaveIntent>(
-                        onInvoke: (intent) {
-                          save();
-                          return null;
+                    child: CodeAutocomplete(
+                      viewBuilder: (context, notifier, onSelected) {
+                        return IdeCodeAutocompleteListView(
+                          notifier: notifier,
+                          onSelected: onSelected,
+                        );
+                      },
+                      promptsBuilder: IdeCompletionPromptsBuilder(
+                        languageId: _language.id,
+                        languageMode: _languageMode,
+                        controller: _controller,
+                      ),
+                      child: CodeEditor(
+                        controller: _controller,
+                        focusNode: _focusNode,
+                        readOnly:
+                            widget.readOnly ||
+                            (_isLargeFile && !_largeFileEditMode),
+                        autofocus: false,
+                        findController: _findController,
+                        findBuilder: (context, controller, readonly) =>
+                            _CodeFindBar(controller: controller),
+                        wordWrap: _wordWrap,
+                        padding: const EdgeInsets.only(left: 4, right: 12),
+                        style: CodeEditorStyle(
+                          fontSize: 12.5,
+                          fontFamily: 'Menlo',
+                          fontHeight: 1.55,
+                          textColor: colors.textPrimary,
+                          backgroundColor: colors.panelElevated,
+                          selectionColor: colors.accent.withValues(alpha: 0.28),
+                          cursorColor: colors.accent,
+                          cursorLineColor: colors.panelHover,
+                          codeTheme: languages.isEmpty
+                              ? null
+                              : CodeHighlightTheme(
+                                  languages: languages,
+                                  theme: highlightTheme,
+                                ),
+                        ),
+                        indicatorBuilder:
+                            (context, editingController, chunkController, notifier) {
+                          final store =
+                              _diagnostics ?? DiagnosticsScope.maybeOf(context);
+                          return Container(
+                            color: colors.panel,
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                DefaultCodeLineNumber(
+                                  controller: editingController,
+                                  notifier: notifier,
+                                ),
+                                SizedBox(
+                                  width: 10,
+                                  child: AnimatedBuilder(
+                                    animation: Listenable.merge([
+                                      notifier,
+                                      if (store != null) store,
+                                    ]),
+                                    builder: (context, _) {
+                                      final map =
+                                          store?.severitiesByLine(
+                                            widget.path,
+                                          ) ??
+                                          const <int, DiagnosticSeverity>{};
+                                      return CustomPaint(
+                                        size: Size(
+                                          10,
+                                          MediaQuery.sizeOf(context).height,
+                                        ),
+                                        painter: _DiagnosticGutterPainter(
+                                          notifier: notifier,
+                                          severities: map,
+                                        ),
+                                      );
+                                    },
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                        },
+                        shortcutOverrideActions: {
+                          CodeShortcutSaveIntent:
+                              CallbackAction<CodeShortcutSaveIntent>(
+                                onInvoke: (intent) {
+                                  save();
+                                  return null;
+                                },
+                              ),
                         },
                       ),
-                    },
+                    ),
                   ),
+                ),
+              if (_showMinimap)
+                SizedBox(
+                  width: 72,
+                  child: _EditorMinimap(
+                    controller: _controller,
+                    textColor: colors.textMuted,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _requestSignatureHelp() async {
+    final workspace = _workspace ?? WorkspaceScope.maybeOf(context);
+    final root = workspace?.rootPath;
+    if (root == null) {
+      setState(() => _signatureHint = '请先打开项目');
+      return;
+    }
+    final selection = _controller.selection;
+    final line = selection.extentIndex.clamp(
+      0,
+      _controller.codeLines.length - 1,
+    );
+    final lineText = _controller.codeLines[line].text;
+    final character = selection.extentOffset.clamp(0, lineText.length);
+    final spec = DefinitionService.instance.specForExtension(
+      p.extension(widget.path).toLowerCase(),
+    );
+    if (spec == null) {
+      setState(() => _signatureHint = '当前文件类型无语言服务');
+      return;
+    }
+    setState(() => _signatureHint = '请求签名中…');
+    try {
+      final client = await DefinitionService.instance.clientFor(
+        rootPath: root,
+        spec: spec,
+      );
+      if (client == null) {
+        if (!mounted) return;
+        setState(() => _signatureHint = DefinitionService.instance.lastStartError ?? '语言服务未启动');
+        return;
+      }
+      final help = await client.signatureHelp(
+        filePath: widget.path,
+        line: line,
+        character: character,
+      );
+      if (!mounted) return;
+      final signatures = (help?['signatures'] as List?) ?? const [];
+      final active = (help?['activeSignature'] as num?)?.toInt() ?? 0;
+      final item = active >= 0 && active < signatures.length ? signatures[active] as Map : null;
+      final label = '${item?['label'] ?? ''}'.trim();
+      setState(() => _signatureHint = label.isEmpty ? '无可用签名' : label);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _signatureHint = '签名请求失败：$e');
+    }
+  }
+}
+
+class _EditorMinimap extends StatelessWidget {
+  const _EditorMinimap({required this.controller, required this.textColor});
+
+  final CodeLineEditingController controller;
+  final Color textColor;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: controller,
+      builder: (context, _) {
+        final total = controller.codeLines.length;
+        final start = (controller.selection.extentIndex - 80).clamp(0, total);
+        final end = (controller.selection.extentIndex + 160).clamp(0, total);
+        final lines = [for (var i = start; i < end; i++) controller.codeLines[i]];
+        return Container(
+          color: Theme.of(context).colorScheme.surfaceContainerHighest.withValues(alpha: 0.35),
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 8),
+          child: SingleChildScrollView(
+            child: Text(
+              lines.map((e) => e.text).join('\n'),
+              style: TextStyle(color: textColor, fontSize: 5, height: 1.1),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _CodeFindBar extends StatelessWidget implements PreferredSizeWidget {
+  const _CodeFindBar({required this.controller});
+
+  final CodeFindController controller;
+
+  @override
+  Size get preferredSize => const Size.fromHeight(42);
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Theme.of(context).colorScheme.surface,
+      child: Row(
+        children: [
+          Expanded(
+            child: TextField(
+              controller: controller.findInputController,
+              focusNode: controller.findInputFocusNode,
+              autofocus: true,
+              decoration: const InputDecoration(
+                hintText: '查找',
+                isDense: true,
+                border: InputBorder.none,
+              ),
+              onSubmitted: (_) => controller.nextMatch(),
+            ),
+          ),
+          if (controller.value?.replaceMode == true)
+            SizedBox(
+              width: 130,
+              child: TextField(
+                controller: controller.replaceInputController,
+                focusNode: controller.replaceInputFocusNode,
+                decoration: const InputDecoration(
+                  hintText: '替换为',
+                  isDense: true,
+                  border: InputBorder.none,
                 ),
               ),
             ),
-          ],
-        ),
-      );
+          IconButton(
+            tooltip: '上一个',
+            icon: const Icon(Icons.keyboard_arrow_up, size: 18),
+            onPressed: controller.previousMatch,
+          ),
+          IconButton(
+            tooltip: '下一个',
+            icon: const Icon(Icons.keyboard_arrow_down, size: 18),
+            onPressed: controller.nextMatch,
+          ),
+          if (controller.value?.replaceMode == true)
+            IconButton(
+              tooltip: '全部替换',
+              icon: const Icon(Icons.find_replace, size: 18),
+              onPressed: controller.replaceAllMatches,
+            ),
+          IconButton(
+            tooltip: '关闭',
+            icon: const Icon(Icons.close, size: 18),
+            onPressed: controller.close,
+          ),
+        ],
+      ),
+    );
   }
 }
 
@@ -1320,10 +1650,7 @@ String _decodeUtf16(List<int> bytes, {required bool littleEndian}) {
 }
 
 class _DiagnosticGutterPainter extends CustomPainter {
-  _DiagnosticGutterPainter({
-    required this.notifier,
-    required this.severities,
-  });
+  _DiagnosticGutterPainter({required this.notifier, required this.severities});
 
   final ValueNotifier<CodeIndicatorValue?> notifier;
   final Map<int, DiagnosticSeverity> severities;

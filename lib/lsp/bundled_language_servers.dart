@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
+
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -184,9 +186,12 @@ class BundledLanguageServers {
     if (await tmp.exists()) await tmp.delete(recursive: true);
     await tmp.create(recursive: true);
     try {
+      final checksum = await _verifyArchiveChecksum(archive);
+      if (!checksum) return false;
       final zstd = await _findZstd();
       if (zstd == null) {
-        _lastError[folder] = '未找到 zstd，无法解压语言服务压缩包';
+        _lastError[folder] =
+            '系统未提供 zstd，已回退到在线安装；如需离线安装请随包提供 zstd';
         return false;
       }
       // zstd -dc archive | tar -x -C tmp
@@ -836,6 +841,27 @@ class BundledLanguageServers {
     } catch (_) {
       return const [];
     }
+  }
+
+  Future<bool> _verifyArchiveChecksum(File archive) async {
+    final checksumFile = File('${archive.path}.sha256');
+    final signatureFile = File('${archive.path}.sig');
+    if (!await checksumFile.exists()) return true;
+    final expected = (await checksumFile.readAsString()).trim().split(RegExp(r'\s+')).first.toLowerCase();
+    if (!RegExp(r'^[0-9a-f]{64}$').hasMatch(expected)) {
+      _lastError[p.basenameWithoutExtension(archive.path)] = '语言包 SHA-256 文件格式无效';
+      return false;
+    }
+    final actual = sha256.convert(await archive.readAsBytes()).toString();
+    if (actual != expected) {
+      _lastError[p.basenameWithoutExtension(archive.path)] = '语言包 SHA-256 校验失败';
+      return false;
+    }
+    if (await signatureFile.exists()) {
+      _lastError[p.basenameWithoutExtension(archive.path)] =
+          '语言包附带签名文件，但当前版本仅完成 SHA-256 校验，尚未启用签名公钥验证';
+    }
+    return true;
   }
 
   Future<String?> _findZstd() async {

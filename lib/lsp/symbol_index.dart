@@ -34,10 +34,24 @@ class IndexedSymbol {
       );
 }
 
+/// LSP 引用查询注入点：由外部（如 DefinitionService/LSP 客户端）注入，
+/// 无注入时回退本地正则索引。
+typedef LspReferencesQuery = Future<List<LspLocation>> Function({
+  required String filePath,
+  required String name,
+  required int line,
+  required int character,
+});
+
 /// 工作区符号索引：打开项目时后台扫描，跳转优先查表。
 class SymbolIndex {
   SymbolIndex._();
   static final SymbolIndex instance = SymbolIndex._();
+
+  /// 可注入的 LSP references 查询；测试可替换。
+  LspReferencesQuery? queryReferencesLsp;
+  /// 索引文件数上限；复用 prefs `workspaceMaxFiles`（默认 8000）。
+  int maxFilesOverride = 8000;
 
   String? _rootPath;
   /// name -> 候选定义（按 priority 降序）
@@ -111,6 +125,7 @@ class SymbolIndex {
     try {
       final result = await compute(_indexIsolate, <String, Object?>{
         'rootPath': root,
+        'maxFiles': maxFilesOverride,
       });
       if (gen != _generation) return;
       _byName
@@ -154,6 +169,11 @@ class SymbolIndex {
 
     String text;
     try {
+      // 先判大小再读：主 isolate 单文件 utf8.encode+sha1 全文，大文件直接爆内存。
+      if (content == null) {
+        final size = await File(absolutePath).length();
+        if (size > 1024 * 1024) return;
+      }
       text = content ?? await File(absolutePath).readAsString();
     } catch (_) {
       return;
@@ -216,6 +236,35 @@ class SymbolIndex {
       if (p.equals(s.filePath, filePath) && s.line == line) return s;
     }
     return null;
+  }
+
+  /// 反向引用：排除定义本体；同文件优先。
+  /// 已注入 [queryReferencesLsp] 时优先走 LSP（异步），失败回退正则。
+  Future<List<LspLocation>> findReferencesAsync({
+    required String name,
+    required String filePath,
+    required int line,
+    required int character,
+    String? currentPath,
+    int? currentLine,
+  }) async {
+    final injected = queryReferencesLsp;
+    if (injected != null) {
+      try {
+        final lsp = await injected(
+          filePath: filePath,
+          name: name,
+          line: line,
+          character: character,
+        );
+        if (lsp.isNotEmpty) return lsp;
+      } catch (_) {}
+    }
+    return findReferences(
+      name: name,
+      currentPath: currentPath ?? filePath,
+      currentLine: currentLine ?? line,
+    );
   }
 
   /// 反向引用：排除定义本体；同文件优先。
@@ -297,6 +346,19 @@ class SymbolIndex {
   List<IndexedSymbol> allForName(String name) =>
       List.unmodifiable(_byName[name] ?? const []);
 
+  /// 大纲用：取前 [limit] 个符号（按名字排序），空索引返回空。
+  List<IndexedSymbol> topSymbols({int limit = 200}) {
+    final all = <IndexedSymbol>[];
+    final names = _byName.keys.toList()..sort();
+    for (final n in names) {
+      for (final s in _byName[n] ?? const <IndexedSymbol>[]) {
+        all.add(s);
+        if (all.length >= limit) return all;
+      }
+    }
+    return all;
+  }
+
   // —— isolate ——
 
   static Map<String, Object?> _indexIsolate(Map<String, Object?> job) {
@@ -309,7 +371,7 @@ class SymbolIndex {
     var refCount = 0;
     var skipped = 0;
     const maxFileBytes = 1024 * 1024;
-    const maxFiles = 8000;
+    final maxFiles = (job['maxFiles'] as num?)?.toInt() ?? 8000;
 
     var filesDone = 0;
     final root = Directory(rootPath);

@@ -126,3 +126,13 @@ if(NOT CMAKE_BUILD_TYPE MATCHES "Debug")
   install(FILES "${AOT_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
     COMPONENT Runtime)
 endif()
+
+# Linux desktop integration: .desktop entry + hicolor icon.
+# APPLICATION_ID=com.example.my_ide，桌面文件与图标名保持一致，
+# flutter build linux --release 后自动落到 bundle/share/ 下。
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/com.example.my_ide.desktop"
+  DESTINATION "${CMAKE_INSTALL_PREFIX}/share/applications"
+  COMPONENT Runtime)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/icons/hicolor/512x512/apps/my_ide.png"
+  DESTINATION "${CMAKE_INSTALL_PREFIX}/share/icons/hicolor/512x512/apps"
+  COMPONENT Runtime)

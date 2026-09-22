@@ -1,10 +1,15 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
+
+import '../fs/workspace_fs.dart';
+import '../settings/settings_store.dart';
 
 enum FileKind { text, image, svg, unsupported }
 
@@ -14,12 +19,15 @@ class WorkspaceFile {
     required this.name,
     required this.isDirectory,
     this.children = const [],
+    this.childrenLoaded = true,
   });
 
   final String path;
   final String name;
   final bool isDirectory;
   final List<WorkspaceFile> children;
+  /// 懒加载标记：false 表示子目录尚未展开，占位空 children。
+  final bool childrenLoaded;
 }
 
 class RevealTarget {
@@ -73,6 +81,8 @@ class _ProcessProjectLocks {
 }
 
 class WorkspaceController extends ChangeNotifier {
+  static final Random _rng = Random.secure();
+  bool _disposed = false;
   String? _rootPath;
   List<WorkspaceFile> _tree = const [];
   final List<OpenEditorTab> _tabs = [];
@@ -95,11 +105,19 @@ class WorkspaceController extends ChangeNotifier {
   Timer? _watchDebounce;
   /// 脏冲突：磁盘已变但本地有未保存缓冲，等待用户抉择，不静默覆盖。
   final Set<String> _conflictPaths = <String>{};
+  /// 覆盖确认：冲突选"保留本地"后，下次手动保存前再确认一次
+  /// （选对话框和按保存可能隔很久，避免用户忘记而覆盖磁盘改动）。
+  final Set<String> _overwriteConfirmPending = <String>{};
   /// 外部冲突回调（UI 侧弹窗抉择）。参数为绝对路径列表。
   void Function(List<String> conflicts)? onExternalConflict;
 
   Set<String> get conflictPaths => Set.unmodifiable(_conflictPaths);
   bool hasConflict(String path) => _conflictPaths.contains(path);
+  bool needsOverwriteConfirm(String path) =>
+      _overwriteConfirmPending.contains(path);
+  void clearOverwriteConfirm(String path) {
+    _overwriteConfirmPending.remove(path);
+  }
 
   /// 编辑器三向合并时标记冲突（本地有未保存缓冲 + 磁盘已变），由 UI 抉择，不静默覆盖。
   void markConflict(String path) {
@@ -118,6 +136,8 @@ class WorkspaceController extends ChangeNotifier {
     _conflictPaths.remove(path);
     if (keepLocal == true) {
       rememberDiskStamp(path);
+      // 下次手动保存覆盖磁盘前再确认一次；自动保存跳过此类文件。
+      _overwriteConfirmPending.add(path);
     } else {
       _dirtyPaths.remove(path);
       final index = _tabs.indexWhere((tab) => tab.path == path);
@@ -173,6 +193,14 @@ class WorkspaceController extends ChangeNotifier {
     } catch (_) {}
   }
 
+  /// 保存前冲突检测：磁盘在编辑器加载/上次保存后被外部改写过则为 true。
+  bool diskChangedSinceStamp(String path) {
+    final recorded = _diskMtimeMs[path];
+    if (recorded == null) return false;
+    final current = _currentMtimeMs(path);
+    return current != null && current != recorded;
+  }
+
   int? _currentMtimeMs(String path) {
     try {
       final stat = File(path).statSync();
@@ -184,9 +212,20 @@ class WorkspaceController extends ChangeNotifier {
   }
 
   /// 编辑器落盘回调注册：CodeEditorPane 挂载时注册，卸载时注销。
-  /// 发送前 saveAll 靠它把已挂载编辑器的未保存内容落盘；
-  /// 未挂载的脏 tab 无法取到缓冲，只靠 dirtyPaths 记版本，不静默丢弃。
+  /// 发送前 saveAll 靠它把已挂载编辑器的未保存内容落盘。
   final Map<String, Future<bool> Function()> _saveHandlers = {};
+
+  /// S5：卸载时暂存的未保存缓冲。编辑器切走 tab（pane 卸载）时若有
+  /// 未保存内容，缓冲随 controller 一起销毁；暂存到这里后，
+  /// 下次挂载 _load 优先恢复，避免"显示脏但内容已是磁盘版"的不一致。
+  /// 进程内有效；崩溃丢失由周期自动保存兜底。
+  final Map<String, String> _draftBuffers = {};
+
+  void stashDraft(String path, String text) {
+    _draftBuffers[path] = text;
+  }
+
+  String? takeDraft(String path) => _draftBuffers.remove(path);
 
   void registerSaveHandler(String path, Future<bool> Function() save) {
     _saveHandlers[path] = save;
@@ -207,6 +246,116 @@ class WorkspaceController extends ChangeNotifier {
       } catch (_) {}
     }
     return saved;
+  }
+
+  /// 周期性自动落盘：崩溃/断电时不至于丢光未保存编辑。
+  /// 处于外部冲突状态的文件跳过，留给用户在对话框里抉择。
+  /// 待覆盖确认的文件也跳过：自动保存不能弹框，留给用户手动保存时确认。
+  /// 重入守卫：大脏文件多时上周期未跑完，下周期直接跳过，避免叠加。
+  bool _autosaving = false;
+
+  Future<List<String>> autosaveDirtyTabs() async {
+    if (_autosaving) return const [];
+    _autosaving = true;
+    try {
+      final saved = <String>[];
+      for (final entry in List.of(_saveHandlers.entries)) {
+        if (!_dirtyPaths.contains(entry.key)) continue;
+        if (_conflictPaths.contains(entry.key)) continue;
+        if (_overwriteConfirmPending.contains(entry.key)) continue;
+        try {
+          final ok = await entry.value();
+          if (ok) saved.add(entry.key);
+        } catch (_) {}
+      }
+      return saved;
+    } finally {
+      _autosaving = false;
+    }
+  }
+
+  Timer? _autosaveTimer;
+
+  void _startAutosave() {
+    _autosaveTimer?.cancel();
+    _autosaveTimer = Timer.periodic(const Duration(minutes: 1), (_) {
+      // ignore: unawaited_futures
+      autosaveDirtyTabs();
+    });
+  }
+
+  // ── 会话恢复（W3）：打开的标签随工作区持久化到 .my_ide/session.json ──
+  Timer? _sessionSaveDebounce;
+
+  /// 标签集合/激活态变化后防抖落盘，重启打开同一项目时恢复。
+  void scheduleSessionPersist() {
+    final root = _rootPath;
+    if (root == null) return;
+    _sessionSaveDebounce?.cancel();
+    _sessionSaveDebounce = Timer(const Duration(milliseconds: 300), () async {
+      await persistSessionNow();
+    });
+  }
+
+  /// 同步落盘当前标签布局：供退出/关闭工作区调用，避免 300ms 防抖被 cancel 丢数据。
+  Future<void> persistSessionNow() async {
+    _sessionSaveDebounce?.cancel();
+    _sessionSaveDebounce = null;
+    final root = _rootPath;
+    if (root == null) return;
+    try {
+      final file = File(p.join(root, '.my_ide', 'session.json'));
+      await file.parent.create(recursive: true);
+      final payload = jsonEncode({
+        'tabs': _tabs.map((t) => t.path).toList(),
+        'active': _activePath,
+      });
+      // 唯一侧车名：此前固定 `.tmp`，防抖落盘与退出落盘并发互盖丢布局。
+      // micros+随机：纯 micros 同微秒仍可同名。
+      final nonce =
+          '${DateTime.now().microsecondsSinceEpoch}-${_rng.nextInt(1 << 32).toRadixString(36)}';
+      final tmp = File('${file.path}.$nonce.tmp');
+      try {
+        await tmp.writeAsString(payload, flush: true);
+        try {
+          await tmp.rename(file.path);
+        } catch (_) {
+          await file.writeAsString(payload, flush: true);
+        }
+      } finally {
+        try {
+          if (await tmp.exists()) await tmp.delete();
+        } catch (_) {}
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _restoreSessionTabs() async {
+    final root = _rootPath;
+    if (root == null) return;
+    try {
+      final file = File(p.join(root, '.my_ide', 'session.json'));
+      if (!await file.exists()) return;
+      final data = jsonDecode(await file.readAsString());
+      if (data is! Map) return;
+      final tabs = data['tabs'];
+      if (tabs is List) {
+        for (final e in tabs) {
+          final path = p.normalize('$e');
+          // session.json 路径越狱拦截：crafted 项目此前任意 path
+          // 只判存在即 openFile 打开 /etc/passwd 等区外文件。
+          if (!_insideAfterRealpath(root, path)) continue;
+          if (await File(path).exists()) openFile(path);
+        }
+      }
+      final active = data['active'];
+      if (active is String &&
+          _tabs.any((t) => t.path == active)) {
+        _activePath = active;
+        _selectedPath = active;
+        notifyListeners();
+      }
+    } catch (_) {}
   }
 
   OpenEditorTab? get activeTab {
@@ -312,7 +461,6 @@ class WorkspaceController extends ChangeNotifier {
       await _deleteLockFileIfOwned(previousLock);
     }
     _ProcessProjectLocks.acquire(normalized, this);
-
     _rootPath = normalized;
     _tabs.clear();
     _dirtyPaths.clear();
@@ -327,10 +475,16 @@ class WorkspaceController extends ChangeNotifier {
     // 空目录 / 仅剩隐藏目录也当新项目打开，不报错。
     await loadTree();
     _startWatch();
+    _startAutosave();
+    await _restoreSessionTabs();
     return null;
   }
 
   Future<void> closeWorkspace() async {
+    _autosaveTimer?.cancel();
+    _autosaveTimer = null;
+    // 切项目/关窗前先同步落盘，避免 300ms 防抖被 cancel 丢标签布局。
+    await persistSessionNow();
     _stopWatch();
     final closing = _rootPath;
     if (closing != null) {
@@ -342,6 +496,10 @@ class WorkspaceController extends ChangeNotifier {
     _tabs.clear();
     _dirtyPaths.clear();
     _conflictPaths.clear();
+    // 旧项目闭包与全文缓冲必须清：否则 saveAll/autosave 会误调旧项目。
+    _saveHandlers.clear();
+    _draftBuffers.clear();
+    _overwriteConfirmPending.clear();
     _pathContentEpoch.clear();
     _diskMtimeMs.clear();
     _contentEpoch = 0;
@@ -355,6 +513,11 @@ class WorkspaceController extends ChangeNotifier {
 
   @override
   void dispose() {
+    _disposed = true;
+    _autosaveTimer?.cancel();
+    _autosaveTimer = null;
+    _sessionSaveDebounce?.cancel();
+    _sessionSaveDebounce = null;
     _stopWatch();
     // 窗口销毁时尽量释放项目锁，避免其它窗口永久打不开。
     final closing = _rootPath;
@@ -368,8 +531,13 @@ class WorkspaceController extends ChangeNotifier {
   void _stopWatch() {
     _watchDebounce?.cancel();
     _watchDebounce = null;
-    _watchSub?.cancel();
+    // cancel() 返回 Future 必须 await，否则残余事件仍回调旧 rootPath。
+    // 同步方法内无法 await，改为 unawaited 并加代际校验兜底（见 _onWatchEvent）。
+    final sub = _watchSub;
     _watchSub = null;
+    if (sub != null) {
+      unawaited(sub.cancel());
+    }
   }
 
   /// 外部变更可靠通道：Directory.watch 递归监听 + mtime 二次确认。
@@ -389,11 +557,25 @@ class WorkspaceController extends ChangeNotifier {
     }
   }
 
+  /// watch burst 处理完成后通知 UI 做 drift 快照。
+  /// checkpoint() 无变化返回 null，天然去重，高频调用安全；
+  /// `.my_ide` 自写目录已被忽略，无回环。
+  VoidCallback? onWorkspaceBurst;
+
   void _onWatchEvent(FileSystemEvent event) {
     if (_rootPath == null || _scanningExternal) return;
     if (_isIgnoredWatchPath(event.path)) return;
+    // 代际+root 双校验：_stopWatch 的 cancel() 是异步的，残余事件可能带着
+    // 旧 rootPath 回调，此处事件路径不在当前 root 下直接丢弃，不刷错树。
+    final root = _rootPath!;
+    if (!p.isWithin(root, event.path) && !p.equals(root, event.path)) {
+      return;
+    }
+    final gen = _openGeneration;
     _watchDebounce?.cancel();
     _watchDebounce = Timer(const Duration(milliseconds: 500), () {
+      // 500ms 内切了项目同样丢弃，不刷错树。
+      if (gen != _openGeneration) return;
       // ignore: unawaited_futures
       _handleWatchBurst();
     });
@@ -417,7 +599,7 @@ class WorkspaceController extends ChangeNotifier {
   /// watch 触发的增量扫描：脏 tab 磁盘变了只记冲突并回调 UI，不静默覆盖；
   /// 干净 tab 才走 notifyExternalChanges 重载；纯新建/删除只刷树。
   Future<void> _handleWatchBurst() async {
-    if (!_hasWorkspaceSafe || _scanningExternal) return;
+    if (_disposed || !_hasWorkspaceSafe || _scanningExternal) return;
     _scanningExternal = true;
     try {
       final changed = <String>[];
@@ -471,8 +653,18 @@ class WorkspaceController extends ChangeNotifier {
         } catch (_) {}
         notifyListeners();
       }
+      // 增量扫描落定后通知 UI 做 drift 快照（无变化则 checkpoint 返回 null）。
+      try {
+        onWorkspaceBurst?.call();
+      } catch (_) {}
     } finally {
       _scanningExternal = false;
+      // dispose 后在途 burst 不再 notify：ChangeNotifier 已销毁会抛。
+      if (!_disposed) {
+        try {
+          notifyListeners();
+        } catch (_) {}
+      }
     }
   }
 
@@ -481,6 +673,8 @@ class WorkspaceController extends ChangeNotifier {
 
   /// 跨窗口项目锁：`.my_ide/project.lock` 写入 PID。
   /// 若锁进程仍存活则拒绝打开；陈旧锁（进程已死）可覆盖。
+  /// 探测失败保守视为占用，避免误开双窗口。
+
   Future<String?> _acquireProjectLock(String rootPath) async {
     final lockPath = _lockFilePath(rootPath);
     final lockFile = File(lockPath);
@@ -489,8 +683,12 @@ class WorkspaceController extends ChangeNotifier {
       await Directory(p.dirname(lockPath)).create(recursive: true);
       if (await lockFile.exists()) {
         final raw = (await lockFile.readAsString()).trim();
-        final ownerPid = int.tryParse(raw.split(RegExp(r'\s+')).first);
+        final parts = raw.split(RegExp(r'\s+'));
+        final ownerPid = int.tryParse(parts.first);
         if (ownerPid != null && ownerPid > 0 && ownerPid != myPid) {
+          // B10：只用存活判定占用，不再用“自身启动时间”比对 owner 启动时间
+          // （旧逻辑两进程该值必不同，他人持锁必被判陈旧覆盖导致双开）。
+          // PID 复用残留风险由“探测失败保守视为占用”兜底。
           if (_isProcessAlive(ownerPid)) {
             return '该项目已经打开';
           }
@@ -581,8 +779,15 @@ class WorkspaceController extends ChangeNotifier {
             children: children,
           ),
         ];
-        // 空文件夹：正常展示根节点即可，清除任何残留错误。
-        _treeError = null;
+        // 超量截断提示：children 已按上限截断，此处给出可见提示。
+        final total = _countFiles(_tree);
+        if (children.length >= effectiveMaxFiles || total >= effectiveMaxFiles) {
+          _treeError =
+              '文件数较多，已截断到前 $effectiveMaxFiles 项（可在设置调整 workspaceMaxFiles），子目录可按需展开';
+        } else {
+          // 空文件夹：正常展示根节点即可，清除任何残留错误。
+          _treeError = null;
+        }
       }
     } catch (error) {
       // 空目录偶发 IO 异常时仍按新项目空态处理。
@@ -612,6 +817,12 @@ class WorkspaceController extends ChangeNotifier {
   }
 
   void openFile(String path) {
+    // 区内围栏：session.json/外部调用此前无围栏，crafted 路径可打开区外文件。
+    final root = _rootPath;
+    if (root != null) {
+      final abs = p.normalize(path);
+      if (!_insideAfterRealpath(root, abs)) return;
+    }
     final file = File(path);
     if (!file.existsSync() || FileSystemEntity.isDirectorySync(path)) {
       return;
@@ -629,6 +840,7 @@ class WorkspaceController extends ChangeNotifier {
     _selectedPath = path;
     rememberDiskStamp(path);
     notifyListeners();
+    scheduleSessionPersist();
   }
 
   /// 切回应用时：刷新树，检测已打开文件的外部覆盖/删除。
@@ -700,6 +912,8 @@ class WorkspaceController extends ChangeNotifier {
   }
 
   /// 在指定目录（或工作区根）新建文件。空名拒绝。返回绝对路径。
+  /// 同 AgentTools 写侧口径：父目录外链此前词法在区内但落盘跟随到区外。
+  /// 敏感路径同样拦截：UI/拖拽此前可新建覆盖 .git/hooks 等，绕过 Agent 门禁。
   Future<String?> createFile(String parentDir, String name) async {
     final root = _rootPath;
     if (root == null) return null;
@@ -710,6 +924,10 @@ class WorkspaceController extends ChangeNotifier {
     if (!await parent.exists()) return null;
     final abs = p.normalize(p.join(parent.path, trimmed));
     if (!p.isWithin(root, abs) && abs != root) return null;
+    if (!_insideAfterRealpath(root, abs)) return null;
+    if (WorkspaceFs.isSensitiveRelative(p.relative(abs, from: root))) {
+      return null;
+    }
     final file = File(abs);
     if (await file.exists()) return null;
     await file.create(recursive: true);
@@ -729,6 +947,10 @@ class WorkspaceController extends ChangeNotifier {
     if (!await parent.exists()) return null;
     final abs = p.normalize(p.join(parent.path, trimmed));
     if (!p.isWithin(root, abs) && abs != root) return null;
+    if (!_insideAfterRealpath(root, abs)) return null;
+    if (WorkspaceFs.isSensitiveRelative(p.relative(abs, from: root))) {
+      return null;
+    }
     final dir = Directory(abs);
     if (await dir.exists()) return null;
     await dir.create(recursive: true);
@@ -774,6 +996,13 @@ class WorkspaceController extends ChangeNotifier {
     }
     if (newAbs == oldAbs) return oldAbs;
     if (!p.isWithin(root, newAbs)) return null;
+    // 两端 realpath 复检：父目录外链此前可经 rename 移出区外。
+    // 敏感路径同样拦截：重命名覆盖 .git/hooks 等此前可绕过 Agent 门禁。
+    if (!_insideAfterRealpath(root, oldAbs) ||
+        !_insideAfterRealpath(root, newAbs) ||
+        WorkspaceFs.isSensitiveRelative(p.relative(newAbs, from: root))) {
+      return null;
+    }
     try {
       final type = FileSystemEntity.typeSync(oldAbs, followLinks: false);
       if (type == FileSystemEntityType.notFound) return null;
@@ -840,6 +1069,12 @@ class WorkspaceController extends ChangeNotifier {
       if (!p.isWithin(root, abs) && abs != root) continue;
       // 禁止直接删项目根
       if (abs == p.normalize(root)) continue;
+      // 父链外链复检：区内链接本身此前按 type 区分，父目录外链可删区外。
+      if (!_insideAfterRealpath(root, abs)) continue;
+      // UI 删除同样拦敏感路径：与 create/rename 对齐，此前可直删 .git/hooks 等。
+      if (WorkspaceFs.isSensitiveRelative(p.relative(abs, from: root))) {
+        continue;
+      }
       try {
         final type = FileSystemEntity.typeSync(abs, followLinks: false);
         if (type == FileSystemEntityType.directory) {
@@ -870,6 +1105,18 @@ class WorkspaceController extends ChangeNotifier {
 
   bool get _hasWorkspaceSafe => _rootPath != null;
 
+  /// realpath 复检：区内 `link->区外` 父目录外链词法在区内，
+  /// 此前 create/rename/delete 只判 normalize 可跟随写出区外。
+  bool _insideAfterRealpath(String root, String abs) {
+    try {
+      final real = WorkspaceFs.realpathOf(abs);
+      final rootReal = WorkspaceFs.realpathOf(p.normalize(root));
+      return real == rootReal || p.isWithin(rootReal, real);
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// 打开文件并定位到行/列（搜索结果点击复用编辑器）。
   void openFileAt(String path, {int line = 0, int character = 0}) {
     revealPosition(path, line, character);
@@ -887,11 +1134,16 @@ class WorkspaceController extends ChangeNotifier {
       if (entityType == FileSystemEntityType.notFound) continue;
       final name = p.basename(raw);
       if (name.isEmpty || name == '.' || name == '..') continue;
+      // 拖拽同样拦敏感名：此 dropping .git/hooks/post-checkout 此前可落地执行。
+      if (WorkspaceFs.isSensitiveRelative(name)) continue;
       final dest = _nonCollidingPath(p.join(root, name));
       try {
         if (entityType == FileSystemEntityType.directory) {
           await _copyDirectory(Directory(raw), Directory(dest));
-          imported.add(p.relative(dest, from: root));
+          // 敏感子目录被整枝跳过时不记入导入结果。
+          if (await Directory(dest).exists()) {
+            imported.add(p.relative(dest, from: root));
+          }
         } else if (entityType == FileSystemEntityType.file) {
           final src = File(raw);
           final target = File(dest);
@@ -934,6 +1186,14 @@ class WorkspaceController extends ChangeNotifier {
 
   Future<void> _copyDirectory(Directory src, Directory dest) async {
     if (p.equals(src.path, dest.path)) return;
+    // 递归同样拦敏感名：顶层只拦了入口名，子目录含 .git/hooks 等此前可落地。
+    final root = _rootPath;
+    if (root != null) {
+      final rel = p.isWithin(root, dest.path)
+          ? p.relative(dest.path, from: root)
+          : p.basename(dest.path);
+      if (WorkspaceFs.isSensitiveRelative(rel)) return;
+    }
     await dest.create(recursive: true);
     await for (final entity in src.list(recursive: false, followLinks: false)) {
       final name = p.basename(entity.path);
@@ -941,6 +1201,12 @@ class WorkspaceController extends ChangeNotifier {
       if (entity is Directory) {
         await _copyDirectory(entity, Directory(next));
       } else if (entity is File) {
+        // 文件级同样拦敏感名：嵌套 .git/hooks/post-checkout 等此前可落地执行。
+        final rootNow = _rootPath;
+        final relNow = rootNow != null && p.isWithin(rootNow, next)
+            ? p.relative(next, from: rootNow)
+            : name;
+        if (WorkspaceFs.isSensitiveRelative(relNow)) continue;
         await entity.copy(next);
       }
     }
@@ -951,6 +1217,7 @@ class WorkspaceController extends ChangeNotifier {
     _activePath = path;
     _selectedPath = path;
     notifyListeners();
+    scheduleSessionPersist();
   }
 
   int? _pendingRevealLine;
@@ -995,6 +1262,7 @@ class WorkspaceController extends ChangeNotifier {
     }
 
     notifyListeners();
+    scheduleSessionPersist();
   }
 
   void setDirty(String path, bool dirty) {
@@ -1221,17 +1489,100 @@ class WorkspaceController extends ChangeNotifier {
   };
 
   Future<List<WorkspaceFile>> _readDirectory(Directory directory) =>
-      compute(_readDirectoryIsolate, directory.path);
+      compute(_readDirectoryIsolate, {
+        'path': directory.path,
+        'maxFiles': effectiveMaxFiles,
+      });
 
-  static List<WorkspaceFile> _readDirectoryIsolate(String path) {
+  /// 大仓上限：prefs `workspaceMaxFiles`，默认 8000；测试可覆盖。
+  int? maxFilesOverrideForTest;
+
+  int get effectiveMaxFiles {
+    if (maxFilesOverrideForTest != null) return maxFilesOverrideForTest!;
+    final store = SettingsStore.maybeInstance;
+    if (store == null) return 8000;
+    try {
+      return store.workspaceMaxFiles;
+    } catch (_) {
+      return 8000;
+    }
+  }
+
+  int _countFiles(List<WorkspaceFile> nodes) {
+    var n = 0;
+    for (final node in nodes) {
+      n++;
+      if (node.isDirectory && node.childrenLoaded) {
+        n += _countFiles(node.children);
+      }
+    }
+    return n;
+  }
+
+  /// 懒加载：子目录按需展开。占位节点 childrenLoaded=false，展开后替换。
+  Future<void> expandDir(String dirPath) async {
+    final root = _rootPath;
+    if (root == null) return;
+    final abs = p.normalize(dirPath);
+    if (!p.isWithin(root, abs) && abs != p.normalize(root)) return;
+    // 链接目录复检：区内 symlink->区外此前按词法放行，直接列出区外内容。
+    if (!_insideAfterRealpath(root, abs)) return;
+    final dir = Directory(abs);
+    if (!await dir.exists()) return;
+    final children = await _readDirectory(dir);
+    _tree = _replaceChildren(_tree, abs, children);
+    notifyListeners();
+  }
+
+  List<WorkspaceFile> _replaceChildren(
+    List<WorkspaceFile> nodes,
+    String target,
+    List<WorkspaceFile> children,
+  ) {
+    return [
+      for (final node in nodes)
+        if (p.equals(node.path, target) && node.isDirectory)
+          WorkspaceFile(
+            path: node.path,
+            name: node.name,
+            isDirectory: true,
+            children: children,
+            childrenLoaded: true,
+          )
+        else if (node.isDirectory && !node.childrenLoaded)
+          node
+        else if (node.isDirectory)
+          WorkspaceFile(
+            path: node.path,
+            name: node.name,
+            isDirectory: node.isDirectory,
+            children: _replaceChildren(node.children, target, children),
+            childrenLoaded: node.childrenLoaded,
+          )
+        else
+          node,
+    ];
+  }
+
+  static List<WorkspaceFile> _readDirectoryIsolate(Object arg) {
+    final String path;
+    final int maxFiles;
+    if (arg is Map) {
+      path = '${arg['path']}';
+      maxFiles = (arg['maxFiles'] as num?)?.toInt() ?? 8000;
+    } else {
+      path = '$arg';
+      maxFiles = 8000;
+    }
     final dir = Directory(path);
     if (!dir.existsSync()) return const [];
     final entities = dir.listSync(followLinks: false);
-    return _buildTreeFromEntities(entities);
+    return _buildTreeFromEntities(entities, maxFiles: maxFiles);
   }
 
   static List<WorkspaceFile> _buildTreeFromEntities(
-      List<FileSystemEntity> entities) {
+      List<FileSystemEntity> entities,
+      {int maxFiles = 8000}) {
     entities.sort((a, b) {
       final aIsDir = a is Directory;
       final bIsDir = b is Directory;
@@ -1243,7 +1594,9 @@ class WorkspaceController extends ChangeNotifier {
     });
 
     final result = <WorkspaceFile>[];
+    var added = 0;
     for (final entity in entities) {
+      if (added >= maxFiles) break;
       final name = p.basename(entity.path);
       if (name.startsWith('.') && !_visibleDotFiles.contains(name)) {
         if (_ignoredNames.contains(name)) continue;
@@ -1252,17 +1605,17 @@ class WorkspaceController extends ChangeNotifier {
       if (_ignoredNames.contains(name)) continue;
 
       if (entity is Directory) {
-        final children = _buildTreeFromEntities(
-          entity.listSync(followLinks: false),
-        );
+        // 懒加载占位：子目录不递归展开，展开时走 expandDir 按需加载。
         result.add(
           WorkspaceFile(
             path: entity.path,
             name: name,
             isDirectory: true,
-            children: children,
+            children: const [],
+            childrenLoaded: false,
           ),
         );
+        added++;
       } else if (entity is File) {
         result.add(
           WorkspaceFile(
@@ -1271,6 +1624,7 @@ class WorkspaceController extends ChangeNotifier {
             isDirectory: false,
           ),
         );
+        added++;
       }
     }
     return result;

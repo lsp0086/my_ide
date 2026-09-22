@@ -19,11 +19,38 @@ static void first_frame_cb(MyApplication* self, FlView* view) {
   gtk_widget_show(gtk_widget_get_toplevel(GTK_WIDGET(view)));
 }
 
+// 设置窗口图标：已安装到系统时按图标名取，未安装（解压即用）时读 bundle 自带图标。
+static void my_application_set_window_icon(GtkWindow* window) {
+  GtkIconTheme* theme = gtk_icon_theme_get_default();
+  if (theme != nullptr && gtk_icon_theme_has_icon(theme, "my_ide")) {
+    gtk_window_set_icon_name(window, "my_ide");
+    return;
+  }
+  // bundle 根目录 = 可执行文件所在目录，图标在 share/icons/... 下（见 linux/CMakeLists.txt）。
+  gchar* exe_target = g_file_read_link("/proc/self/exe", nullptr);
+  if (exe_target == nullptr) {
+    return;
+  }
+  g_autofree gchar* exe_dir = g_path_get_dirname(exe_target);
+  g_free(exe_target);
+  g_autofree gchar* icon_path = g_build_filename(
+      exe_dir, "share", "icons", "hicolor", "512x512", "apps", "my_ide.png", nullptr);
+  if (!g_file_test(icon_path, G_FILE_TEST_EXISTS)) {
+    return;
+  }
+  GError* error = nullptr;
+  if (!gtk_window_set_icon_from_file(window, icon_path, &error)) {
+    g_warning("Failed to set window icon: %s", error != nullptr ? error->message : "unknown");
+    g_clear_error(&error);
+  }
+}
+
 // Implements GApplication::activate.
 static void my_application_activate(GApplication* application) {
   MyApplication* self = MY_APPLICATION(application);
   GtkWindow* window =
       GTK_WINDOW(gtk_application_window_new(GTK_APPLICATION(application)));
+  my_application_set_window_icon(window);
 
   // Use a header bar when running in GNOME as this is the common style used
   // by applications and is the setup most users will be using (e.g. Ubuntu
@@ -52,7 +79,13 @@ static void my_application_activate(GApplication* application) {
     gtk_window_set_title(window, "my_ide");
   }
 
-  gtk_window_set_default_size(window, 1280, 720);
+  gtk_window_set_default_size(window, 1280, 800);
+
+  // 与 macOS/Windows 一致的最小尺寸：1280x800。
+  GdkGeometry hints = {};
+  hints.min_width = 1280;
+  hints.min_height = 800;
+  gtk_window_set_geometry_hints(window, nullptr, &hints, GDK_HINT_MIN_SIZE);
 
   g_autoptr(FlDartProject) project = fl_dart_project_new();
   fl_dart_project_set_dart_entrypoint_arguments(
