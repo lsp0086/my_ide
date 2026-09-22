@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -102,5 +103,41 @@ void main() {
       await File(p.join(workspace.path, 'a.txt.myide-new')).exists(),
       isFalse,
     );
+  });
+
+  test('规划后文件被改：提交乐观锁中止避免静默覆盖', () async {
+    // 规划基线为 'aaa'，落盘前被后台改成 'CHANGED'，
+    // _commitPatchOps 重读比对基线即中止（此前静默打到新内容上）。
+    final result = await tools.execute('apply_patch', {
+      'patches': [
+        {'path': 'a.txt', 'oldText': 'aaa', 'newText': 'AAA'},
+      ],
+      'expectedContents': {'a.txt': 'STALE-BASELINE'},
+    });
+    expect(result.ok, isFalse);
+    expect(result.output, contains('发生变化'));
+    expect(await File(p.join(workspace.path, 'a.txt')).readAsString(), 'aaa');
+  });
+
+  test('复检基线一致时正常落盘', () async {
+    final preview = await tools.preview('apply_patch', {
+      'patches': [
+        {'path': 'a.txt', 'oldText': 'aaa', 'newText': 'AAA'},
+      ],
+    });
+    expect(preview.ok, isTrue);
+    // 预览 oldContent 为各文件基线 JSON（本轮新增），直接透传即一致。
+    final baselines = Map<String, String>.from(
+      (jsonDecode(preview.preview!.oldContent) as Map)
+          .map((k, v) => MapEntry('$k', '$v')),
+    );
+    final result = await tools.execute('apply_patch', {
+      'patches': [
+        {'path': 'a.txt', 'oldText': 'aaa', 'newText': 'AAA'},
+      ],
+      'expectedContents': baselines,
+    });
+    expect(result.ok, isTrue);
+    expect(await File(p.join(workspace.path, 'a.txt')).readAsString(), 'AAA');
   });
 }

@@ -638,6 +638,17 @@ class ChatStore extends ChangeNotifier {
 
   Future<void> loadForProject(String? rootPath) async {
     final gen = ++_loadGeneration;
+    // T4 切项目不再清运行中会话：UI 层切项目已有 guardAiRunning，
+    // 此处是纵深——在途 run 按 runSessionId 持有 session 引用，
+    // _sessions.clear 会让其变孤儿，后续 addMessageTo 找不到直接 return
+    // 丢整轮结果。运行中有锁定时只切 _projectRoot/日志绑定，会话列表保持，
+    // 待 run 结束解锁后由调用方重进 load 刷新。
+    if (_lockedSessions.isNotEmpty) {
+      _projectRoot = rootPath;
+      AppLogger.instance.bindProject(rootPath);
+      notifyListeners();
+      return;
+    }
     _projectRoot = rootPath;
     AppLogger.instance.bindProject(rootPath);
     _sessions.clear();

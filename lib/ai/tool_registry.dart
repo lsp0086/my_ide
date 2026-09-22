@@ -606,6 +606,9 @@ class ToolRegistry {
             ),
           );
           if (!approved || cancelRequested) return null;
+        // T2 审批后执行前取消复检：shouldProceed 通过到落盘执行之间
+        // 用户点取消仍会继续写盘/跑命令，此处复检直接转中断不执行。
+        if (cancelRequested) return null;
           final stAppr = statusBegin('正在执行 $toolName');
           try {
             return await tools.executeApprovedRead(
@@ -976,6 +979,9 @@ class ToolRegistry {
             if (!bgOk || cancelRequested) return null;
           }
         }
+        // T2 审批后执行前取消复检：TOCTOU 复检与后台冲突二次审批耗时，
+        // 期间用户点取消仍会落盘，此处复检直接转中断不执行。
+        if (cancelRequested) return null;
         final stWrite = statusBegin(
           isDelete
               ? '正在删除 $writePath'
@@ -1071,6 +1077,8 @@ class ToolRegistry {
           ),
         );
         if (!cmdApproved || cancelRequested) return null;
+        // T2 审批后执行前取消复检：命令审批通过到真正执行之间取消不再跑命令。
+        if (cancelRequested) return null;
         final stCmd = statusBegin('正在执行命令');
         AgentToolResult cmdResult;
         try {
@@ -1179,7 +1187,9 @@ class ToolRegistry {
             ),
           );
           if (!createApproved || cancelRequested) return null;
-          final stCreate = statusBegin('正在执行 terminal_create');
+        // T2 审批后执行前取消复检：终端创建同样不再执行。
+        if (cancelRequested) return null;
+        final stCreate = statusBegin('正在执行 terminal_create');
           try {
             return await tools.execute(toolName, effectiveArgs);
           } finally {
@@ -1259,6 +1269,8 @@ class ToolRegistry {
           ),
         );
         if (!writeApproved || cancelRequested) return null;
+        // T2 审批后执行前取消复检：终端写入同样不再执行。
+        if (cancelRequested) return null;
         final stTerm = statusBegin('正在执行 terminal_write');
         try {
           return await tools.execute(toolName, effectiveArgs);

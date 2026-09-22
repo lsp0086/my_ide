@@ -1088,15 +1088,34 @@ class AgentTools {
     // （调用方同 id 优先，外部删除不复活）。内存已有项被调用方删掉
     // 视为有意删除，不复活；纯 LWW 会把窗口内用户手改/另一 Agent
     // 的增量静默盖掉。
+    // T3 同 id 内容冲突：调用方 stale 全量里同 id 但内容/状态与盘上不同，
+    // 说明窗口内外部改过该项，直接调用方优先会丢外部改动。此处保留外部新项
+    // （盘上优先），调用方旧值不再覆盖，避免多窗口反复覆盖竞争。
     final callerIds = next.map((t) => t.id).toSet();
+    final diskById = {for (final t in diskSnapshot) t.id: t};
+    final memBeforeById = {for (final t in memBefore) t.id: t};
     final externallyAdded = diskSnapshot
         .where(
           (t) => !callerIds.contains(t.id) && !memBeforeIds.contains(t.id),
         )
         .toList();
+    final merged = <_TodoItem>[];
+    for (final item in next) {
+      final disk = diskById[item.id];
+      final mem = memBeforeById[item.id];
+      if (disk != null &&
+          mem != null &&
+          (disk.content != mem.content || disk.status != mem.status) &&
+          (item.content == mem.content && item.status == mem.status)) {
+        // 调用方拿的是旧基线且未改该项，盘上已被外部更新：保留外部新项。
+        merged.add(disk);
+      } else {
+        merged.add(item);
+      }
+    }
     todos
       ..clear()
-      ..addAll(next)
+      ..addAll(merged)
       ..addAll(externallyAdded);
     while (todos.length > 50) {
       todos.removeAt(0);
@@ -1136,7 +1155,9 @@ class AgentTools {
 
   /// todos.json 的 mtime 缓存：外部改盘后下次读取自动重载，
   /// 避免“一次加载永不重载”导致内存常驻 stale（A7）。
-  static final Map<String, DateTime?> _todosMtimes = {};
+  /// T3 加 size 维度：同毫秒两写/低精度文件系统下 mtime 相等即漏检，
+  /// 判脏必须 size+mtime 双字段。
+  static final Map<String, String?> _todosStamps = {};
 
   String _todoRootKey() => p.normalize(p.absolute(rootPath));
 
@@ -1144,24 +1165,25 @@ class AgentTools {
   List<_TodoItem> _loadTodosFromDisk() {
     final key = _todoRootKey();
     final existing = _todosByRoot.putIfAbsent(key, () => <_TodoItem>[]);
-    DateTime? mtime;
+    String? stamp;
     try {
       final f = File(p.join(key, '.my_ide', 'todos.json'));
       if (!f.existsSync()) {
         _todosLoadedRoots.add(key);
-        _todosMtimes[key] = null;
+        _todosStamps[key] = null;
         return existing;
       }
-      mtime = f.lastModifiedSync();
+      final stat = f.statSync();
+      stamp = '${stat.size}:${stat.modified.microsecondsSinceEpoch}';
     } catch (_) {
       return existing;
     }
-    // 已加载过且 mtime 未变：直接用内存态；否则重载。
-    if (_todosLoadedRoots.contains(key) && _todosMtimes[key] == mtime) {
+    // 已加载过且 size+mtime 未变：直接用内存态；否则重载。
+    if (_todosLoadedRoots.contains(key) && _todosStamps[key] == stamp) {
       return existing;
     }
     _todosLoadedRoots.add(key);
-    _todosMtimes[key] = mtime;
+    _todosStamps[key] = stamp;
     try {
       final f = File(p.join(key, '.my_ide', 'todos.json'));
       if (!f.existsSync()) return existing;
@@ -1205,9 +1227,11 @@ class AgentTools {
       );
       if (Platform.isWindows && target.existsSync()) target.deleteSync();
       tmp.renameSync(target.path);
-      // 落盘后刷新 mtime 缓存，避免下次读取误判外部改动重载丢内存态。
+      // 落盘后刷新判脏戳，避免下次读取误判外部改动重载丢内存态。
       try {
-        _todosMtimes[_todoRootKey()] = target.lastModifiedSync();
+        final stat = target.statSync();
+        _todosStamps[_todoRootKey()] =
+            '${stat.size}:${stat.modified.microsecondsSinceEpoch}';
       } catch (_) {}
     } catch (_) {
       try {
@@ -1274,7 +1298,10 @@ class AgentTools {
       return AgentToolResult(ok: false, output: 'copy_file 需要 from 与 to');
     }
     try {
-      if (_isWriteLinkTarget(to) ||
+      // T6 copy 源端同样先拦 link/父链：_recheckWriteTarget 是事后复检，
+      // 窗口内 from 换链即把区外内容拷入区内。
+      if (_isWriteLinkTarget(from) ||
+          _isWriteLinkTarget(to) ||
           _isOutsideAfterRealpath(to) ||
           _isOutsideAfterRealpath(from)) {
         return AgentToolResult(
@@ -1872,6 +1899,12 @@ class AgentTools {
       if (await target.exists()) {
         return AgentToolResult(ok: false, output: '目标已存在，拒绝覆盖：$rel');
       }
+      // T6 恢复源 link 检查：src 是回收站内条目，预埋 link->/etc/passwd 时
+      // rename 移动链接本身安全，但跨盘回退 src.copy 会跟随读区外内容写回区内。
+      if (FileSystemEntity.typeSync(src.path, followLinks: false) ==
+          FileSystemEntityType.link) {
+        return AgentToolResult(ok: false, output: '回收站条目为符号链接，拒绝恢复：$name');
+      }
       await target.parent.create(recursive: true);
       try {
         if (await srcDir.exists()) {
@@ -1993,6 +2026,13 @@ class AgentTools {
   }) async {
     final rel = '${args['path'] ?? ''}';
     try {
+      // T6 预览与执行同口径：_delete 执行层先拦 link/父链外链，
+      // 预览此前直接读，跟随读做预览会把敏感/区外内容带进审批弹窗。
+      if (!allowOutside &&
+          (_isWriteLinkTarget(rel) || _isOutsideAfterRealpath(rel))) {
+        return AgentToolResult(
+            ok: false, output: '目标为符号链接或链出区外，拒绝删除：$rel');
+      }
       final abs = allowOutside ? _resolveAny(rel) : _resolve(rel);
       final file = File(abs);
       if (!await file.exists()) {
@@ -2489,9 +2529,12 @@ class AgentTools {
         List<String>? fileLines;
         if (contextLines > 0) {
           try {
-            final abs = p.isAbsolute(g.relativePath)
-                ? g.relativePath
-                : p.join(searchRoot, g.relativePath);
+            // T5 回读钳制到审批目录内：WorkspaceSearch 返回的相对路径不可信，
+            // 绝对值/含 .. 时直接跳过该文件上下文，不再拼接读出区外任意文件。
+            if (p.isAbsolute(g.relativePath)) continue;
+            final abs = p.normalize(p.join(searchRoot, g.relativePath));
+            final rootNorm = p.normalize(searchRoot);
+            if (abs != rootNorm && !p.isWithin(rootNorm, abs)) continue;
             // 先判大小再读：此前 readAsLines 全量进内存，大文件直接 OOM。
             final f = File(abs);
             if (await f.exists() && await f.length() <= 1024 * 1024) {
@@ -2799,6 +2842,30 @@ class AgentTools {
     Process? process;
     final stdout = StringBuffer();
     final stderr = StringBuffer();
+    // 前台流订阅句柄提至 try 外：catch 子句看不到 try 内局部函数，
+    // 此前 forEach 无句柄，exitCode 超时/异常时订阅挂起永不释放。
+    StreamSubscription<String>? stdoutSub;
+    StreamSubscription<String>? stderrSub;
+    Completer<void>? stdoutDone;
+    Completer<void>? stderrDone;
+    Future<void> cancelStreams() async {
+      try {
+        await stdoutSub?.cancel();
+      } catch (_) {}
+      try {
+        await stderrSub?.cancel();
+      } catch (_) {}
+      stdoutSub = null;
+      stderrSub = null;
+      final outDone = stdoutDone;
+      final errDone = stderrDone;
+      if (outDone != null && !outDone.isCompleted) {
+        outDone.complete();
+      }
+      if (errDone != null && !errDone.isCompleted) {
+        errDone.complete();
+      }
+    }
     try {
       // Docker 沙箱：高危已在上游拒绝，这里只包裹执行并标注输出。
       final dockerArgs = dockerSandbox
@@ -2819,22 +2886,32 @@ class AgentTools {
       // 容错解码：多字节被切包时普通 utf8.decoder 抛 FormatException，
       // 误记为命令失败。终端侧已用 allowMalformed，此处对齐。
       const outputDecoder = Utf8Decoder(allowMalformed: true);
-      final stdoutDone = process.stdout
-          .transform(outputDecoder)
-          .forEach(stdout.write);
-      final stderrDone = process.stderr
-          .transform(outputDecoder)
-          .forEach(stderr.write);
-      // 流订阅句柄：exitCode 超时/取消时必须取消订阅，否则 forEach 挂起
-      // 永不释放（后台路径已存 stdoutSub/stderrSub 并取消，前台此前泄漏）。
-      Future<void> cancelStreams() async {
-        try {
-          await stdoutDone.timeout(const Duration(seconds: 2));
-        } catch (_) {}
-        try {
-          await stderrDone.timeout(const Duration(seconds: 2));
-        } catch (_) {}
-      }
+      stdoutDone = Completer<void>();
+      stderrDone = Completer<void>();
+      final outDone = stdoutDone;
+      final errDone = stderrDone;
+      stdoutSub = process.stdout.transform(outputDecoder).listen(
+        stdout.write,
+        onDone: () {
+          if (!outDone.isCompleted) outDone.complete();
+        },
+        onError: (Object e) {
+          stdout.writeln('$e');
+          if (!outDone.isCompleted) outDone.complete();
+        },
+        cancelOnError: false,
+      );
+      stderrSub = process.stderr.transform(outputDecoder).listen(
+        stderr.write,
+        onDone: () {
+          if (!errDone.isCompleted) errDone.complete();
+        },
+        onError: (Object e) {
+          stderr.writeln('$e');
+          if (!errDone.isCompleted) errDone.complete();
+        },
+        cancelOnError: false,
+      );
       final exitCode = await process.exitCode.timeout(
         Duration(seconds: timeoutSec),
         onTimeout: () async {
@@ -2843,10 +2920,14 @@ class AgentTools {
         },
       );
       // 输出流等待同样加超时：进程已退出但流未闭合（如 yes 无限输出），
-      // 此前永久挂住该步。
-      await Future.wait([stdoutDone, stderrDone]).timeout(
-        const Duration(seconds: 5),
-      );
+      // 此前永久挂住该步。超时即取消订阅，避免 forEach 挂起泄漏。
+      try {
+        await Future.wait([outDone.future, errDone.future]).timeout(
+          const Duration(seconds: 5),
+        );
+      } on TimeoutException {
+        await cancelStreams();
+      }
       final out = StringBuffer('\$ $command\n');
       if (stdout.isNotEmpty) out.writeln(stdout);
       if (stderr.isNotEmpty) {
@@ -2855,15 +2936,18 @@ class AgentTools {
       }
       out.writeln('[exit $exitCode]');
       final touched = await _diffSnapshot(before);
+      await cancelStreams();
       return AgentToolResult(
         ok: exitCode == 0,
         output: out.toString(),
         touchedFiles: touched,
       );
     } on TimeoutException catch (e) {
+      await cancelStreams();
       final touched = await _diffSnapshot(before);
       return AgentToolResult(ok: false, output: '$e', touchedFiles: touched);
     } catch (e) {
+      await cancelStreams();
       if (process != null) await _processManager.terminate(process);
       final touched = await _diffSnapshot(before);
       return AgentToolResult(
@@ -3215,6 +3299,21 @@ class AgentTools {
     final normalized = targets
         .map((t) => p.normalize(t).replaceAll('\\', '/'))
         .toSet();
+    // T6 目录级按前缀匹配：move from=a/b（目录）vs 后台改 a/b/c.txt，
+    // 精确集合匹配无交集会漏报。此处任一端为另一端前缀即算冲突。
+    bool prefixHit(String a, String b) =>
+        a == b || a.startsWith('$b/') || b.startsWith('$a/');
+    bool dirConflict(Iterable<String> changedPaths) {
+      final changed = changedPaths
+          .map((c) => p.normalize(c).replaceAll('\\', '/'))
+          .toList();
+      for (final t in normalized) {
+        for (final c in changed) {
+          if (prefixHit(t, c)) return true;
+        }
+      }
+      return false;
+    }
     // 常驻终端同样参与冲突判定：在途终端会话可能随时经 terminal_write 改盘。
     // 此前只扫 run_command 后台任务，终端写入后紧跟 edit 会静默覆盖。
     // 终端无快照基线：保守策略为任一在途终端存在即视为全部目标冲突，
@@ -3237,11 +3336,9 @@ class AgentTools {
       if (changed.contains(snapshotTruncatedKey)) {
         return targets.toList()..sort();
       }
-      final hit = changed
-          .map((c) => p.normalize(c).replaceAll('\\', '/'))
-          .where(normalized.contains)
-          .toList();
-      if (hit.isNotEmpty) return hit;
+      if (dirConflict(changed)) {
+        return targets.toList()..sort();
+      }
     }
     return const [];
   }

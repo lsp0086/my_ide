@@ -1766,14 +1766,37 @@ class AgentRunner extends ChangeNotifier {
         ),
       );
     }
-    final restResults = await Future.wait(
-      rest.map(guarded),
-      eagerError: false,
-    );
-    // 取消感知：rest 分支此前 Future.wait 无取消检查，取消发生在等待期时
-    // 要等 30s/300s 熔断才响应，且 timeout 不取消底层 Future 致孤儿继续跑。
-    // 超时/取消后底层仍在跑：Registry 侧审批队列串行，孤儿晚到按 tool_call.id
-    // 首个 wins 丢弃，不污染本批结果；MCP/search 孤儿由各自超时兜底。
+    // T1 取消感知收集：取消发生在纯读批等待期时不再等满 30s/300s，
+    // 50ms 粒度复检取消（与 spawn runParallel 同口径），取消即回中断占位，
+    // 孤儿晚到按 tool_call.id 首个 wins 丢弃。
+    final restResults = <AgentToolResult?>[];
+    final pendingRest = rest.map(guarded).toList();
+    final pendingByIndex = <int, Future<AgentToolResult?>>{
+      for (var i = 0; i < pendingRest.length; i++) i: pendingRest[i],
+    };
+    final collected = <int, AgentToolResult?>{};
+    while (pendingByIndex.isNotEmpty) {
+      int? settled;
+      try {
+        settled = await Future.any(
+          pendingByIndex.entries.map((e) => e.value.then((_) => e.key)),
+        ).timeout(const Duration(milliseconds: 50));
+      } on TimeoutException {
+        settled = null;
+      }
+      if (settled != null) {
+        collected[settled] = await pendingByIndex.remove(settled);
+        continue;
+      }
+      if (_cancelRequested || _gate.cancelRequested) break;
+    }
+    for (var i = 0; i < rest.length; i++) {
+      restResults.add(collected[i]);
+    }
+    // 取消感知：超时后底层仍在跑（timeout 不取消 Future），Registry 侧
+    // 审批队列串行，孤儿晚到按 tool_call.id 首个 wins 丢弃，不污染本批结果；
+    // MCP/search 孤儿由各自超时兜底。取消截断未收集到的项同样回中断占位，
+    // 不能落 null 被下游误记为拒绝（与 spawn 缺失回填同口径）。
     if (_cancelRequested || _gate.cancelRequested) {
       return [
         for (final p in pendingTools)
@@ -1785,7 +1808,15 @@ class AgentRunner extends ChangeNotifier {
     final restById = <String, AgentToolResult?>{};
     // 重复 tool_call.id 后赢者通吃会丢结果：首个 wins，与 spawn 侧 putIfAbsent 同口径。
     for (var i = 0; i < rest.length; i++) {
-      restById.putIfAbsent(rest[i].id, () => restResults[i]);
+      final v = restResults[i];
+      if (v == null) {
+        restById.putIfAbsent(
+          rest[i].id,
+          () => AgentToolResult(ok: false, output: '用户中断，已取消。'),
+        );
+      } else {
+        restById.putIfAbsent(rest[i].id, () => v);
+      }
     }
     return [
       for (final p in pendingTools)
@@ -2089,21 +2120,25 @@ class AgentRunner extends ChangeNotifier {
     if (used < limit * 0.85) return false;
     // 中途裁剪：tool 大文本先裁，仍超则裁 assistant/user 大文本（只留首尾），
     // 保留结构避免断链。此前只裁 tool，纯对话大文本超限不断链 400。
+    // T7 多模态 content 是 List 结构：'${}' 字符串化再 substring 会压坏
+    // image_url，本轮只裁纯 String 文本，List 结构跳过不断链。
     for (var i = 0; i < messages.length && used >= limit * 0.85; i++) {
       final m = messages[i];
       if (m['role'] != 'tool') continue;
-      final content = '${m['content'] ?? ''}';
-      if (content.length <= 2000) continue;
-      m['content'] = '${content.substring(0, 2000)}…（中途裁剪）';
+      final raw = m['content'];
+      if (raw is! String) continue;
+      if (raw.length <= 2000) continue;
+      m['content'] = '${raw.substring(0, 2000)}…（中途裁剪）';
       used = TokenEstimator.estimateMessages(messages) * _usageCalibration;
     }
     for (var i = 0; i < messages.length && used >= limit * 0.85; i++) {
       final m = messages[i];
       if (m['role'] == 'tool') continue;
-      final content = '${m['content'] ?? ''}';
-      if (content.length <= 4000) continue;
+      final raw = m['content'];
+      if (raw is! String) continue;
+      if (raw.length <= 4000) continue;
       m['content'] =
-          '${content.substring(0, 2000)}…（中途裁剪）${content.substring(content.length - 1000)}';
+          '${raw.substring(0, 2000)}…（中途裁剪）${raw.substring(raw.length - 1000)}';
       used = TokenEstimator.estimateMessages(messages) * _usageCalibration;
     }
     return true;
@@ -2139,6 +2174,11 @@ class AgentRunner extends ChangeNotifier {
       }
       for (final ref in m.images) {
         c += TokenEstimator.estimate(ref) + 64;
+      }
+      // T7 子 Agent 输出同样计入预算：每轮最多 3 个各 20k，
+      // 不计会系统性低估致压缩触发晚、中途 400。
+      for (final sub in m.subAgents) {
+        c += TokenEstimator.estimate(sub.output);
       }
       if (keep.length >= compactKeepRecent && cost + c > remain) break;
       keep.insert(0, m);

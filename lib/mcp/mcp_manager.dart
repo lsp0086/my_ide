@@ -294,37 +294,25 @@ class McpManager extends ChangeNotifier {
       // 托管目录删除加固：相对路径/父目录穿越直接拒绝，避免误删工作区；
       // 非绝对路径一律不删。realpath 消 symlink 后再判：预埋链接指向
       // 工作区根时 startsWith 仍可绕过，必须按真实路径校验。
+      // T8 收敛到托管父目录：外部 JSON 可控 installDirectory + 本地进程
+      // 可种 marker 即组合成任意目录删除；此处只允许应用托管根下两层目录，
+      // 家目录/系统前缀/托管根外一律 fail-closed 不删。
+      final managedRoot = await _managedInstallRoot();
+      if (managedRoot.isEmpty) return;
       final type = FileSystemEntity.typeSync(dir, followLinks: false);
       if (type == FileSystemEntityType.link) return;
       final realDir = Directory(dir).resolveSymbolicLinksSync();
       if (!realDir.startsWith('/')) return;
-      final normalized = Directory(realDir).absolute.path;
-      if (normalized == '/' ||
-          normalized == '/tmp' ||
-          normalized == '/Users' ||
-          normalized == '/home' ||
-          normalized == '/usr' ||
-          normalized == '/bin' ||
-          normalized == '/etc' ||
-          normalized == '/var') {
+      final normalized = p.normalize(Directory(realDir).absolute.path);
+      if (normalized == managedRoot ||
+          !p.isWithin(managedRoot, normalized) ||
+          p.relative(normalized, from: managedRoot).split(Platform.pathSeparator).length != 2) {
         return;
       }
-      // 用户家目录本身不删：仅允许家目录下至少两层子目录（如 ~/.cache/x）。
-      // 家目录判断用区内判定（归一化+边界）：此前 resolve-比较，
-      // `~/Documents`（攻击者可控字段）+ 伪造 marker 即可删用户一层目录。
+      if (_isSystemPrefix(normalized)) return;
+      // HOME 缺失 fail-closed：此前 HOME 为空即跳过家目录检查直接删。
       final home = Platform.environment['HOME'];
-      if (home != null && home.isNotEmpty) {
-        try {
-          final realHome = p.normalize(Directory(home).resolveSymbolicLinksSync());
-          if (normalized == realHome ||
-              !p.isWithin(realHome, normalized) ||
-              p.relative(normalized, from: realHome).split(Platform.pathSeparator).length < 2) {
-            return;
-          }
-        } catch (_) {
-          return;
-        }
-      }
+      if (home == null || home.isEmpty) return;
       final directory = Directory(realDir);
       if (!await directory.exists()) return;
       final marker = File('${directory.path}/.my_ide_mcp_managed');
@@ -332,6 +320,42 @@ class McpManager extends ChangeNotifier {
       // 仅删标记目录自身内容，目录不存在/标记缺失即停，不做递归上溯。
       await directory.delete(recursive: true);
     } catch (_) {}
+  }
+
+  /// 应用托管根：~/.cache/my_ide/mcp-installs（macOS/Linux），
+  /// HOME 缺失返回空由调用方 fail-closed。
+  Future<String> _managedInstallRoot() async {
+    try {
+      final home = Platform.environment['HOME'];
+      if (home == null || home.isEmpty) return '';
+      final realHome = p.normalize(Directory(home).resolveSymbolicLinksSync());
+      return p.normalize(p.join(realHome, '.cache', 'my_ide', 'mcp-installs'));
+    } catch (_) {
+      return '';
+    }
+  }
+
+  static bool _isSystemPrefix(String normalized) {
+    const blocked = {
+      '/',
+      '/tmp',
+      '/var',
+      '/private',
+      '/opt',
+      '/Users',
+      '/home',
+      '/usr',
+      '/bin',
+      '/sbin',
+      '/etc',
+      '/System',
+      '/Library',
+    };
+    if (blocked.contains(normalized)) return true;
+    for (final prefix in ['/tmp/', '/var/', '/private/', '/opt/']) {
+      if (normalized.startsWith(prefix)) return true;
+    }
+    return false;
   }
 
   Future<void> setEnabled(String id, bool enabled) async {
