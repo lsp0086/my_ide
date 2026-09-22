@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:path/path.dart' as p;
 
 import '../settings/secret_vault.dart';
 import '../settings/settings_store.dart';
@@ -109,14 +110,19 @@ class McpManager extends ChangeNotifier {
   }
 
   /// qualifiedName 反查 serverId（按 safeToken/原名匹配）。
+  /// 碰撞时按原名精确命中优先：恶意 import 服务器用 `a_b` 影子
+  /// 可信 `a b`（同 safeToken）时，原名调用仍路由到可信方，
+  /// 而非插入序先胜者。
   String? serverIdOfQualified(String qualifiedName) {
     final split = McpToolDef.splitQualifiedName(qualifiedName);
     if (split == null) return null;
+    String? fallback;
     for (final s in _servers) {
       final safe = McpToolDef.safeToken(s.name);
-      if (safe == split.serverKey || s.name == split.serverKey) return s.id;
+      if (s.name == split.serverKey) return s.id;
+      if (fallback == null && safe == split.serverKey) fallback = s.id;
     }
-    return null;
+    return fallback;
   }
 
   String? toolNameOfQualified(String qualifiedName) =>
@@ -304,10 +310,20 @@ class McpManager extends ChangeNotifier {
         return;
       }
       // 用户家目录本身不删：仅允许家目录下至少两层子目录（如 ~/.cache/x）。
+      // 家目录判断用区内判定（归一化+边界）：此前 resolve-比较，
+      // `~/Documents`（攻击者可控字段）+ 伪造 marker 即可删用户一层目录。
       final home = Platform.environment['HOME'];
       if (home != null && home.isNotEmpty) {
-        final realHome = Directory(home).resolveSymbolicLinksSync();
-        if (normalized == realHome) return;
+        try {
+          final realHome = p.normalize(Directory(home).resolveSymbolicLinksSync());
+          if (normalized == realHome ||
+              !p.isWithin(realHome, normalized) ||
+              p.relative(normalized, from: realHome).split(Platform.pathSeparator).length < 2) {
+            return;
+          }
+        } catch (_) {
+          return;
+        }
       }
       final directory = Directory(realDir);
       if (!await directory.exists()) return;
@@ -461,10 +477,24 @@ class McpManager extends ChangeNotifier {
     final serverKey = split.serverKey;
     final toolName = split.toolName;
     // 快照后遍历：await session.callTool 间隙 _servers 被改会抛并发修改。
+    // 两轮匹配：先原名精确命中，再 safeToken 兜底（与 serverIdOfQualified
+    // 同口径）。否则 `a b` 与 `a_b` 碰撞时调用被路由到先插入的恶意方。
+    McpServerConfig? exact;
+    McpServerConfig? fuzzy;
     for (final s in List<McpServerConfig>.from(_servers)) {
       if (!s.enabled) continue;
       final safe = McpToolDef.safeToken(s.name);
-      if (safe != serverKey && s.name != serverKey) continue;
+      if (s.name == serverKey) {
+        exact ??= s;
+      } else if (fuzzy == null && safe == serverKey) {
+        fuzzy = s;
+      }
+    }
+    final s = exact ?? fuzzy;
+    if (s == null) {
+      return McpCallResult(ok: false, output: '未找到 MCP 服务器：$serverKey');
+    }
+    {
       // per-tool 开关：被禁用的工具直接拒绝，不再执行。
       if (s.disabledTools.contains(toolName)) {
         return McpCallResult(
@@ -476,7 +506,6 @@ class McpManager extends ChangeNotifier {
       }
       return session.callTool(toolName, args);
     }
-    return McpCallResult(ok: false, output: '未找到 MCP 服务器：$serverKey');
   }
 
   Future<void> disposeAll() async {

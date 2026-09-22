@@ -935,6 +935,15 @@ class ToolRegistry {
               ? '__MYIDE_NOT_EXISTS__'
               : preview.preview!.oldContent;
         }
+        // apply_patch 同样带乐观锁：预览 oldContent 为各文件基线 JSON
+        // （edit=规划时整文件，create=哨兵），执行层按文件比对，
+        // 预览→审批→落盘窗口内被改即中止（此前无整文件锁，静默打到新内容上）。
+        // 复检已用 _previewHash 判整体一致，这里用复检基线（最新）而非
+        // 初次预览基线：窗口内多次改动取最新快照，提交时再做最终比对。
+        if (toolName == 'apply_patch' && recheck.preview != null) {
+          guardedArgs['expectedContents'] =
+              _patchBaselines(recheck.preview!.oldContent);
+        }
         // B3：写前查后台任务基线——后台命令启动时的 snapshotBefore 与当前磁盘
         // 快照比对，目标文件已被后台改动即强制人工确认，避免覆盖后台产出。
         // D2-8：无在途后台任务/终端时跳过扫描，避免每次写都全量 stat。
@@ -1532,12 +1541,31 @@ class ToolRegistry {
   /// 预览指纹：old+new 内容长度与 sha256 摘要，审批前后比对防 TOCTOU。
   /// 原先用 Dart String.hashCode（32 位非密码学）可碰撞，已换成 sha256。
   /// delete 场景 preview.newContent 为空同样可比对。
+  /// apply_patch 的 oldContent 是各文件基线 JSON（非摘要）：
+  /// 指纹覆盖整份 JSON，任一文件基线变化即整体失配中止。
   static String? _previewHash(FilePreview? preview) {
     if (preview == null) return null;
     final old = preview.oldContent;
     final neu = preview.newContent;
     String digest(String s) => sha256.convert(utf8.encode(s)).toString();
     return '${old.length}:${neu.length}:${digest(old)}:${digest(neu)}';
+  }
+
+  /// apply_patch 基线解析：预览 oldContent（JSON）→ {path: 基线内容}。
+  /// 非 JSON/非 Map 时返回空（老预览兼容）：执行层无锁但复检 hash 仍在，
+  /// 不会比原来更差。
+  static Map<String, String> _patchBaselines(String raw) {
+    try {
+      final data = jsonDecode(raw);
+      if (data is! Map) return const {};
+      final out = <String, String>{};
+      data.forEach((k, v) {
+        if (v is String) out['$k'] = v;
+      });
+      return out;
+    } catch (_) {
+      return const {};
+    }
   }
 
   /// 密钥参数脱敏：key/secret/token/password/authorization 等字段打码，

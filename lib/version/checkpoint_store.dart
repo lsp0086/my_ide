@@ -579,9 +579,16 @@ class CheckpointStore extends ChangeNotifier {
       need--;
     }
     if (evictable.isEmpty) return;
+    // checkpoint() 持 _busy 锁内调用：借位执行，内层 dropVersions 靠
+    // _dropReentrancy 通过 _busy 守卫（否则直接抛错被吞，上限永不生效）。
+    final borrowed = _busy;
+    if (borrowed) _dropReentrancy++;
     try {
       await dropVersions(evictable);
-    } catch (_) {}
+    } catch (_) {
+    } finally {
+      if (borrowed) _dropReentrancy--;
+    }
   }
 
   /// 版本上限：prefs versionMaxNodes，默认 100，钳制 20~500。
@@ -915,7 +922,16 @@ class CheckpointStore extends ChangeNotifier {
         final files = <String, String>{};
         final raw = data['files'];
         if (raw is Map) {
-          raw.forEach((k, v) => files['$k'] = '$v');
+          // 毒化 tree 过滤：crafted key（如 ../../x、绝对路径）在落盘成
+          // ops 前各处虽有 _isSafeRestoreRel 复检，但 _loadTree 缓存污染后
+          // diffTextOf/fileContentAt 会展示毒化路径内容。此处加载即清洗，
+          // 脏 key 不进内存 tree/diff 缓存。
+          final rootPath = _rootPath;
+          raw.forEach((k, v) {
+            final key = '$k';
+            if (rootPath != null && !_isSafeRestoreRel(rootPath, key)) return;
+            files[key] = '$v';
+          });
         }
         _treeCache[id] = files;
         return Map<String, String>.from(files);
@@ -963,6 +979,20 @@ class CheckpointStore extends ChangeNotifier {
       }
     }
     return changes;
+  }
+
+  /// 工作区树指纹：restore 建保险前后比对，漂移即中止避免丢写。
+  /// key 排序后拼 `path=hash` 再 sha1，避免 map 迭代序抖动。
+  static String _treeDigest(Map<String, String> tree) {
+    final keys = tree.keys.toList()..sort();
+    final buf = StringBuffer()..write(keys.length)..write('\n');
+    for (final k in keys) {
+      buf.write(k);
+      buf.write('=');
+      buf.write(tree[k]);
+      buf.write('\n');
+    }
+    return sha1.convert(utf8.encode(buf.toString())).toString();
   }
 
   Future<List<FileChange>> _materializeDiffs({
@@ -1554,6 +1584,10 @@ class CheckpointStore extends ChangeNotifier {
     _busy = true;
     notifyListeners();
     try {
+      // restore 起点快照钉住：_captureWorkspace → 建 redo 保险 → 应用树
+      // 三段之间 Agent/外部写入会让保险与落盘基线分叉（丢写/回滚错位）。
+      // _busy 已阻止第二路版本操作，但不阻止 Agent 写盘；此处记录基线
+      // 生成时的树指纹，恢复提交按树重算、提交前验证漂移并中止。
       final current = await _captureWorkspace(root);
       final toFiles = await _loadTree(versionId);
       // 先建立 Redo 保险，失败则中止恢复：
@@ -1578,7 +1612,15 @@ class CheckpointStore extends ChangeNotifier {
         _redoPatches.removeAt(0);
         _redoLabels.removeAt(0);
       }
+      final currentDigest = _treeDigest(current);
       await _saveRedoStack();
+      // 提交前验证漂移：建保险后工作区若被 Agent/外部改动，
+      // redo 保险基于旧现场，直接应用目标树会静默丢写。此时中止恢复，
+      // 调用方重试即基于新现场重建保险。
+      final recheck = await _captureWorkspace(root);
+      if (_treeDigest(recheck) != currentDigest) {
+        throw StateError('恢复期间工作区发生变化，已中止恢复避免丢写：请重试');
+      }
       await _applyTreeToWorkspace(
         toFiles,
         versionId: versionId,

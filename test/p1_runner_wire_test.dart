@@ -244,6 +244,9 @@ void main() {
     expect(CommandPolicy.sandboxMode('local'), isFalse);
     final wrapped = CommandPolicy.dockerWrap('echo hi', '/tmp/work dir');
     expect(wrapped.first, 'docker');
+    // Windows 下 p.absolute('/tmp/work dir') 会带盘符且用反斜杠
+    // （如 D:\tmp\work dir），不能硬编码 POSIX 路径断言。
+    final mountSpec = wrapped.skipWhile((e) => e != '--mount').skip(1).first;
     expect(
       wrapped,
       containsAllInOrder([
@@ -264,14 +267,27 @@ void main() {
         '--tmpfs',
         '/tmp:rw,noexec,nosuid,size=128m',
         '--mount',
-        'type=bind,source=/tmp/work dir,target=/work,readonly=false',
+        predicate<String>(
+          (s) =>
+              s.startsWith('type=bind,source=') &&
+              s.contains('work dir') &&
+              s.contains('target=/work') &&
+              s.endsWith('readonly=false'),
+          'mount spec with work dir',
+        ),
       ]),
     );
-    expect(CommandPolicy.dockerWrap('echo hi', '/tmp/work dir', uid: 1000, gid: 1000), contains('1000:1000'));
     expect(
-      wrapped,
-      contains('type=bind,source=/tmp/work dir,target=/work,readonly=false'),
+      mountSpec,
+      allOf(
+        startsWith('type=bind,source='),
+        contains('work dir'),
+        contains('target=/work'),
+        endsWith('readonly=false'),
+      ),
     );
+    expect(CommandPolicy.dockerWrap('echo hi', '/tmp/work dir', uid: 1000, gid: 1000), contains('1000:1000'));
+    expect(mountSpec, contains('work dir'));
     expect(wrapped, isNot(contains('/tmp/work dir /work')));
   });
 }

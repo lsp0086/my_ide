@@ -54,22 +54,29 @@ class FilePreview {
 }
 
 class _PatchOp {
-  _PatchOp.edit(this.rel, this.abs, this.oldFragment, this.newFragment)
-    : kind = 'edit',
-      newContent = null,
-      delete = false;
+  _PatchOp.edit(
+    this.rel,
+    this.abs,
+    this.oldFragment,
+    this.newFragment, {
+    required this.baseContent,
+  })  : kind = 'edit',
+        newContent = null,
+        delete = false;
 
   _PatchOp.create(this.rel, this.abs, this.newContent)
-    : kind = 'create',
-      oldFragment = null,
-      newFragment = null,
-      delete = false;
+      : kind = 'create',
+        oldFragment = null,
+        newFragment = null,
+        baseContent = null,
+        delete = false;
 
   _PatchOp.delete(this.rel, this.abs)
     : kind = 'delete',
       newContent = null,
       oldFragment = null,
       newFragment = null,
+      baseContent = null,
       delete = true;
 
   final String rel;
@@ -81,6 +88,16 @@ class _PatchOp {
   final String? oldFragment;
   final String? newFragment;
   final bool delete;
+
+  /// edit 规划时整文件基线：提交前重读比对，窗口内被改即中止，
+  /// 避免静默打到新内容上（与 write/edit 的 expectedContent 同口径）。
+  /// 占内存 ≤1MB（规划阶段已有 1MB 门禁），crash 即随 plan 释放。
+  final String? baseContent;
+
+  /// ToolRegistry 复检基线覆盖：审批复检时的最新快照（可写，供
+  /// _applyPatch 用 expectedContents 覆盖规划基线）。规划基线是
+  /// preview 时刻，复检基线是审批时刻，两者都与提交重读比对。
+  String? baseContentOverride;
 
   /// stage 侧车实际路径：唯一名，避免固定 `.myide-new` 并发互盖。
   String? stagedTmp;
@@ -678,6 +695,18 @@ class AgentTools {
     if (!planned.ok) {
       return AgentToolResult(ok: false, output: planned.error);
     }
+    // ToolRegistry 透传的复检基线（expectedContents）：审批复检时的最新
+    // 快照。调用方直接 execute（测试/内部）时无该字段，用规划基线。
+    final guarded = args['expectedContents'];
+    if (guarded is Map && guarded.isNotEmpty) {
+      for (final op in planned.ops) {
+        if (op.kind != 'edit') continue;
+        final v = guarded[op.rel];
+        if (v is String) {
+          op.baseContentOverride = v;
+        }
+      }
+    }
     final touched = <String>[];
     try {
       await _commitPatchOps(planned.ops);
@@ -774,6 +803,14 @@ class AgentTools {
           }
           final current = await target.readAsString();
           backups[op.abs] = current;
+          // 乐观锁：规划/复检基线与提交时重读比对，窗口内被
+          // 后台/外部改动即中止，避免静默打到新内容上。
+          // 复检基线（审批时刻）优先于规划基线（预览时刻）：
+          // 复检 hash 已保证两份预览一致，这里取最新快照做最终比对。
+          final base = op.baseContentOverride ?? op.baseContent;
+          if (base != null && current != base) {
+            throw StateError('${op.rel} 在审批期间发生变化，已中止落盘避免覆盖：请重新 read_file 后再试');
+          }
           final next = current.replaceFirst(op.oldFragment!, op.newFragment!);
           if (next == current) {
             throw StateError('${op.rel} 提交时片段已不匹配');
@@ -851,6 +888,9 @@ class AgentTools {
   }
 
   /// apply_patch 预览：只试算不落盘，供审批展示。
+  /// 预览同样返回各文件 oldContent 基线：ToolRegistry 复检时
+  /// 按文件逐个比对并透传 expectedContent 做提交乐观锁，
+  /// 避免“预览摘要 hash 通过、但某文件已被改”的漏检。
   Future<AgentToolResult> _applyPatchPreview(
     Map<String, dynamic> args, {
     bool allowOutside = false,
@@ -860,8 +900,16 @@ class AgentTools {
       return AgentToolResult(ok: false, output: planned.error);
     }
     final buf = StringBuffer('补丁预览 ${planned.ops.length} 个文件：\n');
+    final baselines = <String, String>{};
     for (final op in planned.ops) {
       buf.writeln('- ${op.rel}（${op.kind}）');
+      // edit 基线为规划时整文件；create 基线记哨兵（不存在）；
+      // delete 基线为当前内容（执行层不存在即 fail，无需锁）。
+      if (op.kind == 'edit' && op.baseContent != null) {
+        baselines[op.rel] = op.baseContent!;
+      } else if (op.kind == 'create') {
+        baselines[op.rel] = '__MYIDE_NOT_EXISTS__';
+      }
     }
     return AgentToolResult(
       ok: true,
@@ -869,7 +917,7 @@ class AgentTools {
       touchedFiles: planned.ops.map((e) => e.rel).toList(),
       preview: FilePreview(
         path: planned.ops.map((e) => e.rel).join(', '),
-        oldContent: '',
+        oldContent: jsonEncode(baselines),
         newContent: buf.toString(),
       ),
     );
@@ -949,7 +997,13 @@ class AgentTools {
           '$rel oldText 未匹配（含模糊空白）：${_mismatchHint(content, oldText)}',
         );
       }
-      ops.add(_PatchOp.edit(rel, abs, hit.oldFragment, hit.newFragment));
+      ops.add(_PatchOp.edit(
+        rel,
+        abs,
+        hit.oldFragment,
+        hit.newFragment,
+        baseContent: content,
+      ));
     }
     return _PatchPlan(ok: true, error: '', ops: ops);
   }
@@ -1744,6 +1798,12 @@ class AgentTools {
         }
         await Directory(abs).delete(recursive: true);
       } else {
+        // 文件分支同样先判链接：换链窗口（_delete 检查→rename 之间文件被
+        // 换成 symlink）下 File.copy 会跟随读区外目标内容进回收站。
+        if (FileSystemEntity.typeSync(abs, followLinks: false) ==
+            FileSystemEntityType.link) {
+          throw StateError('目标为符号链接，拒绝删除避免读到区外：$abs');
+        }
         await File(abs).copy(dest);
         await File(abs).delete();
       }
@@ -2765,6 +2825,16 @@ class AgentTools {
       final stderrDone = process.stderr
           .transform(outputDecoder)
           .forEach(stderr.write);
+      // 流订阅句柄：exitCode 超时/取消时必须取消订阅，否则 forEach 挂起
+      // 永不释放（后台路径已存 stdoutSub/stderrSub 并取消，前台此前泄漏）。
+      Future<void> cancelStreams() async {
+        try {
+          await stdoutDone.timeout(const Duration(seconds: 2));
+        } catch (_) {}
+        try {
+          await stderrDone.timeout(const Duration(seconds: 2));
+        } catch (_) {}
+      }
       final exitCode = await process.exitCode.timeout(
         Duration(seconds: timeoutSec),
         onTimeout: () async {
