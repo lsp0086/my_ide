@@ -123,7 +123,17 @@ void main() {
   test('对话落盘失败会设置 dirty 和 lastSaveError', () async {
     final blocker = await Directory.systemTemp.createTemp('chat-block-');
     addTearDown(() async {
-      if (await blocker.exists()) await blocker.delete(recursive: true);
+      // macOS 上 delete(recursive:true) 偶发 ENOTEMPTY(66) 竞态：
+      // 重试 + 吞掉清理失败，避免 tearDown 误判用例失败。
+      for (var i = 0; i < 3; i++) {
+        try {
+          if (await blocker.exists()) await blocker.delete(recursive: true);
+          break;
+        } catch (_) {
+          if (i == 2) break;
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+        }
+      }
     });
     final fileAsRoot = File(p.join(blocker.path, 'not-a-dir'));
     await fileAsRoot.writeAsString('x');
