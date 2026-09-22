@@ -42,7 +42,18 @@ void main() {
     });
 
     tearDown(() async {
-      if (await root.exists()) await root.delete(recursive: true);
+      // Windows 下文件句柄释放有延迟（杀毒软件/索引/刚关闭的 isolate），
+      // 直接删临时目录可能报 errno 32，按指数退避重试后仍失败则放弃，
+      // 避免清理问题误判为功能失败。
+      for (var i = 0; i < 5; i++) {
+        try {
+          if (await root.exists()) await root.delete(recursive: true);
+          break;
+        } catch (_) {
+          if (i == 4) break;
+          await Future<void>.delayed(Duration(milliseconds: 100 * (i + 1)));
+        }
+      }
     });
 
     test('glob 和 .gitignore 过滤文件', () async {

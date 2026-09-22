@@ -134,6 +134,9 @@ class WorkspaceSearch {
   }) async {
     final q = query.trim();
     if (q.isEmpty) return const [];
+    // 已取消时直接返回：此前先 compute 再查取消，isolate 在后台继续
+    // 遍历/持有文件句柄，Windows 下 tearDown 删临时目录报 errno 32。
+    if (cancellationToken?.isCancelled == true) return const [];
 
     final rawFuture = compute(_searchIsolate, <String, Object?>{
       'rootPath': rootPath,
@@ -150,11 +153,13 @@ class WorkspaceSearch {
     final result = await rawFuture.timeout(timeout);
     if (cancellationToken?.isCancelled == true) return const [];
     return result.map((g) {
+      // isolate 侧已统一为 /，这里再归一一次，防旧缓存/外部构造混入反斜杠。
+      String normRel(String v) => v.replaceAll('\\', '/');
       final hits = (g['hits'] as List)
           .cast<Map>()
           .map((h) => SearchHit(
                 absolutePath: h['absolutePath'] as String,
-                relativePath: h['relativePath'] as String,
+                relativePath: normRel(h['relativePath'] as String),
                 line: h['line'] as int,
                 column: h['column'] as int,
                 lineText: h['lineText'] as String,
@@ -163,7 +168,7 @@ class WorkspaceSearch {
           .toList();
       return SearchFileGroup(
         absolutePath: g['absolutePath'] as String,
-        relativePath: g['relativePath'] as String,
+        relativePath: normRel(g['relativePath'] as String),
         hits: hits,
       );
     }).toList();
@@ -380,9 +385,14 @@ class WorkspaceSearch {
           final length = entity.lengthSync();
           if (length <= 0 || length > maxFileBytes) continue;
           final raf = entity.openSync();
-          final sample = raf.readSync(length < 512 ? length : 512);
-          raf.closeSync();
-          if (sample.contains(0)) continue;
+          try {
+            final sample = raf.readSync(length < 512 ? length : 512);
+            if (sample.contains(0)) continue;
+          } finally {
+            try {
+              raf.closeSync();
+            } catch (_) {}
+          }
 
           final content = entity.readAsStringSync();
           final lines = content.split('\n');
@@ -392,9 +402,13 @@ class WorkspaceSearch {
             final line = lines[i];
             final match = pattern.firstMatch(line);
             if (match == null) continue;
+            // Windows 下 p.relative 返回反斜杠，统一为 /，
+            // 否则 glob 匹配与调用方断言全错位。
+            final hitRel =
+                p.relative(entity.path, from: rootPath).replaceAll('\\', '/');
             hits.add({
               'absolutePath': entity.path,
-              'relativePath': p.relative(entity.path, from: rootPath),
+              'relativePath': hitRel,
               'line': i,
               'column': match.start,
               'lineText': line.length > 240
@@ -407,7 +421,7 @@ class WorkspaceSearch {
           if (hits.isNotEmpty) {
             groups.add({
               'absolutePath': entity.path,
-              'relativePath': p.relative(entity.path, from: rootPath),
+              'relativePath': relativePath,
               'hits': hits,
             });
           }
