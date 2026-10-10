@@ -124,30 +124,52 @@ class CommandProcessManager {
   }
 
   Future<void> _terminateOnce(Process process, Duration gracePeriod) async {
+    // 终止全程要杀的后代 pid 并集：中途 _recordDescendants 的 retainAll
+    // 会把已孤儿化（被 init 收养、ppid 不再是目标）的存活子进程洗掉，
+    // 后续 SIGKILL 若只用当前集会杀空。并集保证孤儿仍被追杀。
+    final doomed = <int>{};
     try {
       if (Platform.isWindows) {
         await _taskkill(process.pid, force: false);
       } else {
-        // 先快照后代再发信号：`(sleep 2; …) & wait` 这类后台子 shell
-        // 在父 shell 被 SIGTERM 后会被 init 收养，事后 pgrep 再也找不到；
-        // 快照→组杀→逐进程 SIGTERM 必须在父进程还活着时一次做完。
+        // 先冻结再快照：kill 紧跟 start 时子进程可能尚未 fork，
+        // 父 shell 先被 SIGTERM 后子进程被 init 收养，事后 pgrep -P
+        // 再也找不到；`sleep 2; echo ...` 的 echo 就会在 grace 期内
+        // 照样落盘（CI macOS 偶发失败即此）。STOP 冻住父 shell 使其
+        // 不能再 fork/推进到下一条命令，快照才准确。
+        // 注意 STOP 的进程收到的 TERM 会挂起，TERM 后必须 CONT 才送达。
+        await _stopPid(process.pid);
         await _recordDescendants(process.pid);
+        doomed.addAll(_descendants[process.pid] ?? const <int>{});
+        if (doomed.isNotEmpty) {
+          await _stopAll(doomed);
+          await _recordDescendants(process.pid);
+          doomed.addAll(_descendants[process.pid] ?? const <int>{});
+        }
         await _killProcessGroup(process.pid, force: false);
-        final tracked = _descendants[process.pid] ?? const <int>{};
-        _signalAll(tracked, ProcessSignal.sigterm);
-        process.kill(ProcessSignal.sigterm);
+        _signalAll(doomed, ProcessSignal.sigterm);
+        try {
+          process.kill(ProcessSignal.sigterm);
+        } catch (_) {}
+        await _contAll({...doomed, process.pid});
         await Future<void>.delayed(const Duration(milliseconds: 300));
         await _recordDescendants(process.pid);
-        final current = _descendants[process.pid] ?? const <int>{};
-        _signalAll(current, ProcessSignal.sigterm);
+        doomed.addAll(_descendants[process.pid] ?? const <int>{});
+        _signalAll(doomed, ProcessSignal.sigterm);
+        try {
+          process.kill(ProcessSignal.sigterm);
+        } catch (_) {}
+        await _contAll({...doomed, process.pid});
       }
       await Future<void>.delayed(gracePeriod);
       if (Platform.isWindows) {
         await _taskkill(process.pid, force: true);
       } else {
-        final descendants = _descendants[process.pid] ?? const <int>{};
-        _signalAll(descendants, ProcessSignal.sigkill);
-        process.kill(ProcessSignal.sigkill);
+        doomed.addAll(_descendants[process.pid] ?? const <int>{});
+        _signalAll(doomed, ProcessSignal.sigkill);
+        try {
+          process.kill(ProcessSignal.sigkill);
+        } catch (_) {}
         await _killProcessGroup(process.pid, force: true);
       }
       try {
@@ -160,6 +182,40 @@ class CommandProcessManager {
       _active.remove(process.pid);
       _terminating.remove(process.pid);
     }
+  }
+
+  /// 冻结指定 pid（SIGSTOP），失败忽略（进程已退出等）。
+  /// terminate 开头的冻结专用：先冻父 shell，阻止其继续 fork/推进命令。
+  Future<void> _stopPid(int pid) async {
+    try {
+      await Process.run('kill', ['-STOP', '$pid'])
+          .timeout(const Duration(seconds: 2));
+    } catch (_) {}
+  }
+
+  Future<void> _contPid(int pid) async {
+    try {
+      await Process.run('kill', ['-CONT', '$pid'])
+          .timeout(const Duration(seconds: 2));
+    } catch (_) {}
+  }
+
+  Future<void> _stopAll(Iterable<int> pids) async {
+    try {
+      await Future.wait(
+        pids.map(_stopPid),
+        eagerError: false,
+      ).timeout(const Duration(seconds: 5));
+    } catch (_) {}
+  }
+
+  Future<void> _contAll(Iterable<int> pids) async {
+    try {
+      await Future.wait(
+        pids.map(_contPid),
+        eagerError: false,
+      ).timeout(const Duration(seconds: 5));
+    } catch (_) {}
   }
 
   Future<ProcessTerminateReport> terminateWithReport(
