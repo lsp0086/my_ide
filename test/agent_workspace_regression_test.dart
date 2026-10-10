@@ -572,11 +572,14 @@ void main() {
 
     test('在途取消：搜索提前返回空、不悬挂且不写缓存', () async {
       WorkspaceSearch.clearRecentCache();
-      final sw = Stopwatch()..start();
       var polls = 0;
+      // 按轮询次数触发取消，不按耗时：快机上 3MB 扫描远快于 30ms，
+      // 时间谓词根本走不到取消分支，反而把空结果进缓存致断言失败
+      // （Linux 快机偶发失败即此）。第 1 次为 search 入口预检放行，
+      // 第 2 次在 isolate 已 spawn 后的首轮循环命中取消，稳定走 kill 路径。
       final token = SearchCancellationToken.fromPredicate(() {
         polls++;
-        return sw.elapsedMilliseconds > 30;
+        return polls >= 2;
       });
       final result = await WorkspaceSearch.search(
         rootPath: bigRoot.path,
