@@ -39,7 +39,11 @@ class LocalIntegrityChecker {
       jsonDecode(trimmed);
       return const [];
     } on FormatException catch (e) {
-      final offset = (e.offset ?? 0).clamp(0, text.length);
+      // 第7轮R7-1：偏移按trimmed坐标映射——e.offset相对trimmed，
+      // 此前直接套原文text，前导空白即行号漂移。现按前导空白偏移回原文。
+      final trimmedOffset = (e.offset ?? 0).clamp(0, trimmed.length);
+      final leading = text.length - text.trimLeft().length;
+      final offset = (leading + trimmedOffset).clamp(0, text.length);
       final pos = _offsetToLineChar(text, offset);
       return [
         IdeDiagnostic(
@@ -126,7 +130,124 @@ class LocalIntegrityChecker {
           col++;
           continue;
         }
-        if (ch == '\\' && quote != '`') {
+        // R6-反引号模板插值：`a${b}c` 内 ${} 括号在 quote 分支被全吞，
+        // 失衡括号漏检。插值段按代码扫描（引号暂停），} 后恢复模板态。
+        if (quote == '`' && ch == '\$' && next == '{') {
+          // 插值开 `{` 同样压栈：`}` 按配对弹回 depth0 即闭合；
+          // 失衡 `(` 留栈尾由文末 unclosed 检出，`)` 走 extra 检出。
+          stack.add(_BracketFrame('{', line, col));
+          final depth0 = stack.length - 1;
+          i += 2;
+          col += 2;
+          while (i < text.length) {
+            final c2 = text[i];
+            final n2 = i + 1 < text.length ? text[i + 1] : null;
+            if (c2 == '\n') {
+              line++;
+              col = 0;
+              i++;
+              continue;
+            }
+            if (c2 == "'" || c2 == '"' || c2 == '`') {
+              var j = i + 1;
+              while (j < text.length) {
+                if (text[j] == '\\') {
+                  j += 2;
+                  continue;
+                }
+                if (text[j] == c2) break;
+                if (text[j] == '\n' && c2 != '`') break;
+                j++;
+              }
+              // 轮次1：跨行内层字符串（反引号模板）同步维护 line/col——
+              // 此前 line 不递增、col 只 +1，诊断行/列号漂移。
+              var lastNl = -1;
+              var nlCount = 0;
+              for (var k = i; k < j && k < text.length; k++) {
+                if (text[k] == '\n') {
+                  nlCount++;
+                  lastNl = k;
+                }
+              }
+              i = j < text.length ? j + 1 : text.length;
+              if (nlCount > 0) {
+                line += nlCount;
+                col = j - lastNl;
+              } else {
+                col += (j - i) + 1;
+              }
+              continue;
+            }
+            if (c2 == '(' || c2 == '[' || c2 == '{') {
+              stack.add(_BracketFrame(c2, line, col));
+              i++;
+              col++;
+              continue;
+            }
+            if (c2 == ')' || c2 == ']' || c2 == '}') {
+              if (stack.length > depth0) {
+                stack.removeLast();
+                i++;
+                col++;
+                // 插值闭合：回到模板字符串态。
+                if (c2 == '}' && stack.length == depth0) break;
+                continue;
+              }
+              // 插值内多余闭合：记错后继续，避免整段吞掉漏检。
+              out.add(IdeDiagnostic(
+                filePath: filePath,
+                startLine: line,
+                startChar: col,
+                endLine: line,
+                endChar: col + 1,
+                severity: DiagnosticSeverity.error,
+                message: '多余的闭合符号「$c2」',
+                source: source,
+                code: 'bracket.extra',
+                contentVersion: contentVersion,
+              ));
+              i++;
+              col++;
+              // 插值提前闭合同样回模板态。
+              if (c2 == '}') break;
+              continue;
+            }
+            i++;
+            col++;
+            // 模板插值块注释/行注释同样跳过，避免 `/*` 误判。
+            if (c2 == '/' && n2 == '/') {
+              while (i < text.length && text[i] != '\n') {
+                i++;
+                col++;
+              }
+              continue;
+            }
+            if (c2 == '/' && n2 == '*') {
+              i += 2;
+              col += 2;
+              while (i < text.length &&
+                  !(text[i] == '*' &&
+                      i + 1 < text.length &&
+                      text[i + 1] == '/')) {
+                if (text[i] == '\n') {
+                  line++;
+                  col = 0;
+                } else {
+                  col++;
+                }
+                i++;
+              }
+              i += 2;
+              col += 2;
+              continue;
+            }
+          }
+          continue;
+        }
+        if (ch == '\\') {
+          // 轮次1：反引号字符串内同样进入转义态——此前 `quote != '`'`
+          // 条件使 JS 模板 `\`` 转义反引号被误判为闭合，后续文本被
+          // 当代码扫描产生误报。
           escaped = true;
           i++;
           col++;

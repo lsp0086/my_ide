@@ -58,11 +58,34 @@ class _MyIdeAppState extends State<MyIdeApp> {
       highlightStyleId: settings.highlightStyleId,
     );
     _shortcutController = ShortcutController();
+    _loadSavedShortcuts(settings);
+    _shortcutController.addListener(_persistShortcuts);
     _chatStore = ChatStore();
     _checkpointStore = CheckpointStore();
     _diagnosticsStore = DiagnosticsStore();
     _themeController.addListener(_persistTheme);
     settings.addListener(_syncFromSettings);
+  }
+
+  /// 启动恢复：快捷键自定义落盘在 SettingsStore，重启后仍生效。
+  void _loadSavedShortcuts(SettingsStore settings) {
+    for (final action in ShortcutAction.values) {
+      final raw = settings.getString('shortcut.${action.name}');
+      if (raw != null && raw.isNotEmpty) {
+        _shortcutController.applySavedBinding(action, raw);
+      }
+    }
+  }
+
+  void _persistShortcuts() {
+    final settings = SettingsStore.instance;
+    for (final action in ShortcutAction.values) {
+      final value = _shortcutController.bindingPrefsValue(action);
+      if (settings.getString('shortcut.${action.name}') != value) {
+        // ignore: discarded_futures
+        settings.setString('shortcut.${action.name}', value);
+      }
+    }
   }
 
   void _persistTheme() {
@@ -89,6 +112,7 @@ class _MyIdeAppState extends State<MyIdeApp> {
   @override
   void dispose() {
     SettingsStore.instance.removeListener(_syncFromSettings);
+    _shortcutController.removeListener(_persistShortcuts);
     _themeController.removeListener(_persistTheme);
     _themeController.dispose();
     _shortcutController.dispose();

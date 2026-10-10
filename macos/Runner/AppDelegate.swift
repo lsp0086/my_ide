@@ -69,6 +69,21 @@ class AppDelegate: FlutterAppDelegate {
     openNewWindow(openPath: nil)
   }
 
+  /// Dock 图标右键菜单 -> 新建窗口：像其他多窗口应用一样一键直达，
+  /// 不必先聚焦应用再进 Window 菜单。复用同一条 openNewWindow 链路
+  /// （同进程新 NSWindow + 独立 Flutter Engine，空窗口由用户自行选项目）。
+  override func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+    let menu = NSMenu()
+    let item = NSMenuItem(
+      title: "新建窗口",
+      action: #selector(newWindow(_:)),
+      keyEquivalent: ""
+    )
+    item.target = self
+    menu.addItem(item)
+    return menu
+  }
+
   /// Dart 侧通过 MethodChannel 调用；openPath 由新窗口 Dart 经通道拉取直达。
   func openNewWindow(openPath: String?) {
     let controller = MainFlutterWindowController.create(openPath: openPath)

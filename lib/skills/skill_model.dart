@@ -114,9 +114,9 @@ class SkillMdParser {
       if (directoryName != null && directoryName.isNotEmpty) {
         name = directoryName;
         warning = '缺少 name，已用目录名「$directoryName」';
-      } else if (strict) {
-        throw SkillParseException('缺少必填字段 name');
       } else {
+        // 轮次1：strict 与非 strict 分支体此前完全相同（重复死代码），
+        // 合并。
         throw SkillParseException('缺少必填字段 name');
       }
     }
@@ -127,7 +127,10 @@ class SkillMdParser {
 
     if (name.length > 64) {
       if (strict) throw SkillParseException('name 超过 64 字符');
-      warning = _joinWarning(warning, 'name 超过 64 字符');
+      // 轮次1：非 strict 同步截断（对齐 description 口径）——此前仅
+      // warning 不截断，超长 name 仍进 id/目录名/落盘。
+      warning = _joinWarning(warning, 'name 超过 64 字符，已截断');
+      name = name.substring(0, 64);
     }
     if (!_nameRe.hasMatch(name)) {
       if (strict) {

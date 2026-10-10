@@ -20,14 +20,14 @@ import 'url_fetch_policy.dart';
 class AgentToolResult {
   AgentToolResult({
     required this.ok,
-    required this.output,
+    required String output,
     this.touchedFiles = const [],
     this.preview,
     this.untrusted = false,
     this.source,
     this.promptTokens,
     this.completionTokens,
-  });
+  }) : output = AppLogger.redactSensitiveText(output);
 
   final bool ok;
   final String output;
@@ -60,23 +60,23 @@ class _PatchOp {
     this.oldFragment,
     this.newFragment, {
     required this.baseContent,
-  })  : kind = 'edit',
-        newContent = null,
-        delete = false;
+  }) : kind = 'edit',
+       newContent = null,
+       delete = false;
 
   _PatchOp.create(this.rel, this.abs, this.newContent)
-      : kind = 'create',
-        oldFragment = null,
-        newFragment = null,
-        baseContent = null,
-        delete = false;
+    : kind = 'create',
+      oldFragment = null,
+      newFragment = null,
+      baseContent = null,
+      delete = false;
 
-  _PatchOp.delete(this.rel, this.abs)
+  _PatchOp.delete(this.rel, this.abs, {required String? base})
     : kind = 'delete',
       newContent = null,
       oldFragment = null,
       newFragment = null,
-      baseContent = null,
+      baseContent = base,
       delete = true;
 
   final String rel;
@@ -173,6 +173,42 @@ class _BackgroundTask {
   void appendErr(Object e) => _append('$e');
 }
 
+/// 前台 run_command 输出环形缓冲：与后台任务 _BackgroundTask._append 同口径
+/// （单行截 500 字、总量保留尾部 2000 行）。300s 超时窗口内刷屏命令此前
+/// 无上限 StringBuffer 累积可 OOM，现只保留尾部（测试可见，可直接单测）。
+class ForegroundOutputRing {
+  final List<String> _lines = [];
+  bool _truncated = false;
+
+  static const maxLines = 2000;
+  static const maxLineChars = 500;
+
+  void append(String chunk) {
+    for (final line in chunk.split('\n')) {
+      final t = line.trimRight();
+      if (t.isEmpty) continue;
+      _lines.add(
+        t.length > maxLineChars ? '${t.substring(0, maxLineChars)}…' : t,
+      );
+      if (_lines.length > maxLines) {
+        _lines.removeRange(0, _lines.length - maxLines);
+        _truncated = true;
+      }
+    }
+  }
+
+  void appendLine(Object e) => append('$e');
+
+  bool get isNotEmpty => _lines.isNotEmpty;
+
+  @override
+  String toString() {
+    if (_lines.isEmpty) return '';
+    final head = _truncated ? '…（输出超长，仅保留尾部 $maxLines 行）\n' : '';
+    return '$head${_lines.join('\n')}';
+  }
+}
+
 class AgentTools {
   factory AgentTools({
     required String rootPath,
@@ -198,6 +234,45 @@ class AgentTools {
   final WorkspaceFs _fs;
   final TerminalSessionStore terminals;
   static final Random _rng = Random.secure();
+
+  /// 会话取消联动：注册后 search_text 运行中轮询该回调，
+  /// 会话取消即杀底层搜索 isolate（此前搜索无法取消）。
+  bool Function(String sessionId)? isSessionCancelled;
+
+  /// R1-F1：restore 在途探针——直调 execute() 同样等待在途 restore，
+  /// 此前仅 ToolRegistry.executeWithGuards 层等待，直调写在 restore
+  /// 建Redo→复检→应用树之间落盘，被目标树静默覆盖且不在Redo内。
+  /// UI/Runner 侧经 ToolRegistry 已有等待，此处为写盘统一关口兜底；
+  /// 未注入（单测/旧路径）即直接放行。
+  bool Function()? restoreBusyCheck;
+  int Function()? restoreGenCheck;
+
+  /// 在途 search_text 取消令牌（按会话登记）：工具执行入口把 token 关联到
+  /// 本次调用，30s 熔断/取消路径经 [cancelActiveSearch] 置位后，
+  /// _runSearchIsolate 轮询命中即 kill 底层 isolate——此前超时只丢 Future
+  /// 结果，挂死的搜索 isolate 无人杀。
+  final Map<String, List<SearchCancellationToken>> _activeSearchTokens = {};
+
+  final Set<String> _cancelledSessions = {};
+
+  /// 取消该会话全部在途 search_text（SubagentRuntime 30s 熔断与取消路径调用）。
+  void cancelActiveSearch(String sessionId) {
+    final tokens = _activeSearchTokens.remove(sessionId);
+    if (tokens == null) return;
+    for (final t in tokens) {
+      t.cancel();
+    }
+  }
+
+  /// 子 Agent 超时/取消：搜索立即停，其它只读工具在下一次检查点退出。
+  void cancelSessionWork(String sessionId) {
+    if (sessionId.isEmpty) return;
+    _cancelledSessions.add(sessionId);
+    cancelActiveSearch(sessionId);
+  }
+
+  bool sessionWorkCancelled(String sessionId) =>
+      sessionId.isNotEmpty && _cancelledSessions.contains(sessionId);
 
   WorkspaceFs get fs => _fs;
 
@@ -227,6 +302,192 @@ class AgentTools {
   /// 审批后写侧父目录链接检查：目标本身不是链接、但父目录是
   /// `root/link->/tmp` 外链时，`link/a` 词法在区内但落盘跟随到区外。
   /// 此前 _isWriteLinkTarget 只查终点本身，父链可逃逸。
+  /// todo_write 并发串行：进程内按 root 排队，避免双写 load→merge→save 互盖。
+  /// R5-01 多对话并行同文件写锁（Cursor Lock queue 口径）：
+  /// 同工作区多 Runner/多对话并发写同一文件时按规范化绝对路径排队串行，
+  /// 后写基于前写落盘后的新版本读-改-写，不再 last-write-wins 互盖。
+  /// 锁粒度为单文件写操作（write/edit/apply_patch 单文件段），只读不加锁；
+  /// 跨文件补丁按涉及文件依次加锁（顺序排序防死锁）。
+  /// 差异检测走 checkpoint diff：每次写后 Runner 已落 ai-edit-step 版本，
+  /// 冲突回滚用版本链 undo/redo，不走 git worktree（单工作区现状）。
+  static final Map<String, Future<void>> _todoWriteChains = {};
+  static final Map<String, Future<void>> _fileWriteChains = {};
+
+  /// 同文件写串行：absNorms 为本次写涉及的规范化绝对路径（可多个），
+  /// 按排序后顺序逐个排队，避免锁顺序不一致死锁。队列失败不影响后排（catchError 自愈）。
+  /// R5-01 修类型擦除：fileWriteChains 存 Future void 做纯排队哨兵，
+  /// 真结果由独立 Completer 承载，避免 Future.value 强转崩（T3/T4 单测复现）。
+  /// R4-01：写链 canonical 键（测试可见）——编辑器与 Agent 同键串行：
+  /// realpath 消别名 + 非 Linux 小写归一 + 失败 unresolved 隔离，
+  /// 此前编辑器直传词法路径，alias 与 real 双写绕过串行互盖。
+  static String canonicalFileKeyForTest(String raw) {
+    final t = raw.trim();
+    if (t.isEmpty) return '';
+    try {
+      final abs = p.normalize(t);
+      final caseFold = Platform.isLinux ? false : true;
+      try {
+        final real = WorkspaceFs.realpathOf(abs);
+        return caseFold ? real.toLowerCase() : real;
+      } catch (_) {
+        final fallback = caseFold ? abs.toLowerCase() : abs;
+        return 'unresolved:$fallback';
+      }
+    } catch (_) {
+      return '';
+    }
+  }
+
+  static Future<T> serializeFileWrites<T>(
+    List<String> absNorms,
+    Future<T> Function() fn,
+  ) {
+    final keys =
+        absNorms
+            .map(canonicalFileKeyForTest)
+            .where((e) => e.isNotEmpty)
+            .toSet()
+            .toList()
+          ..sort();
+    if (keys.isEmpty) return fn();
+    // R1-T6：链必须含fn体——此前next=prev.then((_) {})只排哨兵，
+    // gate=多key哨兵join，fn在gate后并发，后写仍与前写并发互盖。
+    // 现：快照各key前排→等齐→跑fn→结算；每key尾为本次fn完成future。
+    final prevs = <String, Future<void>>{};
+    for (final key in keys) {
+      prevs[key] = _fileWriteChains[key] ?? Future<void>.value();
+    }
+    final completer = Completer<T>();
+    final tails = <String, Future<void>>{};
+    for (final key in keys) {
+      final tail = completer.future.then((_) {}).catchError((_) {});
+      _fileWriteChains[key] = tail;
+      tails[key] = tail;
+    }
+    // R1-11：超时只告警不放行并发——此前onTimeout返回空列表直接跑fn，
+    // 后写与前写并发互盖（last-write-wins）。现30s打日志告警但仍等队头，
+    // 串行到底，后排阻塞不互盖（对标Cline Shadow-Git写前快照串行口径）。
+    unawaited(
+      Future<void>.delayed(const Duration(seconds: 30), () {
+        if (!completer.isCompleted) {
+          AppLogger.instance.error(
+            'filechain',
+            '写链前排等待超时(30s)，仍串行等待避免互盖',
+            null,
+          );
+        }
+      }),
+    );
+    Future.wait(prevs.values).then((_) async {
+      try {
+        completer.complete(await fn());
+      } catch (e, st) {
+        completer.completeError(e, st);
+      } finally {
+        for (final key in keys) {
+          final cur = _fileWriteChains[key];
+          if (cur != null && identical(cur, tails[key])) {
+            _fileWriteChains.remove(key);
+          }
+        }
+      }
+    });
+    return completer.future;
+  }
+
+  /// R6-03 测试钩子：锁表长度（压测后应回落为 0，不断言内部 future 细节）。
+  static int fileWriteChainLengthForTest() => _fileWriteChains.length;
+
+  /// 实例便捷封装：按 rootPath+rel 算规范化绝对路径后串行。
+  /// 锁键用 realpath 消别名：词法不同的 symlink/大小写别名指向同一文件时
+  /// 必须同键，否则并行双写绕过串行直接互盖。
+  Future<T> _serializeFileWrite<T>(List<String> rels, Future<T> Function() fn) {
+    // R5-07：键单源——直出canonical键，不再此地双算realpath+归一，
+    // 此前与serializeFileWrites内canonical双算口径分裂即互盖。
+    // R1-F1：写盘统一关口等restore——直调execute()不再绕过互斥。
+    // 超时按失败结果返回（不抛错）：调用方按Result口径处理，与
+    // ToolRegistry层"版本恢复进行中"失败返回同口径。
+    Future<T> gated() async {
+      final busy = restoreBusyCheck;
+      final gen = restoreGenCheck;
+      if (busy != null && gen != null && busy()) {
+        final deadline = DateTime.now().add(const Duration(seconds: 30));
+        DateTime? quietSince;
+        while (true) {
+          if (!DateTime.now().isBefore(deadline)) {
+            throw StateError('版本恢复进行中，写盘已推迟避免丢写：请稍后重试');
+          }
+          if (busy()) {
+            quietSince = null;
+          } else {
+            quietSince ??= DateTime.now();
+            if (DateTime.now().difference(quietSince) >=
+                const Duration(milliseconds: 200)) {
+              break;
+            }
+          }
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+        }
+      }
+      return fn();
+    }
+
+    final keys = rels
+        .map((r) {
+          try {
+            final abs = p.normalize(p.isAbsolute(r) ? r : p.join(rootPath, r));
+            return AgentTools.canonicalFileKeyForTest(abs);
+          } catch (_) {
+            return '';
+          }
+        })
+        .where((e) => e.isNotEmpty)
+        .toList();
+    if (keys.isEmpty) return gated();
+    return AgentTools.serializeFileWrites(keys, gated);
+  }
+
+  Future<T> _serializeTodoWrite<T>(Future<T> Function() fn) {
+    // R11R4：与 serializeFileWrites 同口径自动清链——此前只增不删，
+    // 进程常驻下 _todoWriteChains 按 root 无界膨胀；完成后无后排即删 key。
+    // R1-T5：链必须含fn体——此前prev.then((_) {})只排哨兵不排fn，
+    // Future.wait双写并发同时进fn致load→merge→save互盖丢b。
+    // 现tail为本次fn完成 future，后排await prev即等本次fn落盘。
+    // 第2轮R2-2：超时fail-closed与文件链同口径——此前超时打日志后放行进fn，
+    // 网络盘卡住时连续两次todo_write可与前排load→merge→save并发互盖丢todo。
+    // 现30s只告警仍串行等队头，后排阻塞不互盖。
+    final key = _todoRootKey();
+    final prev = _todoWriteChains[key] ?? Future<void>.value();
+    final completer = Completer<T>();
+    final tail = completer.future.then((_) {}).catchError((_) {});
+    _todoWriteChains[key] = tail;
+    unawaited(
+      Future<void>.delayed(const Duration(seconds: 30), () {
+        if (!completer.isCompleted) {
+          AppLogger.instance.error(
+            'todochain',
+            'todo链前排等待超时(30s)，仍串行等待避免互盖',
+            null,
+          );
+        }
+      }),
+    );
+    prev.then((_) async {
+          try {
+            completer.complete(await fn());
+          } catch (e, st) {
+            completer.completeError(e, st);
+          } finally {
+            final cur = _todoWriteChains[key];
+            if (identical(cur, tail)) _todoWriteChains.remove(key);
+          }
+        });
+    return completer.future;
+  }
+
+  /// R11R4 测试钩子：todo 锁表长度（压测后应回落为 0）。
+  static int todoWriteChainLengthForTest() => _todoWriteChains.length;
+
   bool _isOutsideAfterRealpath(String rawPath) {
     try {
       final abs = p.normalize(
@@ -236,7 +497,10 @@ class AgentTools {
       final rootReal = WorkspaceFs.realpathOf(p.normalize(rootPath));
       return real != rootReal && !p.isWithin(rootReal, real);
     } catch (_) {
-      return false;
+      // R11R3：fail-closed——realpath 探测抛错（EPERM/IO异常）时此前
+      // 直接 return false 默认放行，越界写绕过门禁。本路径调用方语义均为
+      // "true 即拒绝写入"，误报只多一次拒绝不丢数据。
+      return true;
     }
   }
 
@@ -245,40 +509,28 @@ class AgentTools {
   /// 中间段同样检查：`root/dangling->/tmp/nonexist` 悬空链上建 `dangling/a` 时，
   /// _realpathOr 越过悬空段返回区内路径，此前终点/父链检查双双放行，
   /// 后续 create(recursive:true) 会跟随悬空链写到区外。
+  /// R1-T7：区内别名（alias->同区real）允许写——此前终点是链接即全拒，
+  /// R1-08内部别名写被误拒。真逃逸由realpath区外判+复检兜底：
+  /// 别名解析仍在区内即放行，解析到区外即拒。
   bool _isWriteLinkTarget(String rawPath) {
+    // 与 WorkspaceFs.isWriteLink 同口径：词法 root 基准逐段查，
+    // 避免 realpath 把 root 下外链段提前展开导致提前退出漏检。
+    final abs = p.normalize(
+      p.isAbsolute(rawPath) ? rawPath : p.join(rootPath, rawPath),
+    );
     try {
-      final abs = p.normalize(
-        p.isAbsolute(rawPath) ? rawPath : p.join(rootPath, rawPath),
-      );
-      if (FileSystemEntity.typeSync(abs, followLinks: false) ==
+      if (FileSystemEntity.typeSync(abs, followLinks: false) !=
           FileSystemEntityType.link) {
-        return true;
+        return WorkspaceFs.isWriteLink(abs, rootPath);
       }
-      // 逐段查中间链接：任一段为链接即拒。
-      var dir = p.dirname(abs);
-      final rootNorm = p.normalize(rootPath);
-      for (var i = 0; i < 32; i++) {
-        if (dir == rootNorm ||
-            !(dir == rootNorm ||
-                p.isWithin(rootNorm, dir) ||
-                p.isWithin(dir, rootNorm))) {
-          break;
-        }
-        try {
-          if (FileSystemEntity.typeSync(dir, followLinks: false) ==
-              FileSystemEntityType.link) {
-            return true;
-          }
-        } catch (_) {
-          break;
-        }
-        final parent = p.dirname(dir);
-        if (parent == dir) break;
-        dir = parent;
-      }
-      return false;
+      // 终点本身是链接：解析后仍在区内即内部别名，放行；
+      // 解析到区外/解析失败即逃逸，拒绝。
+      final real = WorkspaceFs.realpathOf(abs);
+      final rootReal = WorkspaceFs.realpathOf(p.normalize(rootPath));
+      if (real == rootReal || p.isWithin(rootReal, real)) return false;
+      return true;
     } catch (_) {
-      return false;
+      return true;
     }
   }
 
@@ -297,10 +549,34 @@ class AgentTools {
     }
   }
 
+  /// 回收站路径剥离 `<stamp>_<pid-rand>[_<n>]_<原名>` 前缀：
+  /// 与 WorkspaceFs.isSensitiveTrashEntry 同口径，供 _read 纵深补检。
+  /// 非 trash 路径返回 null。
+  String? _stripTrashPrefix(String rel) {
+    final norm = rel.replaceAll('\\', '/');
+    final idx = norm.indexOf('.my_ide/trash/');
+    if (idx < 0) return null;
+    final entry = norm.substring(idx + '.my_ide/trash/'.length);
+    final base = entry.split('/').isEmpty ? entry : entry.split('/').last;
+    final parts = base.split('_');
+    if (parts.length <= 1) return base;
+    if (parts[1].contains('-')) {
+      if (parts.length >= 4 && RegExp(r'^\d+$').hasMatch(parts[2])) {
+        return parts.sublist(3).join('_');
+      }
+      return parts.sublist(2).join('_');
+    }
+    if (parts.length >= 3 && RegExp(r'^\d+$').hasMatch(parts[1])) {
+      return parts.sublist(2).join('_');
+    }
+    return parts.sublist(1).join('_');
+  }
+
   Future<AgentToolResult> execute(
     String name,
-    Map<String, dynamic> args,
-  ) async {
+    Map<String, dynamic> args, {
+    String sessionId = '',
+  }) async {
     switch (name) {
       case 'read_file':
         return _read(args);
@@ -321,7 +597,7 @@ class AgentTools {
       case 'list_files':
         return _list(args);
       case 'search_text':
-        return _search(args);
+        return _search(args, sessionId: sessionId);
       case 'repo_map':
         return _repoMap();
       case 'semantic_search':
@@ -347,17 +623,17 @@ class AgentTools {
       case 'git_blame':
         return _gitBlame(args);
       case 'terminal_create':
-        return _terminalCreate();
+        return _terminalCreate(sessionId);
       case 'terminal_write':
-        return _terminalWrite(args);
+        return _terminalWrite(args, sessionId);
       case 'terminal_poll':
-        return _terminalPoll(args);
+        return _terminalPoll(args, sessionId);
       case 'terminal_kill':
-        return _terminalKill(args);
+        return _terminalKill(args, sessionId);
       case 'run_command':
-        return _runCommand(args);
+        return _runCommand(args, sessionId: sessionId);
       case 'poll_task':
-        return pollTask(args);
+        return pollTask(args, sessionId: sessionId);
       case 'ask_question':
         // 由 Runner 拦截处理，这里兜底
         return AgentToolResult(ok: false, output: 'ask_question 需经 UI 确认后继续');
@@ -371,7 +647,8 @@ class AgentTools {
     }
   }
 
-  /// 审批通过后的区外/敏感只读：仅 read_file / list_files。
+  /// 审批通过后的区外/敏感只读：仅 read_file / list_files（单文件 stat）。
+  /// search_text 区外直接拒绝，避免一次审批全文扫任意区外目录。
   Future<AgentToolResult> executeApprovedRead(
     String name,
     Map<String, dynamic> args,
@@ -382,14 +659,14 @@ class AgentTools {
       case 'list_files':
         return _list(args, allowOutside: true);
       case 'search_text':
-        return _search(args, allowOutside: true);
+        return AgentToolResult(
+          ok: false,
+          output: '区外路径不支持全文搜索，仅允许 read_file 单文件读取',
+        );
       case 'git_status':
       case 'git_diff':
       case 'git_preflight':
-        return AgentToolResult(
-          ok: false,
-          output: 'Git 工具仅支持工作区内路径读取',
-        );
+        return AgentToolResult(ok: false, output: 'Git 工具仅支持工作区内路径读取');
       default:
         return AgentToolResult(
           ok: false,
@@ -415,11 +692,17 @@ class AgentTools {
         return _delete(args, allowOutside: true);
       case 'move_file':
         return _move(args, allowOutside: true);
+      case 'make_dir':
+        return _makeDir(args, allowOutside: true);
+      case 'copy_file':
+        return _copyFile(args, allowOutside: true);
+      case 'set_executable':
+        return _setExecutable(args, allowOutside: true);
       default:
         return AgentToolResult(
           ok: false,
           output:
-              '区外/敏感路径审批后仅支持 write_file / edit_file / delete_file / move_file',
+              '区外/敏感路径审批后仅支持 write_file / edit_file / delete_file / move_file / make_dir / copy_file / set_executable',
         );
     }
   }
@@ -482,6 +765,18 @@ class AgentTools {
     final limit = (args['limit'] as num?)?.toInt() ?? 200;
     final offset = (args['offset'] as num?)?.toInt() ?? 0;
     try {
+      // 回收站敏感豁免不可读：WorkspaceFs 对 .my_ide/trash/ 提前 return false 判 inside，
+      // 但 trash 条目剥离前缀后可能是已删密钥（.env），直读即泄露。此处纵深补检。
+      final trashStripped = _stripTrashPrefix(rel);
+      if (trashStripped != null &&
+          WorkspaceFs.isSensitiveRelative(trashStripped)) {
+        return AgentToolResult(ok: false, output: '敏感路径拒绝读取：$rel');
+      }
+      // Round4：审批外读同样纵深拒敏感——此前仅 _list 在 allowOutside 时补
+      // sensitive 拒绝，读通道可经审批读敏感文件（与写侧不对称）。
+      if (allowOutside && WorkspaceFs.isSensitiveRelative(rel)) {
+        return AgentToolResult(ok: false, output: '敏感路径拒绝读取：$rel');
+      }
       final abs = allowOutside ? _resolveApprovedRead(rel) : _resolve(rel);
       final file = File(abs);
       if (!await file.exists()) {
@@ -501,7 +796,16 @@ class AgentTools {
       final lines = text.split('\n');
       final start = offset.clamp(0, lines.length);
       final end = (start + limit).clamp(0, lines.length);
-      final slice = lines.sublist(start, end).join('\n');
+      // 单行长度钳制：512KB 内单行超长（压缩/打包/单行 JSON）此前整行
+      // 回传灌爆上下文。>2000 字符截断并注明本行总长（对齐命令输出按行
+      // 截断口径，只钳展示切片，行数统计不受影响）。
+      final slice = lines
+          .sublist(start, end)
+          .map((l) {
+            if (l.length <= 2000) return l;
+            return '${l.substring(0, 2000)}…（本行超长已截断：总长 ${l.length} 字符）';
+          })
+          .join('\n');
       return AgentToolResult(
         ok: true,
         output: '文件 $rel 共 ${lines.length} 行，显示 $start-${end - 1}：\n$slice',
@@ -517,75 +821,220 @@ class AgentTools {
   }) async {
     final rel = '${args['path'] ?? ''}';
     final content = '${args['content'] ?? ''}';
-    try {
-      // 先拦链接本身：_resolve 已 realpath 解析，查到的是真实文件，
-      // 在解析后路径上查 link 恒为 false，必须在解析前拦。
-      if (_isWriteLinkTarget(rel)) {
-        return AgentToolResult(ok: false, output: '目标为符号链接，拒绝写入避免写到区外：$rel');
-      }
-      if (_isOutsideAfterRealpath(rel)) {
-        return AgentToolResult(
-          ok: false,
-          output: '父目录为区外符号链接，拒绝写入避免写到区外：$rel',
-        );
-      }
-      // write_file 同样做乐观锁：审批复检与落盘之间窗口内
-      // 被后台/外部改动即中止，避免静默覆盖（此前仅 edit 有 expectedContent）。
-      // 区外审批写同样比对：调用方透传 expectedContent，不再按 allowOutside 豁免。
-      final expected = args['expectedContent'];
-      if (expected is String && expected.isNotEmpty) {
-        try {
-          // 区外审批写用 _resolveAny 探测：_resolve 对区外直接抛，
-          // catch(_) 吞掉后乐观锁静默失效。
-          final probeAbs = allowOutside ? _resolveAny(rel) : _resolve(rel);
-          final probe = File(probeAbs);
-          if (await probe.exists()) {
-            if (await probe.length() <= 1024 * 1024) {
-              final current = await probe.readAsString();
-              if (current != expected) {
+    // R5-01：多对话并行同文件串行（Lock queue）：锁内再读-改-写，
+    // 后写基于前写的新版本，不再 last-write-wins 互盖。
+    return _serializeFileWrite([rel], () async {
+      try {
+        // 先拦链接本身：_resolve 已 realpath 解析，查到的是真实文件，
+        // 在解析后路径上查 link 恒为 false，必须在解析前拦。
+        if (_isWriteLinkTarget(rel)) {
+          return AgentToolResult(ok: false, output: '目标为符号链接，拒绝写入避免写到区外：$rel');
+        }
+        if (!allowOutside && _isOutsideAfterRealpath(rel)) {
+          return AgentToolResult(
+            ok: false,
+            output: '父目录为区外符号链接，拒绝写入避免写到区外：$rel',
+          );
+        }
+        // write_file 同样做乐观锁：审批复检与落盘之间窗口内
+        // 被后台/外部改动即中止，避免静默覆盖（此前仅 edit 有 expectedContent）。
+        // 区外审批写同样比对：调用方透传 expectedContent，不再按 allowOutside 豁免。
+        final expected = args['expectedContent'];
+        if (expected is String && expected.isNotEmpty) {
+          // R2-乐观锁探测可观测：探测抛错此前 catch(_) 静默跳锁直接落盘。
+          // 现探测失败即中止 fail-closed（多一次拒绝，不丢数据）。
+          // 来源 Aider 脏文件先提交隔离口径 https://aider.chat/docs/git.html
+          // 与 Cline 影子仓 checkpoint 口径 https://docs.cline.bot/core-workflows/checkpoints
+          // （采纳：探测失败即中止；不采纳：git 自动提交，见 README 已知待办）。
+          String? probeErr;
+          try {
+            // 区外审批写用 _resolveAny 探测：_resolve 对区外直接抛，
+            // catch(_) 吞掉后乐观锁静默失效。
+            final probeAbs = allowOutside ? _resolveAny(rel) : _resolve(rel);
+            final probe = File(probeAbs);
+            if (await probe.exists()) {
+              // R4-F1：大文件同样比对——此前仅<=1MB比对，超限直接落盘
+              // 静默覆盖。与_edit超限拒绝不同，_write走分段读比对，
+              // 失败即中止fail-closed，不再跳锁。
+              // R1-F2：length+头+尾三比对——此前只比前1MB，尾部改动
+              // 静默覆盖。现长度不等即中止；等长再比头+尾32KB。
+              // 第1轮R2-1：字节口径——此前expected.length字符数比probe.length
+              // 字节数，非ASCII必误报长度漂移。现按utf8字节比，头/尾同样按字节切片解码。
+              final len = await probe.length();
+              final expectedBytes = utf8.encode(expected);
+              final expectedLen = expectedBytes.length;
+              if (len != expectedLen) {
                 return AgentToolResult(
                   ok: false,
-                  output: '文件在预览后发生变化，已中止落盘避免覆盖：$rel\n请重新 read_file 查看最新内容后再试。',
+                  output:
+                      '文件在预览后发生变化（长度 $expectedLen→$len），已中止落盘避免覆盖：$rel\n请重新 read_file 查看最新内容后再试。',
                 );
               }
+              if (len <= 1024 * 1024) {
+                final current = await probe.readAsString();
+                if (current != expected) {
+                  return AgentToolResult(
+                    ok: false,
+                    output:
+                        '文件在预览后发生变化，已中止落盘避免覆盖：$rel\n请重新 read_file 查看最新内容后再试。',
+                  );
+                }
+              } else {
+                final current = await probe
+                    .openRead(0, 1024 * 1024)
+                    .transform(const Utf8Decoder(allowMalformed: true))
+                    .join();
+                final head = expectedBytes.length <= 1024 * 1024
+                    ? const Utf8Decoder(allowMalformed: true)
+                        .convert(expectedBytes)
+                    : const Utf8Decoder(allowMalformed: true).convert(
+                        expectedBytes.sublist(0, 1024 * 1024),
+                      );
+                if (current != head) {
+                  return AgentToolResult(
+                    ok: false,
+                    output:
+                        '文件在预览后发生变化，已中止落盘避免覆盖：$rel\n请重新 read_file 查看最新内容后再试。',
+                  );
+                }
+                // R1-F2续：尾部32KB比对——等长但尾部被改时头部比对放行。
+                const tailSize = 32 * 1024;
+                final tailStart = len - tailSize;
+                final currentTail = await probe
+                    .openRead(tailStart, len)
+                    .transform(const Utf8Decoder(allowMalformed: true))
+                    .join();
+                final expectedTail = expectedBytes.length <= tailSize
+                    ? const Utf8Decoder(allowMalformed: true)
+                        .convert(expectedBytes)
+                    : const Utf8Decoder(allowMalformed: true).convert(
+                        expectedBytes.sublist(
+                          expectedBytes.length - tailSize,
+                        ),
+                      );
+                if (currentTail != expectedTail) {
+                  return AgentToolResult(
+                    ok: false,
+                    output:
+                        '文件在预览后发生变化（尾部已变更），已中止落盘避免覆盖：$rel\n请重新 read_file 查看最新内容后再试。',
+                  );
+                }
+              }
+            } else if (expected != '__MYIDE_NOT_EXISTS__') {
+              return AgentToolResult(
+                ok: false,
+                output: '文件在预览后发生变化（预览时不存在，现已新建），已中止落盘避免覆盖：$rel',
+              );
             }
-          } else if (expected != '__MYIDE_NOT_EXISTS__') {
+          } catch (e) {
+            probeErr = '$e';
+          }
+          if (probeErr != null) {
             return AgentToolResult(
               ok: false,
-              output: '文件在预览后发生变化（预览时不存在，现已新建），已中止落盘避免覆盖：$rel',
+              output: '乐观锁探测失败，已中止落盘避免覆盖：$rel（$probeErr）',
             );
           }
+        }
+        final abs = allowOutside ? _resolveAny(rel) : _resolve(rel);
+        final file = File(abs);
+        // 父目录创建先于复检副作用修复：create(recursive:true) 会跟随
+        // 检查后被替换的父目录外链，在区外建目录。先复检再建目录，
+        // 建后落盘前二次复检（TOCTOU 双检）。
+        _recheckWriteTarget(rel, abs);
+        await file.parent.create(recursive: true);
+        // 落盘前二次复检：create 与落盘之间父目录可被换成外链，
+        // 补丁通道已有 recheckTarget，单文件通道同样复检。
+        _recheckWriteTarget(rel, abs);
+        await _writeFileAtomic(file, content);
+        // R3-09：写后搜索缓存失效——_recentCache TTL 10s，此前写后5s内同查
+        // 命中旧快照零命中。写盘成功即清缓存，下次搜索重扫。
+        try {
+          WorkspaceSearch.clearRecentCache();
         } catch (_) {}
+        return AgentToolResult(
+          ok: true,
+          output: '已写入 $rel（${content.length} 字符）',
+          touchedFiles: [rel],
+        );
+      } catch (e) {
+        return AgentToolResult(ok: false, output: '写入失败：$e');
       }
-      final abs = allowOutside ? _resolveAny(rel) : _resolve(rel);
-      final file = File(abs);
-      await file.parent.create(recursive: true);
-      // 落盘前二次复检：create 与落盘之间父目录可被换成外链，
-      // 补丁通道已有 recheckTarget，单文件通道同样复检。
-      _recheckWriteTarget(rel, abs);
-      await _writeFileAtomic(file, content);
-      return AgentToolResult(
-        ok: true,
-        output: '已写入 $rel（${content.length} 字符）',
-        touchedFiles: [rel],
-      );
-    } catch (e) {
-      return AgentToolResult(ok: false, output: '写入失败：$e');
-    }
+    });
   }
 
   /// 写盘原子化：唯一 tmp+flush+rename，此前直接 writeAsString 崩溃留半写。
   /// nonce 用 Random.secure：micros+hashCode 仅 16bit 非稳定，并发可同名。
+  /// R2-F5：补丁提交journal——提交前记ops，成功清；残留即上次半落盘证据。
+  Future<void> _writePatchJournal(List<String> rels) async {
+    try {
+      final dir = Directory(p.join(rootPath, '.my_ide'));
+      await dir.create(recursive: true);
+      final f = File(p.join(dir.path, 'patch-journal.json'));
+      await f.writeAsString(
+        jsonEncode({
+          'at': DateTime.now().toIso8601String(),
+          'rels': rels,
+        }),
+        flush: true,
+      );
+    } catch (_) {}
+  }
+
+  Future<void> _clearPatchJournal() async {
+    try {
+      final f = File(p.join(rootPath, '.my_ide', 'patch-journal.json'));
+      if (await f.exists()) await f.delete();
+    } catch (_) {}
+  }
+
+  /// R16R1：补丁journal可读+启动提示——此前只有写/清无读，kill半落盘
+  /// 重启无人消费。现读出受影响文件清单供启动检查提示人工核对，
+  /// 不自动重放防二次写（与checkpoint commit.json只提示同口径）。
+  Future<List<String>> readPatchJournalForTest() async {
+    try {
+      final f = File(p.join(rootPath, '.my_ide', 'patch-journal.json'));
+      if (!await f.exists()) return const [];
+      final data = jsonDecode(await f.readAsString());
+      if (data is! Map) return const [];
+      final rels = data['rels'];
+      if (rels is! List) return const [];
+      return rels.map((e) => '$e').where((e) => e.isNotEmpty).toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
   Future<void> _writeFileAtomic(File target, String content) async {
     final nonce =
         '${DateTime.now().microsecondsSinceEpoch}-${_rng.nextInt(1 << 32).toRadixString(36)}';
     final tmp = File('${target.path}.$nonce.tmp');
+    // R1-Win：Windows三步原子——此前先delete后rename，崩溃窗口丢文件。
+    // 现：目标→.bak→新→目标→删bak，任一步失败回滚.bak。
+    File? bak;
     try {
       await tmp.writeAsString(content, flush: true);
+      if (Platform.isWindows && await target.exists()) {
+        bak = File('${target.path}.$nonce.bak');
+        try {
+          if (await bak.exists()) await bak.delete();
+        } catch (_) {}
+        await target.rename(bak.path);
+      }
       try {
         await tmp.rename(target.path);
-      } catch (_) {
-        await target.writeAsString(content, flush: true);
+      } catch (e) {
+        if (bak != null && await bak.exists()) {
+          try {
+            await bak.rename(target.path);
+          } catch (_) {}
+        }
+        rethrow;
+      }
+      if (bak != null && await bak.exists()) {
+        try {
+          await bak.delete();
+        } catch (_) {}
       }
     } finally {
       try {
@@ -601,67 +1050,94 @@ class AgentTools {
     final rel = '${args['path'] ?? ''}';
     final oldText = '${args['oldText'] ?? ''}';
     final newText = '${args['newText'] ?? ''}';
-    try {
-      if (_isWriteLinkTarget(rel)) {
-        return AgentToolResult(ok: false, output: '目标为符号链接，拒绝写入避免写到区外：$rel');
-      }
-      if (_isOutsideAfterRealpath(rel)) {
-        return AgentToolResult(
-          ok: false,
-          output: '父目录为区外符号链接，拒绝写入避免写到区外：$rel',
-        );
-      }
-      final abs = allowOutside ? _resolveAny(rel) : _resolve(rel);
-      final file = File(abs);
-      if (!await file.exists()) {
-        return AgentToolResult(ok: false, output: '文件不存在：$rel');
-      }
-      // 先判大小再读：此前 readAsString 全量进内存，大文件直接爆内存。
+    return _serializeFileWrite([rel], () async {
       try {
-        if (await file.length() > 1024 * 1024) {
+        if (_isWriteLinkTarget(rel)) {
+          return AgentToolResult(ok: false, output: '目标为符号链接，拒绝写入避免写到区外：$rel');
+        }
+        if (!allowOutside && _isOutsideAfterRealpath(rel)) {
           return AgentToolResult(
             ok: false,
-            output: '文件超过 1MB，请用 read_file 分段处理：$rel',
+            output: '父目录为区外符号链接，拒绝写入避免写到区外：$rel',
           );
         }
-      } catch (_) {}
-      final content = await file.readAsString();
-      if (!content.contains(oldText)) {
+        final abs = allowOutside ? _resolveAny(rel) : _resolve(rel);
+        final file = File(abs);
+        if (!await file.exists()) {
+          return AgentToolResult(ok: false, output: '文件不存在：$rel');
+        }
+        // 先判大小再读：此前 readAsString 全量进内存，大文件直接爆内存。
+        try {
+          if (await file.length() > 1024 * 1024) {
+            return AgentToolResult(
+              ok: false,
+              output: '文件超过 1MB，请用 read_file 分段处理：$rel',
+            );
+          }
+        } catch (_) {}
+        final content = await file.readAsString();
+        if (!content.contains(oldText)) {
+          return AgentToolResult(
+            ok: false,
+            output:
+                'oldText 未精确匹配（含空格/换行），请先 read_file 查看原文后原样粘贴。'
+                '${_mismatchHint(content, oldText)}',
+          );
+        }
+        // R1-C2：重复块必须显式失败——此前replaceFirst永远改第一处，
+        // 双相同函数文件静默打错位置。现：多处命中即拒，要求加上下文。
+        final firstHit = content.indexOf(oldText);
+        if (firstHit >= 0 &&
+            content.indexOf(oldText, firstHit + oldText.length) >= 0) {
+          return AgentToolResult(
+            ok: false,
+            output: 'oldText 在 $rel 中出现多次，请补充上下文行精确定位后再试：$rel',
+          );
+        }
+        final updated = content.replaceFirst(oldText, newText);
+        // B2：提交时乐观锁复检——调用方透传 expectedContent（预览时的旧内容），
+        // 执行窗口内被后台任务/外部改动即中止，避免静默丢更新。
+        // R1-F3：提交期锁内二次重读——此前读→验→写之间不验内容，
+        // 后台在比对后改文件仍直接覆盖。现落盘前锁内再读一次比expected。
+        final expected = args['expectedContent'];
+        if (expected is String && expected.isNotEmpty) {
+          if (content != expected) {
+            return AgentToolResult(
+              ok: false,
+              output: '文件在预览后发生变化，已中止落盘避免覆盖：$rel\n请重新 read_file 查看最新内容后再试。',
+            );
+          }
+          String recommitted;
+          try {
+            recommitted = await file.readAsString();
+          } catch (e) {
+            return AgentToolResult(
+              ok: false,
+              output: '乐观锁提交期重读失败，已中止落盘避免覆盖：$rel（$e）',
+            );
+          }
+          if (recommitted != expected) {
+            return AgentToolResult(
+              ok: false,
+              output: '文件在提交期发生变化，已中止落盘避免覆盖：$rel\n请重新 read_file 查看最新内容后再试。',
+            );
+          }
+        }
+        _recheckWriteTarget(rel, abs);
+        await _writeFileAtomic(file, updated);
         return AgentToolResult(
-          ok: false,
-          output:
-              'oldText 未精确匹配（含空格/换行），请先 read_file 查看原文后原样粘贴。'
-              '${_mismatchHint(content, oldText)}',
+          ok: true,
+          output: '已编辑 $rel',
+          touchedFiles: [rel],
         );
+      } catch (e) {
+        return AgentToolResult(ok: false, output: '编辑失败：$e');
       }
-      final updated = content.replaceFirst(oldText, newText);
-      // B2：提交时乐观锁复检——调用方透传 expectedContent（预览时的旧内容），
-      // 执行窗口内被后台任务/外部改动即中止，避免静默丢更新。
-      final expected = args['expectedContent'];
-      if (expected is String && expected.isNotEmpty && content != expected) {
-        return AgentToolResult(
-          ok: false,
-          output: '文件在预览后发生变化，已中止落盘避免覆盖：$rel\n请重新 read_file 查看最新内容后再试。',
-        );
-      }
-      _recheckWriteTarget(rel, abs);
-      await _writeFileAtomic(file, updated);
-      return AgentToolResult(
-        ok: true,
-        output: '已编辑 $rel',
-        touchedFiles: [rel],
-        preview: FilePreview(
-          path: rel,
-          oldContent: content,
-          newContent: updated,
-        ),
-      );
-    } catch (e) {
-      return AgentToolResult(ok: false, output: '编辑失败：$e');
-    }
+    });
   }
 
   /// edit 失败时的可粘贴提示：忽略空白后的首个差异行，帮助模型定位空格/缩进问题。
+  /// R4-Ext1 SWE-agent ACI：失败返回行号+修复建议，不静默。
   String _mismatchHint(String content, String oldText) {
     try {
       final contentLines = content.split('\n');
@@ -672,7 +1148,12 @@ class AgentTools {
         if (want.isEmpty) continue;
         final hit = norm.indexWhere((e) => e == want);
         if (hit < 0) {
-          return '首个失配行（去空白后全文件无此行）：「${_clip(oldLines[i])}」';
+          // ACI：给出近似行建议，模型可按建议重读定位。
+          final near = _nearestLine(contentLines, want);
+          final suggest = near == null
+              ? ''
+              : '最接近的是第 ${near + 1} 行「${_clip(contentLines[near])}」，请 read_file 确认后原样粘贴。';
+          return '首个失配行（去空白后全文件无此行）：「${_clip(oldLines[i])}」。$suggest';
         }
         if (contentLines[hit] != oldLines[i]) {
           return '第 ${hit + 1} 行空白不一致，文件原文为「${_clip(contentLines[hit])}」请原样粘贴。';
@@ -680,6 +1161,29 @@ class AgentTools {
       }
     } catch (_) {}
     return '';
+  }
+
+  /// ACI 近似行：按词袋交集找最像的一行，无交集返回 null。
+  int? _nearestLine(List<String> contentLines, String want) {
+    final wantTokens = want
+        .split(RegExp(r'\W+'))
+        .where((e) => e.isNotEmpty)
+        .toSet();
+    if (wantTokens.isEmpty) return null;
+    var best = -1;
+    var bestScore = 0;
+    for (var i = 0; i < contentLines.length; i++) {
+      final lineTokens = contentLines[i]
+          .split(RegExp(r'\W+'))
+          .where((e) => e.isNotEmpty)
+          .toSet();
+      final score = wantTokens.intersection(lineTokens).length;
+      if (score > bestScore) {
+        bestScore = score;
+        best = i;
+      }
+    }
+    return bestScore > 0 ? best : null;
   }
 
   String _clip(String s, [int max = 80]) =>
@@ -700,7 +1204,8 @@ class AgentTools {
     final guarded = args['expectedContents'];
     if (guarded is Map && guarded.isNotEmpty) {
       for (final op in planned.ops) {
-        if (op.kind != 'edit') continue;
+        // R2-1：delete 同样接受复检基线覆盖（审批时刻快照优先）。
+        if (op.kind != 'edit' && !op.delete) continue;
         final v = guarded[op.rel];
         if (v is String) {
           op.baseContentOverride = v;
@@ -709,7 +1214,12 @@ class AgentTools {
     }
     final touched = <String>[];
     try {
-      await _commitPatchOps(planned.ops);
+      // R5-01：多文件补丁按涉及文件排队串行（键已排序防死锁），锁内提交。
+      final keys = planned.ops.map((e) => e.rel).toList();
+      await _serializeFileWrite(
+        keys,
+        () => _commitPatchOps(planned.ops, allowOutside: allowOutside),
+      );
       touched.addAll(planned.ops.map((e) => e.rel));
       return AgentToolResult(
         ok: true,
@@ -739,7 +1249,29 @@ class AgentTools {
       }
     } catch (_) {}
     if (Platform.isWindows && await target.exists()) {
-      await target.delete();
+      // Windows 先删后改名存在崩溃丢文件窗口：删后 rename 前进程崩溃即丢目标。
+      // 先改名备份再删，rename 失败即回滚备份，与 _writeFileAtomic 三步原子同口径。
+      // 备份名带随机后缀：固定 `.winbak` 在并发双补丁同文件时互盖，
+      // 与侧车 `.myide-new` 唯一名同口径。
+      final winbak =
+          '${target.path}.${DateTime.now().microsecondsSinceEpoch}-${_rng.nextInt(1 << 32).toRadixString(36)}.winbak';
+      final bak = File(winbak);
+      try {
+        if (await bak.exists()) await bak.delete();
+      } catch (_) {}
+      await target.rename(bak.path);
+      try {
+        await tmp.rename(target.path);
+      } catch (e) {
+        try {
+          await bak.rename(target.path);
+        } catch (_) {}
+        rethrow;
+      }
+      try {
+        if (await bak.exists()) await bak.delete();
+      } catch (_) {}
+      return;
     }
     await tmp.rename(target.path);
     if (executable && !Platform.isWindows) {
@@ -749,7 +1281,10 @@ class AgentTools {
     }
   }
 
-  Future<void> _commitPatchOps(List<_PatchOp> ops) async {
+  Future<void> _commitPatchOps(
+    List<_PatchOp> ops, {
+    bool allowOutside = false,
+  }) async {
     final staged = <File>[];
     final committed = <_PatchOp>[];
     // S8：stage 阶段先把各目标原内容读入内存备份，回滚时整文件精确恢复，
@@ -762,6 +1297,8 @@ class AgentTools {
       if (_isWriteLinkTarget(rel)) {
         throw StateError('$rel 为符号链接，拒绝修改避免写到区外');
       }
+      // 区外审批补丁跳过区内判（审批即授权），仍拒链接本身。
+      if (allowOutside) return;
       final real = WorkspaceFs.realpathOf(
         p.normalize(p.isAbsolute(abs) ? abs : p.join(rootPath, abs)),
       );
@@ -772,11 +1309,18 @@ class AgentTools {
     }
 
     try {
+      // R2-F5：提交前落补丁journal——kill在rename序列中间即半落盘且
+      // 内存备份丢失。现ops+已提交记录落.my_ide/patch-journal.json，
+      // 成功清；重开凭journal提示人工检查（不自动重放防二次写）。
+      await _writePatchJournal(ops.map((o) => o.rel).toList());
       for (final op in ops) {
         if (op.delete) continue;
+        // 写前预检再建目录：与 _write/copy/move/make_dir 同口径，
+        // 先复检再 create，建后提交前由 rename 原子性兜底。
         recheckTarget(op.rel, op.abs);
         final target = File(op.abs);
         await target.parent.create(recursive: true);
+        recheckTarget(op.rel, op.abs);
         // 唯一侧车名：此前固定 `.myide-new`，并发两补丁同文件互盖侧车。
         // micros+随机双因子：纯 micros 同微秒仍可同名。
         final nonce =
@@ -815,6 +1359,17 @@ class AgentTools {
           if (next == current) {
             throw StateError('${op.rel} 提交时片段已不匹配');
           }
+          // R1-F4：提交期多处命中即中止——此前只判找不到，静默打第一处，
+          // 与_edit多处拒改口径分裂。现与_edit同口径，要求加上下文定位。
+          final firstHit = current.indexOf(op.oldFragment!);
+          if (firstHit >= 0 &&
+              current.indexOf(
+                    op.oldFragment!,
+                    firstHit + op.oldFragment!.length,
+                  ) >=
+                  0) {
+            throw StateError('${op.rel} 提交时片段出现多次，请补充上下文行精确定位后再试');
+          }
           await tmp.writeAsString(next, flush: true);
         }
         staged.add(tmp);
@@ -824,9 +1379,26 @@ class AgentTools {
         recheckTarget(op.rel, op.abs);
         final target = File(op.abs);
         if (await target.exists()) {
-          backups[op.abs] = await target.readAsString();
+          // R2-1：delete 提交期同样 1MB 门禁+乐观锁——窗口内膨胀/被改即中止。
+          try {
+            if (await target.length() > 1024 * 1024) {
+              throw StateError('${op.rel} 超过 1MB，请用 read_file 分段处理');
+            }
+          } catch (e) {
+            if (e is StateError) rethrow;
+          }
+          final current = await target.readAsString();
+          backups[op.abs] = current;
+          final base = op.baseContentOverride ?? op.baseContent;
+          if (base != null && current != base) {
+            throw StateError('${op.rel} 在审批期间发生变化，已中止删除避免误删：请重新 read_file 后再试');
+          }
         } else {
           backups[op.abs] = null;
+          // 规划时存在、提交时消失：视为外部已删，不再重复删。
+          if ((op.baseContentOverride ?? op.baseContent) != null) {
+            throw StateError('${op.rel} 在审批期间已被删除，无需重复删除');
+          }
         }
       }
       // 旧名兜底：历史侧车固定名残留时仍尝试清理，不影响新唯一名主路径。
@@ -836,7 +1408,17 @@ class AgentTools {
         // 侧车 rename 前必须确认目标仍在区内。
         recheckTarget(op.rel, op.abs);
         final target = File(op.abs);
+        // 覆盖前拒链接：侧车 rename 会替换链接本身语义分裂，直接拒。
+        try {
+          if (FileSystemEntity.typeSync(target.path, followLinks: false) ==
+              FileSystemEntityType.link) {
+            throw StateError('${op.rel} 为符号链接，拒绝修改避免写到区外');
+          }
+        } catch (e) {
+          if (e is StateError) rethrow;
+        }
         final stagedFile = op.stagedTmp == null
+            // R8遗留固定名侧车兜底：唯一名全覆盖后此分支仅历史崩溃残留可达。
             ? File('${target.path}.myide-new')
             : File(op.stagedTmp!);
         await _replaceOver(stagedFile, target);
@@ -849,9 +1431,22 @@ class AgentTools {
         if (await target.exists()) await target.delete();
         committed.add(op);
       }
+      // R2-F5：提交成功清journal。
+      await _clearPatchJournal();
     } catch (e) {
+      // 回滚失败不再静默吞错：逐项收集后聚合进错误信息，
+      // 提示补丁可能半落盘需要人工检查（此前 catch(_) 静默无告警）。
+      final rollbackErrors = <String>[];
       for (final op in committed.reversed) {
         try {
+          // R2-F4：回滚同样复检——此前直接create+写，父链在提交窗口
+          // 被换成外链时回滚写穿区外。现不通过即记错跳过。
+          try {
+            recheckTarget(op.rel, op.abs);
+          } catch (re) {
+            rollbackErrors.add('${op.rel}：回滚复检不通过已跳过（$re）');
+            continue;
+          }
           final target = File(op.abs);
           if (op.kind == 'create') {
             if (await target.exists()) await target.delete();
@@ -865,14 +1460,18 @@ class AgentTools {
             await target.parent.create(recursive: true);
             await _writeFileAtomic(target, backup);
           }
-        } catch (_) {}
+        } catch (re) {
+          rollbackErrors.add('${op.rel}：$re');
+        }
       }
       // 旧名兜底清理改为显式分支：压缩行内三元此前 analyzer 误报可读性，
       // 此处保持与上方 commit 循环同口径，避免 stagedTmp 为空时清错文件。
       for (final tmp in staged) {
         try {
           if (await tmp.exists()) await tmp.delete();
-        } catch (_) {}
+        } catch (re) {
+          rollbackErrors.add('临时文件 ${p.basename(tmp.path)}：$re');
+        }
       }
       // 遗留固定名侧车（历史版本崩溃残留）：按目标逐个探测删除，
       // 不再 glob 全盘扫描。
@@ -881,9 +1480,15 @@ class AgentTools {
         try {
           final legacy = File('${op.abs}.myide-new');
           if (await legacy.exists()) await legacy.delete();
-        } catch (_) {}
+        } catch (re) {
+          rollbackErrors.add('残留侧车 ${p.basename(op.abs)}.myide-new：$re');
+        }
       }
-      rethrow;
+      if (rollbackErrors.isEmpty) rethrow;
+      throw StateError(
+        '补丁提交失败：$e；回滚也失败，部分文件可能处于半落盘状态，请人工检查：'
+        '${rollbackErrors.join('；')}',
+      );
     }
   }
 
@@ -903,12 +1508,14 @@ class AgentTools {
     final baselines = <String, String>{};
     for (final op in planned.ops) {
       buf.writeln('- ${op.rel}（${op.kind}）');
-      // edit 基线为规划时整文件；create 基线记哨兵（不存在）；
-      // delete 基线为当前内容（执行层不存在即 fail，无需锁）。
+      // delete 基线为当前内容（提交时重读比对，窗口内被改即中止，
+      // 此前注释称"无需锁"会删掉审批期间的新内容）。
       if (op.kind == 'edit' && op.baseContent != null) {
         baselines[op.rel] = op.baseContent!;
       } else if (op.kind == 'create') {
         baselines[op.rel] = '__MYIDE_NOT_EXISTS__';
+      } else if (op.delete && op.baseContent != null) {
+        baselines[op.rel] = op.baseContent!;
       }
     }
     return AgentToolResult(
@@ -937,7 +1544,10 @@ class AgentTools {
     // 同补丁内同文件只能出现一次：按解析后绝对路径去重，
     // `a/../b` 与 `b` 同一文件此前按 rel 字符串比对可绕过，
     // 后者覆盖前者备份导致回滚错版本。
+    // R3-05：大小写归一——macOS/Windows盘不敏感，A.dart/a.dart同文件，
+    // 此前大小写敏感去重双双过检，后者备份覆盖前者致回滚中间态。
     final seenRels = <String>{};
+    final caseFoldPatch = Platform.isLinux ? false : true;
     final ops = <_PatchOp>[];
     for (final item in raw) {
       if (item is! Map) return _PatchPlan.fail('patches 项必须是对象');
@@ -954,18 +1564,36 @@ class AgentTools {
       } catch (e) {
         return _PatchPlan.fail('$rel 门禁拒绝：$e');
       }
-      if (!seenRels.add(p.normalize(abs))) {
+      if (!seenRels.add(
+        caseFoldPatch ? p.normalize(abs).toLowerCase() : p.normalize(abs),
+      )) {
         return _PatchPlan.fail('$rel 在同一次补丁中出现多次，请合并为一个 op 后重试');
       }
       final file = File(abs);
-      final exists = file.existsSync();
+      // 存在性用不跟随模式：悬空父链下跟随exists误判，create可被绕过覆盖。
+      final exists =
+          FileSystemEntity.typeSync(abs, followLinks: false) !=
+          FileSystemEntityType.notFound;
       if (_isWriteLinkTarget(rel)) {
         // 与 _write/_edit 同口径：链接目标跨区改写必须拒，由用户手动处理。
         return _PatchPlan.fail('$rel 为符号链接，拒绝修改避免写到区外');
       }
       if (delete) {
         if (!exists) return _PatchPlan.fail('$rel 不存在，无法删除');
-        ops.add(_PatchOp.delete(rel, abs));
+        // R2-1：delete 同样记基线+1MB门禁——审批窗口内被改/膨胀即中止，
+        // 不再静默删新内容/读GB进内存。
+        try {
+          if (file.lengthSync() > 1024 * 1024) {
+            return _PatchPlan.fail('$rel 超过 1MB，请用 read_file 分段处理');
+          }
+        } catch (_) {}
+        String delBase;
+        try {
+          delBase = file.readAsStringSync();
+        } catch (e) {
+          return _PatchPlan.fail('$rel 读取失败：$e');
+        }
+        ops.add(_PatchOp.delete(rel, abs, base: delBase));
         continue;
       }
       final newText = '${item['newText'] ?? ''}';
@@ -997,13 +1625,21 @@ class AgentTools {
           '$rel oldText 未匹配（含模糊空白）：${_mismatchHint(content, oldText)}',
         );
       }
-      ops.add(_PatchOp.edit(
-        rel,
-        abs,
-        hit.oldFragment,
-        hit.newFragment,
-        baseContent: content,
-      ));
+      // 第2轮R2-3：规划期多命中即拒——此前只提交期按实例化oldFragment查多处，
+      // 归一不同但精确文本不同（如尾空格）时提交期只见首处，静默打第一处。
+      // 现规划期按归一口径计数，多处即拒，与_edit同口径收敛。
+      if (_fuzzyMatchCount(content, oldText) > 1) {
+        return _PatchPlan.fail('$rel oldText 出现多次（有多处匹配），请补足上下文唯一化后重试');
+      }
+      ops.add(
+        _PatchOp.edit(
+          rel,
+          abs,
+          hit.oldFragment,
+          hit.newFragment,
+          baseContent: content,
+        ),
+      );
     }
     return _PatchPlan(ok: true, error: '', ops: ops);
   }
@@ -1030,7 +1666,16 @@ class AgentTools {
       start++
     ) {
       for (var i = 0; i < oldLines.length; i++) {
-        if (contentLines[start + i].trim() != oldLines[i].trim()) {
+        // 行尾空白先 rtrim 归一（含 CRLF 残留的 \r）：CRLF 文件含空行
+        // oldText 此前 '\r' vs '' 精确比较双双失配。空行仍要求 rtrim 后
+        // 精确相等（保留防多空行模板跨段误匹配防线）；非空行再走忽略
+        // 首尾空白比较。对齐 Codex seek_sequence 口径：
+        // 精确（rtrim 后）→ 忽略行尾空白 → 忽略首尾空白。
+        final a = contentLines[start + i].trimRight();
+        final b = oldLines[i].trimRight();
+        if (a.isEmpty || b.isEmpty) {
+          if (a != b) continue outer;
+        } else if (a.trim() != b.trim()) {
           continue outer;
         }
       }
@@ -1042,12 +1687,59 @@ class AgentTools {
     return null;
   }
 
+  /// 第2轮R2-3测试钩子：归一口径命中计数（精确命中按1计，模糊逐行归一计数）。
+  int _fuzzyMatchCount(String content, String oldText) {
+    if (content.contains(oldText)) {
+      var n = 0;
+      var from = 0;
+      while (true) {
+        final at = content.indexOf(oldText, from);
+        if (at < 0) break;
+        n++;
+        from = at + (oldText.isEmpty ? 1 : oldText.length);
+        if (n > 1) return n;
+      }
+      return n;
+    }
+    if (oldText.trim().isEmpty) return 0;
+    final contentLines = content.split('\n');
+    final oldLines = oldText.split('\n');
+    var hits = 0;
+    outer:
+    for (
+      var start = 0;
+      start + oldLines.length <= contentLines.length;
+      start++
+    ) {
+      for (var i = 0; i < oldLines.length; i++) {
+        final a = contentLines[start + i].trimRight();
+        final b = oldLines[i].trimRight();
+        if (a.isEmpty || b.isEmpty) {
+          if (a != b) continue outer;
+        } else if (a.trim() != b.trim()) {
+          continue outer;
+        }
+      }
+      hits++;
+      if (hits > 1) return hits;
+    }
+    return hits;
+  }
+
+  /// 第2轮R2-3测试可见：归一口径命中计数。
+  int debugFuzzyMatchCountForTest(String content, String oldText) =>
+      _fuzzyMatchCount(content, oldText);
+
   /// 待办清单：内存态，全量替换；不传 todos 返回当前清单。
   /// 同时落盘 .my_ide/todos.json（读写容错），跨轮/重启可恢复。
   /// 外部改盘合并：写前先按 mtime 探测盘上新值，调用方 stale 全量里
   /// 缺失的外部新增项会被并回（按 id 去重，调用方同 id 优先），
   /// 避免用户手改/多 Agent 窗口内的增量被 LWW 静默盖掉。
   Future<AgentToolResult> _todoWrite(Map<String, dynamic> args) async {
+    return _serializeTodoWrite(() => _todoWriteInner(args));
+  }
+
+  Future<AgentToolResult> _todoWriteInner(Map<String, dynamic> args) async {
     // 写前重载盘上最新值：先记内存基线，再 load（mtime 变则重载为盘上快照）。
     final memBefore = List<_TodoItem>.from(
       _todosByRoot[_todoRootKey()] ?? const <_TodoItem>[],
@@ -1095,9 +1787,7 @@ class AgentTools {
     final diskById = {for (final t in diskSnapshot) t.id: t};
     final memBeforeById = {for (final t in memBefore) t.id: t};
     final externallyAdded = diskSnapshot
-        .where(
-          (t) => !callerIds.contains(t.id) && !memBeforeIds.contains(t.id),
-        )
+        .where((t) => !callerIds.contains(t.id) && !memBeforeIds.contains(t.id))
         .toList();
     final merged = <_TodoItem>[];
     for (final item in next) {
@@ -1109,6 +1799,18 @@ class AgentTools {
           (item.content == mem.content && item.status == mem.status)) {
         // 调用方拿的是旧基线且未改该项，盘上已被外部更新：保留外部新项。
         merged.add(disk);
+      } else if (disk != null &&
+          mem != null &&
+          (disk.content != mem.content || disk.status != mem.status) &&
+          (item.content != mem.content || item.status != mem.status)) {
+        // R4-T1：双方同改冲突——调用方与外部各改一次，直接选边会丢一端。
+        // 现返回conflict由模型重读后重试，不静默盖掉任一端。
+        return AgentToolResult(
+          ok: false,
+          output:
+              '待办 ${item.id} 在外部已被修改（当前：${disk.content}/${disk.status}），'
+              '请重新读取最新清单后重试，避免覆盖他人改动。',
+        );
       } else {
         merged.add(item);
       }
@@ -1225,8 +1927,32 @@ class AgentTools {
         ]),
         flush: true,
       );
-      if (Platform.isWindows && target.existsSync()) target.deleteSync();
-      tmp.renameSync(target.path);
+      // R3-A1：Windows三步原子——此前先删后改名，崩溃窗口丢todos。
+      File? bak;
+      if (Platform.isWindows && target.existsSync()) {
+        bak = File('${target.path}.myide-bak');
+        try {
+          if (bak.existsSync()) bak.deleteSync();
+        } catch (_) {}
+        target.renameSync(bak.path);
+      } else if (!Platform.isWindows && target.existsSync()) {
+        // 非Windows rename即覆盖，无需bak。
+      }
+      try {
+        tmp.renameSync(target.path);
+      } catch (e) {
+        if (bak != null && bak.existsSync()) {
+          try {
+            bak.renameSync(target.path);
+          } catch (_) {}
+        }
+        rethrow;
+      }
+      if (bak != null && bak.existsSync()) {
+        try {
+          bak.deleteSync();
+        } catch (_) {}
+      }
       // 落盘后刷新判脏戳，避免下次读取误判外部改动重载丢内存态。
       try {
         final stat = target.statSync();
@@ -1241,28 +1967,39 @@ class AgentTools {
   }
 
   /// 新建目录（含父级递归）。
-  Future<AgentToolResult> _makeDir(Map<String, dynamic> args) async {
+  Future<AgentToolResult> _makeDir(
+    Map<String, dynamic> args, {
+    bool allowOutside = false,
+  }) async {
     final rel = '${args['path'] ?? ''}'.trim();
     if (rel.isEmpty) return AgentToolResult(ok: false, output: 'path 不能为空');
-    try {
-      // 写侧链接检查与 _write 同口径：父链外链直接拒。
-      if (_isWriteLinkTarget(rel) || _isOutsideAfterRealpath(rel)) {
+    // R5-01：并行对话同路径建目录同样排队，避免 create 竞态。
+    return _serializeFileWrite([rel], () async {
+      try {
+        // 区内链检查恒做；区外审批写跳过区外拒（审批即授权），仍拒链接本身。
+        if (_isWriteLinkTarget(rel) ||
+            (!allowOutside && _isOutsideAfterRealpath(rel))) {
+          return AgentToolResult(ok: false, output: '目标为符号链接或链出区外，拒绝创建目录：$rel');
+        }
+        final abs = allowOutside ? _resolveAny(rel) : _resolve(rel);
+        // 写前预检：与 _write/copy/move 同口径，先复检再 create，
+        // 建后二次复检（TOCTOU 双检）。区外审批写跳过区内复检（审批即授权）。
+        if (!allowOutside) {
+          _recheckWriteTarget(rel, abs);
+        }
+        await Directory(abs).create(recursive: true);
+        if (!allowOutside) {
+          _recheckWriteTarget(rel, abs);
+        }
         return AgentToolResult(
-          ok: false,
-          output: '目标为符号链接或链出区外，拒绝创建目录：$rel',
+          ok: true,
+          output: '已创建目录 $rel',
+          touchedFiles: [rel],
         );
+      } catch (e) {
+        return AgentToolResult(ok: false, output: '创建目录失败：$e');
       }
-      final abs = _resolve(rel);
-      await Directory(abs).create(recursive: true);
-      _recheckWriteTarget(rel, abs);
-      return AgentToolResult(
-        ok: true,
-        output: '已创建目录 $rel',
-        touchedFiles: [rel],
-      );
-    } catch (e) {
-      return AgentToolResult(ok: false, output: '创建目录失败：$e');
-    }
+    });
   }
 
   Future<AgentToolResult> _makeDirPreview(Map<String, dynamic> args) async {
@@ -1270,10 +2007,7 @@ class AgentTools {
     if (rel.isEmpty) return AgentToolResult(ok: false, output: 'path 不能为空');
     try {
       if (_isWriteLinkTarget(rel) || _isOutsideAfterRealpath(rel)) {
-        return AgentToolResult(
-          ok: false,
-          output: '目标为符号链接或链出区外，拒绝创建目录：$rel',
-        );
+        return AgentToolResult(ok: false, output: '目标为符号链接或链出区外，拒绝创建目录：$rel');
       }
       final abs = _resolve(rel);
       if (FileSystemEntity.typeSync(abs, followLinks: false) !=
@@ -1311,7 +2045,10 @@ class AgentTools {
       }
       final fromAbs = _resolve(from);
       final toAbs = _resolve(to);
-      if (!await File(fromAbs).exists()) {
+      // 预览源存在性同样不跟随：跟随 exists 会把悬空链源误判存在，
+      // 预览通过而执行拒，审批链语义分叉。
+      if (FileSystemEntity.typeSync(fromAbs, followLinks: false) ==
+          FileSystemEntityType.notFound) {
         return AgentToolResult(ok: false, output: '文件不存在：$from');
       }
       if (FileSystemEntity.typeSync(toAbs, followLinks: false) !=
@@ -1322,7 +2059,11 @@ class AgentTools {
         ok: true,
         output: '预览复制 $from → $to',
         touchedFiles: [to],
-        preview: FilePreview(path: '$from → $to', oldContent: from, newContent: to),
+        preview: FilePreview(
+          path: '$from → $to',
+          oldContent: from,
+          newContent: to,
+        ),
       );
     } catch (e) {
       return AgentToolResult(ok: false, output: '预览失败：$e');
@@ -1336,10 +2077,7 @@ class AgentTools {
     if (rel.isEmpty) return AgentToolResult(ok: false, output: 'path 不能为空');
     try {
       if (_isWriteLinkTarget(rel) || _isOutsideAfterRealpath(rel)) {
-        return AgentToolResult(
-          ok: false,
-          output: '目标为符号链接或链出区外，拒绝置可执行：$rel',
-        );
+        return AgentToolResult(ok: false, output: '目标为符号链接或链出区外，拒绝置可执行：$rel');
       }
       final abs = _resolve(rel);
       if (!await File(abs).exists()) {
@@ -1358,56 +2096,79 @@ class AgentTools {
 
   /// 复制文件：同名目标直接拒绝，不覆盖。
   /// 写侧链接检查与 _write/_edit 同口径：目标/父链外链直接拒。
-  Future<AgentToolResult> _copyFile(Map<String, dynamic> args) async {
+  Future<AgentToolResult> _copyFile(
+    Map<String, dynamic> args, {
+    bool allowOutside = false,
+  }) async {
     final from = '${args['from'] ?? ''}'.trim();
     final to = '${args['to'] ?? ''}'.trim();
     if (from.isEmpty || to.isEmpty) {
       return AgentToolResult(ok: false, output: 'copy_file 需要 from 与 to');
     }
-    try {
-      if (_isWriteLinkTarget(to) ||
-          _isOutsideAfterRealpath(to) ||
-          _isOutsideAfterRealpath(from)) {
+    // R5-01：目标端排队串行，避免并行对话同 to 竞写。
+    // R6-1：两端一起排队——此前只锁 to，并发写 from 时拷到半写内容
+    // （Cursor/Claude Code同类并行覆盖问题同根，见任务清单）。
+    return _serializeFileWrite([from, to], () async {
+      try {
+        // 执行与预览同口径：预览查 from 端 link，此前执行缺 _isWriteLinkTarget(from)。
+        // 悬空链判定与预览同口径 followLinks:false，此前执行用跟随模式分叉。
+        if (_isWriteLinkTarget(from) ||
+            _isWriteLinkTarget(to) ||
+            (!allowOutside &&
+                (_isOutsideAfterRealpath(to) ||
+                    _isOutsideAfterRealpath(from)))) {
+          return AgentToolResult(
+            ok: false,
+            output: '复制端为符号链接或链出区外，拒绝复制：$from → $to',
+          );
+        }
+        final fromAbs = allowOutside ? _resolveAny(from) : _resolve(from);
+        final toAbs = allowOutside ? _resolveAny(to) : _resolve(to);
+        if (FileSystemEntity.typeSync(fromAbs, followLinks: false) ==
+            FileSystemEntityType.notFound) {
+          return AgentToolResult(ok: false, output: '文件不存在：$from');
+        }
+        if (FileSystemEntity.typeSync(toAbs, followLinks: false) !=
+            FileSystemEntityType.notFound) {
+          return AgentToolResult(ok: false, output: '目标已存在，拒绝覆盖：$to');
+        }
+        // 写前预检再建目录：此前直接 create，跟随被替换父链在区外建目录。
+        // _write 已修同口径，此处 copy/move 同样先复检。区外审批写跳过区内复检。
+        if (!allowOutside) {
+          _recheckWriteTarget(to, toAbs);
+          _recheckWriteTarget(from, fromAbs);
+        }
+        await Directory(p.dirname(toAbs)).create(recursive: true);
+        if (!allowOutside) {
+          _recheckWriteTarget(to, toAbs);
+          _recheckWriteTarget(from, fromAbs);
+        }
+        await File(fromAbs).copy(toAbs);
         return AgentToolResult(
-          ok: false,
-          output: '复制端为符号链接或链出区外，拒绝复制：$from → $to',
+          ok: true,
+          output: '已复制 $from → $to',
+          touchedFiles: [to],
         );
+      } catch (e) {
+        return AgentToolResult(ok: false, output: '复制失败：$e');
       }
-      final fromAbs = _resolve(from);
-      final toAbs = _resolve(to);
-      if (!await File(fromAbs).exists()) {
-        return AgentToolResult(ok: false, output: '文件不存在：$from');
-      }
-      if (await FileSystemEntity.type(toAbs) != FileSystemEntityType.notFound) {
-        return AgentToolResult(ok: false, output: '目标已存在，拒绝覆盖：$to');
-      }
-      await Directory(p.dirname(toAbs)).create(recursive: true);
-      _recheckWriteTarget(to, toAbs);
-      _recheckWriteTarget(from, fromAbs);
-      await File(fromAbs).copy(toAbs);
-      return AgentToolResult(
-        ok: true,
-        output: '已复制 $from → $to',
-        touchedFiles: [to],
-      );
-    } catch (e) {
-      return AgentToolResult(ok: false, output: '复制失败：$e');
-    }
+    });
   }
 
   /// 置可执行位（仅非 Windows 生效，Windows 下直接成功提示）。
-  Future<AgentToolResult> _setExecutable(Map<String, dynamic> args) async {
+  Future<AgentToolResult> _setExecutable(
+    Map<String, dynamic> args, {
+    bool allowOutside = false,
+  }) async {
     final rel = '${args['path'] ?? ''}'.trim();
     if (rel.isEmpty) return AgentToolResult(ok: false, output: 'path 不能为空');
     try {
       // 链接目标直接拒：chmod 跟随链接会改区外文件权限。
-      if (_isWriteLinkTarget(rel) || _isOutsideAfterRealpath(rel)) {
-        return AgentToolResult(
-          ok: false,
-          output: '目标为符号链接或链出区外，拒绝置可执行：$rel',
-        );
+      if (_isWriteLinkTarget(rel) ||
+          (!allowOutside && _isOutsideAfterRealpath(rel))) {
+        return AgentToolResult(ok: false, output: '目标为符号链接或链出区外，拒绝置可执行：$rel');
       }
-      final abs = _resolve(rel);
+      final abs = allowOutside ? _resolveAny(rel) : _resolve(rel);
       if (!await File(abs).exists()) {
         return AgentToolResult(ok: false, output: '文件不存在：$rel');
       }
@@ -1551,9 +2312,12 @@ class AgentTools {
   }
 
   /// 常驻终端：创建会话。
-  Future<AgentToolResult> _terminalCreate() async {
+  Future<AgentToolResult> _terminalCreate(String sessionId) async {
     try {
-      final s = await terminals.create(rootPath: rootPath);
+      final s = await terminals.create(
+        rootPath: rootPath,
+        ownerSessionId: sessionId,
+      );
       return AgentToolResult(
         ok: true,
         output:
@@ -1565,10 +2329,21 @@ class AgentTools {
     }
   }
 
-  Future<AgentToolResult> _terminalWrite(Map<String, dynamic> args) async {
+  Future<AgentToolResult> _terminalWrite(
+    Map<String, dynamic> args,
+    String sessionId,
+  ) async {
     final id = '${args['sessionId'] ?? args['id'] ?? ''}'.trim();
     final input = '${args['input'] ?? args['command'] ?? ''}';
-    final s = terminals.get(id);
+    // shell 旁路封 .my_ide：与文件工具 sensitive 永拒对齐，
+    // 终端是长驻通道，审批弹窗摘要易漏中段恶意目标，直接拒绝。
+    if (CommandPolicy.hitsIdeStateDir(input)) {
+      return AgentToolResult(
+        ok: false,
+        output: '拒绝写入终端命令：命中 IDE 状态目录 .my_ide（防删版本库），请改走版本面板/手动操作',
+      );
+    }
+    final s = terminals.get(id, rootPath: rootPath, ownerSessionId: sessionId);
     if (s == null) return AgentToolResult(ok: false, output: '终端不存在：$id');
     if (s.finished) return AgentToolResult(ok: false, output: '终端已结束：$id');
     final cols = ((args['cols'] as num?)?.toInt() ?? 0);
@@ -1578,21 +2353,41 @@ class AgentTools {
       await s.writeStdin(input);
       // 有状态变更即标记会话，供下次审批展示逃逸告警。
       s.noteInputState(input);
+      // 回根复位：纯 cd 回工作区根后清除目录脏标记，避免一次 cd 永久强制 ask。
+      // R6：仅 cwdHint 回根才复位——export/alias/source 的环境脏标记不得
+      // 连带清除（此前 resetStateDirty 全清，回根即洗白环境逃逸）。
+      try {
+        final hint = (s.cwdHint ?? '').trim();
+        if (hint.isNotEmpty) {
+          final absHint = p.isAbsolute(hint)
+              ? p.normalize(hint)
+              : p.normalize(p.join(rootPath, hint));
+          final rootReal = WorkspaceFs.realpathOf(p.normalize(rootPath));
+          final hintReal = WorkspaceFs.realpathOf(absHint);
+          if (hintReal == rootReal) s.resetCwdHint();
+        }
+      } catch (_) {}
       var suffix = '';
       if (s.stateDirty) {
         final hint = s.stateHint ?? 'shell 状态已变更';
         final cwd = s.cwdHint == null ? '' : '（cd 目标：${s.cwdHint}）';
         suffix = '\n注意：该终端$hint$cwd，后续相对路径/命令语义可能已脱离工作区，下次写入将强制审批。';
       }
-      return AgentToolResult(ok: true, output: '已写入 $id（${input.length} 字符）$suffix');
+      return AgentToolResult(
+        ok: true,
+        output: '已写入 $id（${input.length} 字符）$suffix',
+      );
     } catch (e) {
       return AgentToolResult(ok: false, output: '写入终端失败：$e');
     }
   }
 
-  Future<AgentToolResult> _terminalPoll(Map<String, dynamic> args) async {
+  Future<AgentToolResult> _terminalPoll(
+    Map<String, dynamic> args,
+    String sessionId,
+  ) async {
     final id = '${args['sessionId'] ?? args['id'] ?? ''}'.trim();
-    final s = terminals.get(id);
+    final s = terminals.get(id, rootPath: rootPath, ownerSessionId: sessionId);
     if (s == null) return AgentToolResult(ok: false, output: '终端不存在：$id');
     final tail = ((args['tail'] as num?)?.toInt() ?? 60);
     final out = s.poll(tail: tail);
@@ -1603,10 +2398,25 @@ class AgentTools {
     );
   }
 
-  Future<AgentToolResult> _terminalKill(Map<String, dynamic> args) async {
+  Future<AgentToolResult> _terminalKill(
+    Map<String, dynamic> args,
+    String sessionId,
+  ) async {
     final id = '${args['sessionId'] ?? args['id'] ?? ''}'.trim();
-    final ok = await terminals.kill(id);
-    return AgentToolResult(ok: ok, output: ok ? '已结束终端 $id' : '终端不存在：$id');
+    final s = terminals.get(id, rootPath: rootPath, ownerSessionId: sessionId);
+    if (s == null) {
+      return AgentToolResult(ok: false, output: '终端不存在：$id');
+    }
+    final ok = await terminals.kill(
+      id,
+      rootPath: rootPath,
+      ownerSessionId: sessionId,
+    );
+    // R6：kill 验活仍活返回 false，会话已放回表供重试，不报"不存在"误导。
+    return AgentToolResult(
+      ok: ok,
+      output: ok ? '已结束终端 $id' : '终端 $id 仍在运行（终止超时），已保留会话可重试结束',
+    );
   }
 
   static UrlFetchPolicy fetchPolicy = UrlFetchPolicy();
@@ -1638,31 +2448,42 @@ class AgentTools {
       client = HttpClient();
       client.userAgent = 'my_ide/1.0';
       client.connectionTimeout = const Duration(seconds: 10);
+      // 抓取连接数收敛：并发抓取风暴下连接堆积。chrome-devtools-mcp 网络节流口径。
+      // 来源 https://github.com/ChromeDevTools/chrome-devtools-mcp/blob/main/README.md。
+      client.maxConnectionsPerHost = 6;
+      client.idleTimeout = const Duration(seconds: 10);
+      // 代理同样经门禁：环境 http_proxy 指向内网时代理抓取即 SSRF 旁路，
+      // 此前仅禁显式 proxyHost 参数，环境代理直通。现显式找系统代理并拒内网。
+      try {
+        final proxy = HttpClient.findProxyFromEnvironment(uri);
+        if (proxy.trim().isNotEmpty && proxy.trim() != 'DIRECT') {
+          return AgentToolResult(ok: false, output: '拒绝代理抓取：$raw');
+        }
+      } catch (_) {}
       client.connectionFactory = (url, proxyHost, proxyPort) {
         if (proxyHost != null) {
           throw StateError('拒绝代理抓取');
         }
-        return Future(() async {
-          final why = await fetchPolicy.rejectResolved(url);
-          if (why != null) throw StateError(why);
-          final addrs = InternetAddress.tryParse(url.host) != null
-              ? [InternetAddress(url.host)]
-              : await InternetAddress.lookup(url.host);
-          InternetAddress? chosen;
-          for (final addr in addrs) {
-            if (fetchPolicy.rejectAddress(addr) == null) {
-              chosen = addr;
-              break;
-            }
-          }
-          if (chosen == null) {
-            throw StateError('无允许的解析地址：${url.host}');
+        return (() async {
+          // R8-1：连接时复用外层已校验结果——此前外层 rejectResolved 查一次、
+          // factory 内又 lookup 一次，DNS 轮转/重绑定下校验 IP≠连接 IP。
+          // 现优先用首轮 lookup 已全量判私网的地址集做连接，不再二次解析。
+          // R6-二次lookup超时：lookupChecked/rejectResolved/lookup均已5s收敛，
+          // 此处兜底整段8s超时，弱网下不断整条抓取链。
+          // 第1轮收敛：初址/重定向统一走 lookupChecked 单次解析+全量校验后直连，
+          // 消除 rejectResolved 与二次 lookup 双解析窗口（DNS 轮转 TOCTOU）。
+          // 对齐 chrome-devtools-mcp 网络超时口径：
+          // https://github.com/ChromeDevTools/chrome-devtools-mcp
+          final checked = await fetchPolicy.lookupChecked(url.host);
+          if (checked == null || checked.isEmpty) {
+            final why = await fetchPolicy.rejectResolved(url);
+            throw StateError(why ?? '无允许的解析地址：${url.host}');
           }
           final port = url.hasPort
               ? url.port
               : (url.scheme == 'https' ? 443 : 80);
-          return Socket.startConnect(chosen, port);
-        });
+          return Socket.startConnect(checked.first, port);
+        })().timeout(const Duration(seconds: 8));
       };
       var current = uri;
       HttpClientResponse? resp;
@@ -1678,14 +2499,38 @@ class AgentTools {
         resp = await req.close().timeout(const Duration(seconds: 20));
         if (resp.isRedirect) {
           final loc = resp.headers.value(HttpHeaders.locationHeader);
-          resp.listen((_) {}).cancel();
+          // R15R3：跳转前排空旧体——此前 listen().cancel() 未 await，
+          // 旧体残留致连接复用污染下跳。drain 后再跟随。
+          try {
+            await resp.drain<void>().timeout(const Duration(seconds: 5));
+          } catch (_) {
+            try {
+              await resp.listen((_) {}).cancel();
+            } catch (_) {}
+          }
           if (loc == null || loc.isEmpty) {
             return AgentToolResult(
               ok: false,
               output: '重定向缺少 Location：$current',
             );
           }
-          current = current.resolve(loc);
+          final next = current.resolve(loc);
+          // R11R10：Location scheme 钳制——此前 current.resolve 直接跟随，
+          // `Location: file:///etc/passwd`/`gopher://` 切 scheme 后下轮
+          // rejectLiteral 才拦，但 file scheme 在 connectionFactory 前已可
+          // 被 HttpClient 按本地文件处理。非 http(s) 直接拒绝不跟随。
+          if (next.scheme != 'http' && next.scheme != 'https') {
+            return AgentToolResult(ok: false, output: '仅支持 http(s)：$next');
+          }
+          // R7-T1：https->http降级拒绝——此前切scheme照跟，cookie/token
+          // 明文泄密。升级http->https允许，降级直接拒绝。
+          if (current.scheme == 'https' && next.scheme == 'http') {
+            return AgentToolResult(
+              ok: false,
+              output: '拒绝 https 降级到 http：$next',
+            );
+          }
+          current = next;
           continue;
         }
         break;
@@ -1697,7 +2542,15 @@ class AgentTools {
         return AgentToolResult(ok: false, output: '重定向过多：$raw');
       }
       if (resp.statusCode < 200 || resp.statusCode >= 300) {
-        resp.listen((_) {}).cancel();
+        // R15R6：失败体同样排空——同 R15R3 重定向口径，未 await 即残留
+        // 污染连接复用下次抓取。
+        try {
+          await resp.drain<void>().timeout(const Duration(seconds: 5));
+        } catch (_) {
+          try {
+            await resp.listen((_) {}).cancel();
+          } catch (_) {}
+        }
         return AgentToolResult(
           ok: false,
           output: '抓取失败 HTTP ${resp.statusCode}：$raw',
@@ -1760,29 +2613,53 @@ class AgentTools {
     bool allowOutside = false,
   }) async {
     final rel = '${args['path'] ?? ''}';
-    try {
-      // 删除同样拦链接与父链外链：此前直接 _moveToTrash 跟随父目录链接删区外。
-      if (_isWriteLinkTarget(rel) || _isOutsideAfterRealpath(rel)) {
-        return AgentToolResult(
-          ok: false,
-          output: '目标为符号链接或父目录链出区外，拒绝删除：$rel',
+    // R5-01：删除同样按目标排队，避免并行对话删/写同一路径竞态。
+    return _serializeFileWrite([rel], () async {
+      try {
+        // R3-01：词法链接优先——区内alias->同区real属内部别名放行写，
+        // 但删除语义必须删链接本身。_isWriteLinkTarget对内部别名返回false，
+        // 后续_resolve展开到realpath致删本体留悬空链。现词法先判link，
+        // 是链接即删链接本体（经回收站），不碰目标。
+        final lexAbs = p.normalize(
+          p.isAbsolute(rel) ? rel : p.join(rootPath, rel),
         );
+        final lexIsLink =
+            FileSystemEntity.typeSync(lexAbs, followLinks: false) ==
+            FileSystemEntityType.link;
+        if (lexIsLink) {
+          // 链接本身删入回收站：_moveToTrash词法判link走Link.rename不跟随。
+          final trashPath = await _moveToTrash(lexAbs);
+          final trashRel = p.relative(trashPath, from: rootPath);
+          return AgentToolResult(
+            ok: true,
+            output: '已删除链接 $rel（已移入回收站：$trashRel，原目标不受影响）',
+            touchedFiles: [rel],
+          );
+        }
+        // 区内恒拦链；区外审批删跳过区外拒（审批即授权），仍拒链接本身。
+        if (_isWriteLinkTarget(rel) ||
+            (!allowOutside && _isOutsideAfterRealpath(rel))) {
+          return AgentToolResult(
+            ok: false,
+            output: '目标为符号链接或父目录链出区外，拒绝删除：$rel',
+          );
+        }
+        final abs = allowOutside ? _resolveAny(rel) : _resolve(rel);
+        final entity = FileSystemEntity.typeSync(abs, followLinks: false);
+        if (entity == FileSystemEntityType.notFound) {
+          return AgentToolResult(ok: false, output: '文件或目录不存在：$rel');
+        }
+        final trashPath = await _moveToTrash(abs);
+        final trashRel = p.relative(trashPath, from: rootPath);
+        return AgentToolResult(
+          ok: true,
+          output: '已删除 $rel（已移入回收站：$trashRel）',
+          touchedFiles: [rel],
+        );
+      } catch (e) {
+        return AgentToolResult(ok: false, output: '删除失败：$e');
       }
-      final abs = allowOutside ? _resolveAny(rel) : _resolve(rel);
-      final entity = FileSystemEntity.typeSync(abs, followLinks: false);
-      if (entity == FileSystemEntityType.notFound) {
-        return AgentToolResult(ok: false, output: '文件或目录不存在：$rel');
-      }
-      final trashPath = await _moveToTrash(abs);
-      final trashRel = p.relative(trashPath, from: rootPath);
-      return AgentToolResult(
-        ok: true,
-        output: '已删除 $rel（已移入回收站：$trashRel）',
-        touchedFiles: [rel],
-      );
-    } catch (e) {
-      return AgentToolResult(ok: false, output: '删除失败：$e');
-    }
+    });
   }
 
   /// 回收站：将绝对路径文件移入 `<root>/.my_ide/trash/<时间戳>_<名>`，返回回收站绝对路径。
@@ -1799,10 +2676,17 @@ class AgentTools {
     var i = 0;
     while (await File(dest).exists() || await Directory(dest).exists()) {
       i++;
-      dest = p.join(trashDir.path, '${stamp}_${i}_$base');
+      // 碰撞后缀保留 pid-rand 段：否则解析器无法区分 `<stamp>_<n>_<原名>`
+      // 旧格式与 `<stamp>_<pid-rand>_<n>_<原名>`，原名含数字下划线时错位。
+      dest = p.join(trashDir.path, '${stamp}_${suffix}_${i}_$base');
     }
     try {
-      if (await Directory(abs).exists()) {
+      // R3-01：链接本身走Link.rename不跟随——Directory(abs).exists会跟随
+      // 链接判目标，File.rename在链接上同样跟随。词法先判link直接移链接。
+      if (FileSystemEntity.typeSync(abs, followLinks: false) ==
+          FileSystemEntityType.link) {
+        await Link(abs).rename(dest);
+      } else if (await Directory(abs).exists()) {
         await Directory(abs).rename(dest);
       } else {
         await File(abs).rename(dest);
@@ -1811,8 +2695,9 @@ class AgentTools {
       if (await Directory(abs).exists()) {
         await Directory(dest).create(recursive: true);
         // 跟随链接会把区外内容拷进回收站：只拷实体，链接跳过。
-        await for (final child
-            in Directory(abs).list(recursive: true, followLinks: false)) {
+        await for (final child in Directory(
+          abs,
+        ).list(recursive: true, followLinks: false)) {
           if (child is Link) continue;
           final rel = p.relative(child.path, from: abs);
           final target = p.join(dest, rel);
@@ -1821,6 +2706,16 @@ class AgentTools {
           } else if (child is File) {
             await File(target).parent.create(recursive: true);
             await File(child.path).copy(target);
+            // R5：跨盘回退 copy 后校验长度一致再继续——磁盘满致半拷贝
+            // 即删源会丢文件。单文件失败即清残留抛错。
+            final srcLen = await File(child.path).length();
+            final dstLen = await File(target).length();
+            if (srcLen != dstLen) {
+              try {
+                await Directory(dest).delete(recursive: true);
+              } catch (_) {}
+              throw StateError('回收站备份不完整（$rel 大小不一致），已中止删除避免丢文件');
+            }
           }
         }
         await Directory(abs).delete(recursive: true);
@@ -1832,6 +2727,15 @@ class AgentTools {
           throw StateError('目标为符号链接，拒绝删除避免读到区外：$abs');
         }
         await File(abs).copy(dest);
+        // R5：同上，校验长度一致才删源。
+        final srcLen = await File(abs).length();
+        final dstLen = await File(dest).length();
+        if (srcLen != dstLen) {
+          try {
+            await File(dest).delete();
+          } catch (_) {}
+          throw StateError('回收站备份不完整（大小不一致），已中止删除避免丢文件');
+        }
         await File(abs).delete();
       }
     }
@@ -1889,10 +2793,7 @@ class AgentTools {
         return AgentToolResult(ok: false, output: '敏感路径拒绝恢复：$rel');
       }
       if (_isWriteLinkTarget(rel) || _isOutsideAfterRealpath(rel)) {
-        return AgentToolResult(
-          ok: false,
-          output: '恢复目标为符号链接或链出区外，拒绝恢复：$rel',
-        );
+        return AgentToolResult(ok: false, output: '恢复目标为符号链接或链出区外，拒绝恢复：$rel');
       }
       final abs = _resolve(rel);
       final target = File(abs);
@@ -1906,6 +2807,9 @@ class AgentTools {
         return AgentToolResult(ok: false, output: '回收站条目为符号链接，拒绝恢复：$name');
       }
       await target.parent.create(recursive: true);
+      // R3-1：建目录后二次复检——检查与落盘之间父链可被换成外链，
+      // 与 _write/_move 同口径双检，否则在区外建目录/恢复写出区外。
+      _recheckWriteTarget(rel, abs);
       try {
         if (await srcDir.exists()) {
           await srcDir.rename(abs);
@@ -1917,6 +2821,15 @@ class AgentTools {
           await srcDir.rename(abs);
         } else {
           await src.copy(abs);
+          // R3-11：跨盘回退半拷贝不删源——copy+delete前后比长度，不一致删目标抛错。
+          final srcLen = await src.length();
+          final dstLen = await File(abs).length();
+          if (srcLen != dstLen) {
+            try {
+              await File(abs).delete();
+            } catch (_) {}
+            throw StateError('回收站恢复不完整（大小不一致），已中止恢复避免丢文件');
+          }
           await src.delete();
         }
       }
@@ -1941,41 +2854,66 @@ class AgentTools {
     if (from.isEmpty || to.isEmpty) {
       return AgentToolResult(ok: false, output: 'move_file 需要 from 与 to');
     }
-    try {
-      // 移动两端同样拦链接与父链外链：此前只验存在，可经父链移出区外。
-      // 先拦链接再解析：解析后路径上查 link 恒 false，必须解析前拦。
-      if (_isWriteLinkTarget(from) ||
-          _isWriteLinkTarget(to) ||
-          _isOutsideAfterRealpath(from) ||
-          _isOutsideAfterRealpath(to)) {
-        return AgentToolResult(ok: false, output: '移动端为符号链接或链出区外，拒绝移动：$from → $to');
+    // R5-01：两端一起排队（排序防死锁），避免并行对话 move/写同路径竞态。
+    return _serializeFileWrite([from, to], () async {
+      try {
+        // 移动两端同样拦链接与父链外链：此前只验存在，可经父链移出区外。
+        // 先拦链接再解析：解析后路径上查 link 恒 false，必须解析前拦。
+        if (_isWriteLinkTarget(from) ||
+            _isWriteLinkTarget(to) ||
+            (!allowOutside &&
+                (_isOutsideAfterRealpath(from) ||
+                    _isOutsideAfterRealpath(to)))) {
+          return AgentToolResult(
+            ok: false,
+            output: '移动端为符号链接或链出区外，拒绝移动：$from → $to',
+          );
+        }
+        final fromAbs = allowOutside ? _resolveAny(from) : _resolve(from);
+        final toAbs = allowOutside ? _resolveAny(to) : _resolve(to);
+        // R2-链接源词法拒：_isWriteLinkTarget 对区内别名放行（写语义经 realpath
+        // 落目标本体正确），但 move 经 _resolve 展开后 rename 会动目标本体、
+        // 留下悬空链接语义分裂。源端词法是链接本身即拒（_delete 同类隐患另轮收敛）。
+        final fromLex = p.normalize(
+          p.isAbsolute(from) ? from : p.join(rootPath, from),
+        );
+        if (FileSystemEntity.typeSync(fromLex, followLinks: false) ==
+            FileSystemEntityType.link) {
+          return AgentToolResult(ok: false, output: '移动源为符号链接，拒绝移动：$from');
+        }
+        final type = FileSystemEntity.typeSync(fromAbs, followLinks: false);
+        if (type == FileSystemEntityType.notFound) {
+          return AgentToolResult(ok: false, output: '文件不存在：$from');
+        }
+        if (FileSystemEntity.typeSync(toAbs, followLinks: false) !=
+            FileSystemEntityType.notFound) {
+          return AgentToolResult(ok: false, output: '目标已存在，拒绝覆盖：$to');
+        }
+        // 写前预检再建目录：与 copy/_write 同口径，先复检再 create。
+        // 区外审批写跳过区内复检（审批即授权）。
+        if (!allowOutside) {
+          _recheckWriteTarget(from, fromAbs);
+          _recheckWriteTarget(to, toAbs);
+        }
+        await Directory(p.dirname(toAbs)).create(recursive: true);
+        if (!allowOutside) {
+          _recheckWriteTarget(from, fromAbs);
+          _recheckWriteTarget(to, toAbs);
+        }
+        if (type == FileSystemEntityType.directory) {
+          await Directory(fromAbs).rename(toAbs);
+        } else {
+          await File(fromAbs).rename(toAbs);
+        }
+        return AgentToolResult(
+          ok: true,
+          output: '已移动 $from → $to',
+          touchedFiles: [from, to],
+        );
+      } catch (e) {
+        return AgentToolResult(ok: false, output: '移动失败：$e');
       }
-      final fromAbs = allowOutside ? _resolveAny(from) : _resolve(from);
-      final toAbs = allowOutside ? _resolveAny(to) : _resolve(to);
-      final type = FileSystemEntity.typeSync(fromAbs, followLinks: false);
-      if (type == FileSystemEntityType.notFound) {
-        return AgentToolResult(ok: false, output: '文件不存在：$from');
-      }
-      if (FileSystemEntity.typeSync(toAbs, followLinks: false) !=
-          FileSystemEntityType.notFound) {
-        return AgentToolResult(ok: false, output: '目标已存在，拒绝覆盖：$to');
-      }
-      await Directory(p.dirname(toAbs)).create(recursive: true);
-      _recheckWriteTarget(from, fromAbs);
-      _recheckWriteTarget(to, toAbs);
-      if (type == FileSystemEntityType.directory) {
-        await Directory(fromAbs).rename(toAbs);
-      } else {
-        await File(fromAbs).rename(toAbs);
-      }
-      return AgentToolResult(
-        ok: true,
-        output: '已移动 $from → $to',
-        touchedFiles: [from, to],
-      );
-    } catch (e) {
-      return AgentToolResult(ok: false, output: '移动失败：$e');
-    }
+    });
   }
 
   Future<AgentToolResult> _movePreview(
@@ -1989,11 +2927,15 @@ class AgentTools {
     }
     try {
       // 预览同样拦链接/父链外链：恶意移动预览此前全程无写侧检查不告警。
+      // 区外审批预览跳过区外拒（审批即授权），仍拒链接本身。
       if (_isWriteLinkTarget(from) ||
           _isWriteLinkTarget(to) ||
-          _isOutsideAfterRealpath(from) ||
-          _isOutsideAfterRealpath(to)) {
-        return AgentToolResult(ok: false, output: '移动端为符号链接或链出区外，拒绝移动：$from → $to');
+          (!allowOutside &&
+              (_isOutsideAfterRealpath(from) || _isOutsideAfterRealpath(to)))) {
+        return AgentToolResult(
+          ok: false,
+          output: '移动端为符号链接或链出区外，拒绝移动：$from → $to',
+        );
       }
       final fromAbs = allowOutside ? _resolveAny(from) : _resolve(from);
       final toAbs = allowOutside ? _resolveAny(to) : _resolve(to);
@@ -2030,8 +2972,7 @@ class AgentTools {
       // 预览此前直接读，跟随读做预览会把敏感/区外内容带进审批弹窗。
       if (!allowOutside &&
           (_isWriteLinkTarget(rel) || _isOutsideAfterRealpath(rel))) {
-        return AgentToolResult(
-            ok: false, output: '目标为符号链接或链出区外，拒绝删除：$rel');
+        return AgentToolResult(ok: false, output: '目标为符号链接或链出区外，拒绝删除：$rel');
       }
       final abs = allowOutside ? _resolveAny(rel) : _resolve(rel);
       final file = File(abs);
@@ -2067,7 +3008,10 @@ class AgentTools {
     final content = '${args['content'] ?? ''}';
     try {
       if (_isWriteLinkTarget(rel) || _isOutsideAfterRealpath(rel)) {
-        return AgentToolResult(ok: false, output: '目标为符号链接或链出区外，拒绝写入避免写到区外：$rel');
+        return AgentToolResult(
+          ok: false,
+          output: '目标为符号链接或链出区外，拒绝写入避免写到区外：$rel',
+        );
       }
       final abs = allowOutside ? _resolveAny(rel) : _resolve(rel);
       final file = File(abs);
@@ -2101,7 +3045,10 @@ class AgentTools {
     final newText = '${args['newText'] ?? ''}';
     try {
       if (_isWriteLinkTarget(rel) || _isOutsideAfterRealpath(rel)) {
-        return AgentToolResult(ok: false, output: '目标为符号链接或链出区外，拒绝修改避免写到区外：$rel');
+        return AgentToolResult(
+          ok: false,
+          output: '目标为符号链接或链出区外，拒绝修改避免写到区外：$rel',
+        );
       }
       final abs = allowOutside ? _resolveAny(rel) : _resolve(rel);
       final file = File(abs);
@@ -2120,6 +3067,15 @@ class AgentTools {
       final content = await file.readAsString();
       if (!content.contains(oldText)) {
         return AgentToolResult(ok: false, output: 'oldText 未精确匹配，请先 read_file');
+      }
+      // R1-C2同口径：预览层同样拒重复块，避免预览与执行不一致。
+      final firstHit = content.indexOf(oldText);
+      if (firstHit >= 0 &&
+          content.indexOf(oldText, firstHit + oldText.length) >= 0) {
+        return AgentToolResult(
+          ok: false,
+          output: 'oldText 在 $rel 中出现多次，请补充上下文行精确定位后再试：$rel',
+        );
       }
       final updated = content.replaceFirst(oldText, newText);
       return AgentToolResult(
@@ -2360,10 +3316,7 @@ class AgentTools {
           'sensitiveFiles': sensitive,
           'risks': risks,
           'commitMessageSuggestion': message,
-          'actions': const {
-            'commit': 'not_executed',
-            'push': 'not_executed',
-          },
+          'actions': const {'commit': 'not_executed', 'push': 'not_executed'},
         }),
       );
     } catch (e) {
@@ -2418,7 +3371,10 @@ class AgentTools {
         p.relative(abs, from: rootPath),
       ], workingDirectory: rootPath);
       if (result.exitCode != 0) {
-        return AgentToolResult(ok: false, output: 'git blame 失败：${result.stderr}');
+        return AgentToolResult(
+          ok: false,
+          output: 'git blame 失败：${result.stderr}',
+        );
       }
       return AgentToolResult(ok: true, output: '${result.stdout}');
     } catch (e) {
@@ -2438,6 +3394,19 @@ class AgentTools {
         final zone = _fs.zoneOf(rel);
         if (zone == FsZone.sensitive) {
           return AgentToolResult(ok: false, output: '敏感路径拒绝读取：$rel');
+        }
+        // 区外 list 仅允许单文件 stat：目录枚举区外直接拒绝，
+        // 避免一次审批枚举任意区外 200 项。
+        final absProbe = _resolveAny(rel);
+        final typeProbe = FileSystemEntity.typeSync(
+          absProbe,
+          followLinks: false,
+        );
+        if (typeProbe == FileSystemEntityType.directory) {
+          return AgentToolResult(
+            ok: false,
+            output: '区外目录不支持枚举，仅允许 read_file 单文件读取：$rel',
+          );
         }
       }
       final abs = allowOutside ? _resolveAny(rel) : _resolve(rel);
@@ -2465,9 +3434,11 @@ class AgentTools {
   }
 
   /// 全文搜索：走 WorkspaceSearch isolate（正则/glob/上下文行/上限），不占 UI isolate。
+  /// 会话取消联动：运行中轮询 [isSessionCancelled]，取消即杀底层 isolate 提前返回。
   Future<AgentToolResult> _search(
     Map<String, dynamic> args, {
     bool allowOutside = false,
+    String sessionId = '',
   }) async {
     final query = '${args['query'] ?? ''}';
     final include = '${args['include'] ?? ''}'.trim();
@@ -2490,18 +3461,42 @@ class AgentTools {
         .where((e) => e.isNotEmpty)
         .toList();
     try {
-      final searchRoot = allowOutside
-          ? _resolveApprovedRead('${args['path'] ?? '.'}')
-          : _resolve('${args['path'] ?? '.'}');
-      final groups = await WorkspaceSearch.search(
-        rootPath: searchRoot,
-        query: query,
-        caseSensitive: caseSensitive,
-        wholeWord: wholeWord,
-        useRegex: useRegex,
-        maxHits: maxResults,
-        ignoreDirs: excludeDirs,
+      if (allowOutside) {
+        // 区外 search 直接拒绝：一次审批即全文扫任意区外目录，
+        // 相对区外路径的敏感名单不对称泄露。仅允许 read_file 单文件。
+        return AgentToolResult(
+          ok: false,
+          output: '区外路径不支持全文搜索，仅允许 read_file 单文件读取',
+        );
+      }
+      final searchRoot = _resolve('${args['path'] ?? '.'}');
+      // token 恒创建（无会话取消回调时仅凭 cancel() 置位）：30s 熔断/取消
+      // 路径经 cancelActiveSearch 杀底层 isolate，不再依赖回调是否接线。
+      final cancelToken = SearchCancellationToken.fromPredicate(
+        () =>
+            sessionWorkCancelled(sessionId) ||
+            (isSessionCancelled?.call(sessionId) ?? false),
       );
+      _activeSearchTokens.putIfAbsent(sessionId, () => []).add(cancelToken);
+      final List<SearchFileGroup> groups;
+      try {
+        groups = await WorkspaceSearch.search(
+          rootPath: searchRoot,
+          query: query,
+          caseSensitive: caseSensitive,
+          wholeWord: wholeWord,
+          useRegex: useRegex,
+          maxHits: maxResults,
+          ignoreDirs: excludeDirs,
+          cancellationToken: cancelToken,
+        );
+      } finally {
+        final inflight = _activeSearchTokens[sessionId];
+        if (inflight != null) {
+          inflight.remove(cancelToken);
+          if (inflight.isEmpty) _activeSearchTokens.remove(sessionId);
+        }
+      }
       final glob = _globToRegExp(include);
       final filtered = glob == null
           ? groups
@@ -2535,6 +3530,15 @@ class AgentTools {
             final abs = p.normalize(p.join(searchRoot, g.relativePath));
             final rootNorm = p.normalize(searchRoot);
             if (abs != rootNorm && !p.isWithin(rootNorm, abs)) continue;
+            // realpath 链检查：搜索根含链接/命中链接文件时词法围栏可被穿透，
+            // 此前仅 normalize+isWithin，未查 symlink 即读出区外内容进上下文。
+            final real = WorkspaceFs.realpathOf(abs);
+            final rootReal = WorkspaceFs.realpathOf(rootNorm);
+            if (real != rootReal && !p.isWithin(rootReal, real)) continue;
+            if (FileSystemEntity.typeSync(abs, followLinks: false) ==
+                FileSystemEntityType.link) {
+              continue;
+            }
             // 先判大小再读：此前 readAsLines 全量进内存，大文件直接 OOM。
             final f = File(abs);
             if (await f.exists() && await f.length() <= 1024 * 1024) {
@@ -2577,7 +3581,8 @@ class AgentTools {
           : '';
       return AgentToolResult(
         ok: true,
-        output: '搜索 $query 共 $total 条$capped$sensitiveNote：\n${lines.join('\n')}',
+        output:
+            '搜索 $query 共 $total 条$capped$sensitiveNote：\n${lines.join('\n')}',
       );
     } catch (e) {
       return AgentToolResult(ok: false, output: '搜索失败：$e');
@@ -2604,13 +3609,29 @@ class AgentTools {
     if (query.isEmpty) {
       return AgentToolResult(ok: false, output: 'query 不能为空');
     }
-    final maxResults = ((args['maxResults'] as num?)?.toInt() ?? 20).clamp(1, 50);
+    final maxResults = ((args['maxResults'] as num?)?.toInt() ?? 20).clamp(
+      1,
+      50,
+    );
     try {
       final docs = <SemanticDoc>[];
-      await for (final entity
-          in Directory(rootPath).list(recursive: true, followLinks: false)) {
+      // R5-A6 采集截断旗：500 即 break 时尾部未参排，输出附注不再静默。
+      var collectTruncated = false;
+      // R8-A3 目录流有界：recursive list无take上限，深仓此前流卡死。
+      // 现采集计数超2000即停（docs 500+跳过计数同口径）。
+      var scanned = 0;
+      await for (final entity in Directory(
+        rootPath,
+      ).list(recursive: true, followLinks: false)) {
         if (entity is! File) continue;
-        if (docs.length >= 500) break;
+        if (++scanned > 2000) {
+          collectTruncated = true;
+          break;
+        }
+        if (docs.length >= 500) {
+          collectTruncated = true;
+          break;
+        }
         final rel = p.relative(entity.path, from: rootPath);
         if (_snapshotSkipped(rel)) continue;
         if (p.basename(rel) == '.DS_Store') continue;
@@ -2638,7 +3659,13 @@ class AgentTools {
       final lines = ranked
           .map((r) => '${r.path}（${r.score.toStringAsFixed(3)}）')
           .join('\n');
-      return AgentToolResult(ok: true, output: '语义检索 $query：\n$lines');
+      // R5-A6 截断提示：采集 500 即断（collectTruncated）或 semanticRank
+      // 内 500 截断时，尾部不再静默不可见。
+      final truncatedNote = collectTruncated ? '\n（仅前500文档参排，尾部未参排）' : '';
+      return AgentToolResult(
+        ok: true,
+        output: '语义检索 $query：\n$lines$truncatedNote',
+      );
     } catch (e) {
       return AgentToolResult(ok: false, output: '语义检索失败：$e');
     }
@@ -2685,12 +3712,15 @@ class AgentTools {
         character: character,
       );
       if (locs.isEmpty) return AgentToolResult(ok: true, output: '无定义：$rel');
-      final lines = locs.take(20).map((l) {
-        final r = p.isWithin(rootPath, l.filePath)
-            ? p.relative(l.filePath, from: rootPath)
-            : l.filePath;
-        return '$r:${l.line + 1}:${l.character}';
-      }).join('\n');
+      final lines = locs
+          .take(20)
+          .map((l) {
+            final r = p.isWithin(rootPath, l.filePath)
+                ? p.relative(l.filePath, from: rootPath)
+                : l.filePath;
+            return '$r:${l.line + 1}:${l.character}';
+          })
+          .join('\n');
       return AgentToolResult(ok: true, output: '定义：\n$lines');
     } catch (e) {
       return AgentToolResult(ok: false, output: '跳转定义失败：$e');
@@ -2725,12 +3755,15 @@ class AgentTools {
         character: character,
       );
       if (locs.isEmpty) return AgentToolResult(ok: true, output: '无引用：$rel');
-      final lines = locs.take(50).map((l) {
-        final r = p.isWithin(rootPath, l.filePath)
-            ? p.relative(l.filePath, from: rootPath)
-            : l.filePath;
-        return '$r:${l.line + 1}';
-      }).join('\n');
+      final lines = locs
+          .take(50)
+          .map((l) {
+            final r = p.isWithin(rootPath, l.filePath)
+                ? p.relative(l.filePath, from: rootPath)
+                : l.filePath;
+            return '$r:${l.line + 1}';
+          })
+          .join('\n');
       return AgentToolResult(ok: true, output: '引用：\n$lines');
     } catch (e) {
       return AgentToolResult(ok: false, output: '查引用失败：$e');
@@ -2821,7 +3854,18 @@ class AgentTools {
     if (command.trim().isEmpty) {
       return AgentToolResult(ok: false, output: 'command 不能为空');
     }
-    if (isDangerous(command)) {
+    // shell 旁路封 .my_ide：与文件工具 sensitive 永拒对齐，
+    // 审批弹窗只给摘要（首尾各 120 字），长命令中段目标易漏，直接拒绝。
+    if (CommandPolicy.hitsIdeStateDir(command)) {
+      return AgentToolResult(
+        ok: false,
+        output: '拒绝执行命令：命中 IDE 状态目录 .my_ide（防删版本库），请改走版本面板/手动操作',
+      );
+    }
+    // A7：带 rootPath 判定——敏感重定向落点（> .env、> .git/hooks 等）
+    // 在执行层直接拒绝；isDangerous 无 rootPath 判不了落点分区。
+    if (CommandPolicy.judge(command, rootPath: rootPath) ==
+        CommandVerdict.deny) {
       return AgentToolResult(ok: false, output: '拒绝执行高危命令：$command');
     }
     final safe = CommandPolicy.safeInvocation(command, rootPath: rootPath);
@@ -2830,9 +3874,13 @@ class AgentTools {
     }
     // background=true：长任务后台跑，立即返回 taskId，不阻塞 45 步循环。
     if (args['background'] == true) {
+      final dockerArgs = dockerSandbox
+          ? CommandPolicy.dockerWrap(command, rootPath)
+          : null;
       return _startBackgroundCommand(
         command,
         safe: safe,
+        dockerArgs: dockerArgs,
         timeout: Duration(seconds: timeoutSec),
         sessionId: sessionId,
       );
@@ -2840,8 +3888,10 @@ class AgentTools {
     // 命令前后快照对比，探测改盘文件（touchedFiles 恒为空会导致 UI 不刷新）。
     final before = await _snapshotWorkspace();
     Process? process;
-    final stdout = StringBuffer();
-    final stderr = StringBuffer();
+    // 前台输出同样走环形缓冲：与后台任务同口径（尾部 2000 行），
+    // 300s 窗口内刷屏命令此前无上限累积 StringBuffer 可 OOM。
+    final stdout = ForegroundOutputRing();
+    final stderr = ForegroundOutputRing();
     // 前台流订阅句柄提至 try 外：catch 子句看不到 try 内局部函数，
     // 此前 forEach 无句柄，exitCode 超时/异常时订阅挂起永不释放。
     StreamSubscription<String>? stdoutSub;
@@ -2866,22 +3916,28 @@ class AgentTools {
         errDone.complete();
       }
     }
+
     try {
       // Docker 沙箱：高危已在上游拒绝，这里只包裹执行并标注输出。
       final dockerArgs = dockerSandbox
           ? CommandPolicy.dockerWrap(command, rootPath)
           : null;
+      // A7：区内重定向命令必须经 shell 以原文执行（argv 直跑会丢重定向）。
+      final viaShell =
+          dockerArgs != null || safe == null || safe.redirectCommand != null;
+      final executable =
+          dockerArgs?.first ?? (viaShell ? _shellExecutable : safe.executable);
+      final arguments =
+          dockerArgs?.sublist(1) ??
+          (viaShell ? _shellArguments(command) : safe.arguments);
       process = await _processManager.start(
-        dockerArgs != null
-            ? dockerArgs.first
-            : (safe?.executable ?? _shellExecutable),
-        dockerArgs != null
-            ? dockerArgs.sublist(1)
-            : (safe?.arguments ?? _shellArguments(command)),
+        executable,
+        arguments,
         workingDirectory: rootPath,
         // 命令独立成组：超时/取消时 kill -- -pgid 只杀该命令组，
         // 沙箱验证过与 IDE 不同组才组杀，不会误伤 IDE 自身。
         startNewSession: true,
+        sessionId: sessionId,
       );
       // 容错解码：多字节被切包时普通 utf8.decoder 抛 FormatException，
       // 误记为命令失败。终端侧已用 allowMalformed，此处对齐。
@@ -2890,28 +3946,32 @@ class AgentTools {
       stderrDone = Completer<void>();
       final outDone = stdoutDone;
       final errDone = stderrDone;
-      stdoutSub = process.stdout.transform(outputDecoder).listen(
-        stdout.write,
-        onDone: () {
-          if (!outDone.isCompleted) outDone.complete();
-        },
-        onError: (Object e) {
-          stdout.writeln('$e');
-          if (!outDone.isCompleted) outDone.complete();
-        },
-        cancelOnError: false,
-      );
-      stderrSub = process.stderr.transform(outputDecoder).listen(
-        stderr.write,
-        onDone: () {
-          if (!errDone.isCompleted) errDone.complete();
-        },
-        onError: (Object e) {
-          stderr.writeln('$e');
-          if (!errDone.isCompleted) errDone.complete();
-        },
-        cancelOnError: false,
-      );
+      stdoutSub = process.stdout
+          .transform(outputDecoder)
+          .listen(
+            stdout.append,
+            onDone: () {
+              if (!outDone.isCompleted) outDone.complete();
+            },
+            onError: (Object e) {
+              stdout.appendLine(e);
+              if (!outDone.isCompleted) outDone.complete();
+            },
+            cancelOnError: false,
+          );
+      stderrSub = process.stderr
+          .transform(outputDecoder)
+          .listen(
+            stderr.append,
+            onDone: () {
+              if (!errDone.isCompleted) errDone.complete();
+            },
+            onError: (Object e) {
+              stderr.appendLine(e);
+              if (!errDone.isCompleted) errDone.complete();
+            },
+            cancelOnError: false,
+          );
       final exitCode = await process.exitCode.timeout(
         Duration(seconds: timeoutSec),
         onTimeout: () async {
@@ -2922,9 +3982,10 @@ class AgentTools {
       // 输出流等待同样加超时：进程已退出但流未闭合（如 yes 无限输出），
       // 此前永久挂住该步。超时即取消订阅，避免 forEach 挂起泄漏。
       try {
-        await Future.wait([outDone.future, errDone.future]).timeout(
-          const Duration(seconds: 5),
-        );
+        await Future.wait([
+          outDone.future,
+          errDone.future,
+        ]).timeout(const Duration(seconds: 5));
       } on TimeoutException {
         await cancelStreams();
       }
@@ -2971,6 +4032,7 @@ class AgentTools {
   Future<AgentToolResult> _startBackgroundCommand(
     String command, {
     SafeCommandInvocation? safe,
+    List<String>? dockerArgs,
     required Duration timeout,
     required String sessionId,
   }) async {
@@ -2978,9 +4040,17 @@ class AgentTools {
     final startedAt = DateTime.now();
     final before = await _snapshotWorkspace();
     try {
+      // A7：区内重定向命令必须经 shell 以原文执行（argv 直跑会丢重定向）。
+      final wrapped = dockerArgs;
+      final viaShell =
+          wrapped == null && (safe == null || safe.redirectCommand != null);
       final proc = await _processManager.start(
-        safe?.executable ?? _shellExecutable,
-        safe?.arguments ?? _shellArguments(command),
+        wrapped != null
+            ? wrapped.first
+            : (viaShell ? _shellExecutable : safe!.executable),
+        wrapped != null
+            ? wrapped.sublist(1)
+            : (viaShell ? _shellArguments(command) : safe!.arguments),
         workingDirectory: rootPath,
         // 后台任务同样独立成组，超时/kill 时整组终止不留孤儿。
         startNewSession: true,
@@ -3076,7 +4146,11 @@ class AgentTools {
       return AgentToolResult(ok: false, output: 'taskId 不能为空');
     }
     final task = _bgTasks[id];
-    if (task == null || task.sessionId != sessionId) {
+    // R6：同时校验 workspace——跨项目复用同 chat（同 sessionId）可 poll
+    // 他区任务输出。此前只验 sessionId。
+    if (task == null ||
+        task.sessionId != sessionId ||
+        task.workspace != rootPath) {
       return AgentToolResult(ok: false, output: '后台任务不存在：$id');
     }
     if (args['kill'] == true) {
@@ -3136,7 +4210,19 @@ class AgentTools {
   }
 
   Future<void> disposeBackgroundTasks({String? sessionId}) async {
-    await terminals.disposeAll();
+    // 按会话清理终端：sessionId 非空只杀本会话终端，他会话终端保留；
+    // 空 sessionId=全局兜底（关窗/切项目），全清。
+    // 此前无条件 disposeAll，并行下 A 取消把 B 的常驻终端一起杀掉。
+    if (sessionId == null) {
+      await terminals.disposeAll();
+    } else {
+      for (final id in terminals.sessions.keys.toList()) {
+        final s = terminals.sessions[id];
+        if (s != null && s.ownerSessionId == sessionId) {
+          await terminals.kill(id, ownerSessionId: sessionId);
+        }
+      }
+    }
     final tasks = _bgTasks.values
         .where((task) => sessionId == null || task.sessionId == sessionId)
         .toList();
@@ -3196,6 +4282,9 @@ class AgentTools {
 
   bool _snapshotSkipped(String rel) {
     if (rel.startsWith('.my_ide') || rel.startsWith('.git/')) return true;
+    // R4-05：commit.json 同样跳过——与 checkpoint_store 同口径，事务 journal
+    // 不计入后台冲突快照，否则每轮 checkpoint 自身触发冲突。
+    if (p.basename(rel) == 'commit.json') return true;
     // 侧车文件不计入改动：写盘/补丁/版本恢复的唯一 tmp 在快照窗口内
     // 此前会被当成"新增文件"记入 touchedFiles。
     final base = p.basename(rel);
@@ -3232,7 +4321,8 @@ class AgentTools {
         if (_snapshotSkipped(rel)) continue;
         try {
           final stat = await entity.stat();
-          out[rel] = '${stat.size}:${stat.modified.millisecondsSinceEpoch}';
+          // 微秒精度：毫秒截断下同毫秒同大小改写漏检（与 todos.json 微秒口径对齐）。
+          out[rel] = '${stat.size}:${stat.modified.microsecondsSinceEpoch}';
           count++;
         } catch (_) {}
       }
@@ -3250,7 +4340,12 @@ class AgentTools {
     }
     touched.sort();
     // 上限 200，避免某次全量生成刷爆 UI。
-    return touched.length > 200 ? touched.sublist(0, 200) : touched;
+    // R3-07：截断带哨兵——此前静默sublist(0,200)，backgroundTouchedConflict
+    // 误判无冲突直接覆盖后台产出。现超量追加哨兵key，调用方见哨兵即全目标冲突。
+    if (touched.length > 200) {
+      return [...touched.sublist(0, 200), snapshotTruncatedKey];
+    }
+    return touched;
   }
 
   /// B3：后台任务并发写检查——目标文件若在任一在途后台任务启动后被改动，
@@ -3284,6 +4379,10 @@ class AgentTools {
           ? '${args['path'] ?? ''}'.trim()
           : '${args['path'] ?? args['from'] ?? ''}'.trim();
       if (path.isNotEmpty) targets.add(path);
+    } else if (toolName == 'set_executable') {
+      // chmod 同样改盘：后台正在写 a 时 chmod 竞态，此前漏检。
+      final path = '${args['path'] ?? ''}'.trim();
+      if (path.isNotEmpty) targets.add(path);
     } else if (toolName == 'copy_file') {
       // copy 的 from 同样可能正在被后台改：此前仅 edit/write/patch 走冲突检查，
       // copy 源文件被后台改即拷到半写内容。
@@ -3314,6 +4413,7 @@ class AgentTools {
       }
       return false;
     }
+
     // 常驻终端同样参与冲突判定：在途终端会话可能随时经 terminal_write 改盘。
     // 此前只扫 run_command 后台任务，终端写入后紧跟 edit 会静默覆盖。
     // 终端无快照基线：保守策略为任一在途终端存在即视为全部目标冲突，

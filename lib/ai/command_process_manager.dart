@@ -2,11 +2,26 @@ import 'dart:async';
 import 'dart:io';
 
 /// Runner 级命令进程管理器。持有所有命令句柄，并负责终止完整进程树。
+class ProcessTerminateReport {
+  ProcessTerminateReport({
+    required this.pid,
+    required this.exited,
+    this.remainingPids = const [],
+  });
+
+  final int pid;
+  final bool exited;
+  final List<int> remainingPids;
+}
+
 class CommandProcessManager {
   final Map<int, Process> _active = {};
   final Map<int, Set<int>> _descendants = {};
   final Map<int, Timer> _trackers = {};
   final Map<int, Future<void>> _terminating = {};
+  // R1-02：前台进程按会话归属——pid→sessionId，取消只杀本会话，
+  // 此前前台只按pid登记，requestCancel(session)杀不到前台致孤儿常驻。
+  final Map<int, String> _sessionOf = {};
   bool _disposed = false;
 
   int get activeCount => _active.length;
@@ -15,46 +30,105 @@ class CommandProcessManager {
     String executable,
     List<String> arguments, {
     required String workingDirectory,
+    // 真独立进程会话（跨平台）：macOS/Linux 经 `/usr/bin/setsid` 新起会话，
+    // Windows 经 `CREATE_NEW_PROCESS_GROUP` 新起进程组，
+    // 超时/取消时整组终止不留孤儿（daemon 双 fork 仍可能逃逸，见 terminateWithReport）。
+    // 失败回退普通启动（沙箱无 setsid/Win32 异常），调用方靠 pgrep 精确路径兜底。
     bool startNewSession = false,
+    String? sessionLabel,
+    String sessionId = '',
   }) async {
     if (_disposed) throw StateError('命令进程管理器已关闭');
-    // 独立进程组不可用：ProcessStartMode.detachedWithStdio 虽经 setsid
-    // 新起会话，但 Dart 对 detached 进程禁用 exitCode（抛
-    // `Bad state: Process is detached`），前台/后台命令都依赖 exitCode
-    // 判定完成，已回退为普通启动。startNewSession 参数保留表意，
-    // 供未来原生 helper 实现真隔离；当前组杀安全由 _killProcessGroup 的
-    // pgid 归属校验保证（与 IDE 同组跳过组杀，只走 pgrep 精确路径），
-    // 收养孤儿靠“先快照后代再发信号”一次做完（见 _terminateOnce）。
-    final trackedProcess = await Process.start(
+    Process? trackedProcess;
+    if (startNewSession && !Platform.isWindows) {
+      // macOS 沙箱可能无 setsid：缺失即回退普通启动，不抛错阻断命令。
+      try {
+        trackedProcess = await _startDetachedPosix(
+          executable,
+          arguments,
+          workingDirectory: workingDirectory,
+        );
+      } catch (_) {
+        trackedProcess = null;
+      }
+    }
+    if (trackedProcess == null && startNewSession && Platform.isWindows) {
+      try {
+        trackedProcess = await _startDetachedWindows(
+          executable,
+          arguments,
+          workingDirectory: workingDirectory,
+        );
+      } catch (_) {
+        trackedProcess = null;
+      }
+    }
+    trackedProcess ??= await Process.start(
       executable,
       arguments,
       workingDirectory: workingDirectory,
       runInShell: false,
     );
-    _active[trackedProcess.pid] = trackedProcess;
-    _descendants[trackedProcess.pid] = <int>{};
+    final proc = trackedProcess;
+    _active[proc.pid] = proc;
+    _sessionOf[proc.pid] = sessionId;
+    _descendants[proc.pid] = <int>{};
     if (!Platform.isWindows) {
       // 降频到 1s：此前 100ms + 每次 pgrep，常驻 dev server 每秒 10 次建进程。
-      _trackers[trackedProcess.pid] = Timer.periodic(
+      _trackers[proc.pid] = Timer.periodic(
         const Duration(seconds: 1),
-        (_) => unawaited(_recordDescendants(trackedProcess.pid)),
+        (_) => unawaited(_recordDescendants(proc.pid)),
       );
-      await _recordDescendants(trackedProcess.pid);
+      await _recordDescendants(proc.pid);
     }
     unawaited(
-      trackedProcess.exitCode.whenComplete(() async {
-        _trackers.remove(trackedProcess.pid)?.cancel();
+      proc.exitCode.whenComplete(() async {
+        _trackers.remove(proc.pid)?.cancel();
+        _sessionOf.remove(proc.pid);
         final descendants =
-            _descendants.remove(trackedProcess.pid) ?? const <int>{};
+            _descendants.remove(proc.pid) ?? const <int>{};
         if (!Platform.isWindows && descendants.isNotEmpty) {
           _signalAll(descendants, ProcessSignal.sigterm);
           await Future<void>.delayed(const Duration(milliseconds: 200));
           _signalAll(descendants, ProcessSignal.sigkill);
         }
-        _active.remove(trackedProcess.pid);
+        _active.remove(proc.pid);
       }),
     );
-    return trackedProcess;
+    return proc;
+  }
+
+  /// POSIX 独立会话启动：经 setsid 新起会话，子进程 getpgid/getsid 与父不同。
+  /// setsid 缺失/被沙箱拦截即抛，由 start() 回退普通启动。
+  Future<Process> _startDetachedPosix(
+    String executable,
+    List<String> arguments, {
+    required String workingDirectory,
+  }) {
+    return Process.start(
+      '/usr/bin/setsid',
+      [executable, ...arguments],
+      workingDirectory: workingDirectory,
+      runInShell: false,
+      // detachedWithStdio 经 setsid 新起会话且保留 stdio/exitCode 可用。
+      mode: ProcessStartMode.detachedWithStdio,
+    );
+  }
+
+  /// Windows 独立进程组启动：CREATE_NEW_PROCESS_GROUP 语义，
+  /// taskkill /T 整组终止时不连带 IDE 自身。
+  Future<Process> _startDetachedWindows(
+    String executable,
+    List<String> arguments, {
+    required String workingDirectory,
+  }) {
+    return Process.start(
+      executable,
+      arguments,
+      workingDirectory: workingDirectory,
+      runInShell: false,
+      mode: ProcessStartMode.detached,
+    );
   }
 
   Future<void> terminate(
@@ -100,8 +174,76 @@ class CommandProcessManager {
     } finally {
       _trackers.remove(process.pid)?.cancel();
       _descendants.remove(process.pid);
+      _sessionOf.remove(process.pid);
       _active.remove(process.pid);
       _terminating.remove(process.pid);
+    }
+  }
+
+  Future<ProcessTerminateReport> terminateWithReport(
+    Process process, {
+    Duration gracePeriod = const Duration(seconds: 2),
+  }) async {
+    // R3-F2：先快照后代再终止——此前_terminateOnce的finally已remove，
+    // 再读_descendants恒空，daemon逃逸报告说谎。现快照用于报告。
+    final snapshot = Set<int>.of(_descendants[process.pid] ?? const <int>{});
+    await terminate(process, gracePeriod: gracePeriod);
+    var alive = false;
+    List<int> remaining = const [];
+    try {
+      await process.exitCode.timeout(const Duration(milliseconds: 200));
+    } catch (_) {
+      alive = true;
+    }
+    if (alive) {
+      remaining = <int>[
+        process.pid,
+        ...snapshot,
+      ];
+    }
+    return ProcessTerminateReport(
+      pid: process.pid,
+      exited: !alive,
+      remainingPids: remaining,
+    );
+  }
+
+  Future<List<ProcessTerminateReport>> terminateAllWithReport() async {
+    final processes = List<Process>.from(_active.values);
+    final reports = <ProcessTerminateReport>[];
+    for (final process in processes) {
+      try {
+        reports.add(await terminateWithReport(process));
+      } catch (e) {
+        reports.add(
+          ProcessTerminateReport(
+            pid: process.pid,
+            exited: false,
+            remainingPids: [process.pid],
+          ),
+        );
+      }
+    }
+    return reports;
+  }
+
+  /// R1-02：按会话终止前台进程——只杀归属 sessionId 的进程，
+  /// 他会话/后台不受影响。空 sessionId 走 terminateAll 兼容旧路径。
+  Future<void> terminateSession(String sessionId) async {
+    if (sessionId.isEmpty) return terminateAll();
+    final pids = _sessionOf.entries
+        .where((e) => e.value == sessionId)
+        .map((e) => e.key)
+        .toList();
+    for (final pid in pids) {
+      final proc = _active[pid];
+      if (proc == null) {
+        _sessionOf.remove(pid);
+        continue;
+      }
+      try {
+        await terminate(proc);
+      } catch (_) {}
     }
   }
 
@@ -131,6 +273,9 @@ class CommandProcessManager {
     final tracked = _descendants[rootPid];
     if (tracked == null) return;
     final found = await _descendantPids(rootPid);
+    // R3-F1：求交集收敛——此前只addAll不剔除，已退出pid常驻，
+    // PID复用后_signalAll误杀无关进程。现已消失即删。
+    tracked.retainAll(found);
     tracked.addAll(found);
   }
 
@@ -158,9 +303,23 @@ class CommandProcessManager {
 
   void _signalAll(Iterable<int> pids, ProcessSignal signal) {
     for (final pid in pids) {
+      // R3-F1：发信号前验活——kill pid取不到进程组（ESRCH）即已退出，
+      // 跳过不发，避免PID复用后杀到无关新进程。
+      if (!_isAlive(pid)) continue;
       try {
         Process.killPid(pid, signal);
       } catch (_) {}
+    }
+  }
+
+  bool _isAlive(int queryPid) {
+    if (Platform.isWindows) return true;
+    try {
+      // signal 0只探活不发信号：ESRCH抛错即已退出。
+      final result = Process.runSync('kill', ['-0', '$queryPid']);
+      return result.exitCode == 0;
+    } catch (_) {
+      return true;
     }
   }
 
@@ -183,6 +342,10 @@ class CommandProcessManager {
     try {
       final targetPgid = await _pgidOf(targetPid);
       if (targetPgid == null || targetPgid <= 1) return;
+      // R6：仅组长才组杀——targetPgid==targetPid 说明目标是进程组长，
+      // 组杀只杀其组。PID 退出复用后 pgid≠pid，此时组杀会误杀他人组，
+      // 只走逐 pid 精确补杀（_signalAll 路径）。
+      if (targetPgid != targetPid) return;
       // dart:io 的顶层 pid 即 IDE 自身 pid：方法参数已改名，避免遮蔽。
       final myPgid = await _pgidOf(pid);
       // 与 IDE 同组：跳过组杀，只走 pgrep 精确路径，避免误伤 IDE 自身。
@@ -193,14 +356,9 @@ class CommandProcessManager {
         '-$targetPgid',
       ]).timeout(const Duration(seconds: 3));
     } catch (_) {}
-    // 兼容旧语义：按 pid 组杀一次（pgid 不存在时 kill 直接 ESRCH 失败，无副作用）。
-    try {
-      await Process.run('kill', [
-        force ? '-KILL' : '-TERM',
-        '--',
-        '-$targetPid',
-      ]).timeout(const Duration(seconds: 3));
-    } catch (_) {}
+    // R3-F3：删按pid组杀兼容分支——此前targetPgid==null已return，
+    // 该分支永不可达；且targetPid≠pgid时`kill -- -pid`可误伤复用
+    // 进程组。现只按已校验pgid组杀，逐pid精确补杀由_signalAll承担。
   }
 
   /// 查询指定 pid 的进程组 id，失败返回 null（ps 不可用时调用方回退旧路径）。

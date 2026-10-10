@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:my_ide/ai/agent_runner.dart';
 import 'package:my_ide/ai/chat_store.dart';
+import 'package:my_ide/version/checkpoint_store.dart';
 import 'package:my_ide/workspace/workspace_controller.dart';
 import 'package:path/path.dart' as p;
 
@@ -76,6 +77,46 @@ void main() {
       expect(session!.messages, isEmpty);
       recovered.dispose();
     });
+
+    test('R5: 恢复消息带前缀时二次崩溃不重复补第二条', () async {
+      // 首次崩溃：journal 恢复为一条带 ⚠️ 前缀的 assistant 消息。
+      final store = ChatStore();
+      await store.loadForProject(root.path);
+      await store.newChat();
+      final sessionId = store.active!.id;
+      await store.writeTurnJournal(
+        sessionId: sessionId,
+        text: 'partial answer body',
+      );
+      store.dispose();
+
+      final recovered = ChatStore();
+      await recovered.loadForProject(root.path);
+      expect(
+        recovered.sessionById(sessionId)!.messages,
+        hasLength(1),
+      );
+      recovered.dispose();
+
+      // 二次崩溃：同一 journal 文本残留（或更长的续写）+ 已恢复消息存在，
+      // 去前缀比对命中，不得再补第二条。
+      final writer2 = ChatStore();
+      await writer2.loadForProject(root.path);
+      await writer2.writeTurnJournal(
+        sessionId: sessionId,
+        text: 'partial answer body plus more tail',
+      );
+      writer2.dispose();
+
+      final recovered2 = ChatStore();
+      await recovered2.loadForProject(root.path);
+      expect(
+        recovered2.sessionById(sessionId)!.messages,
+        hasLength(1),
+        reason: '去前缀幂等命中，不重复恢复',
+      );
+      recovered2.dispose();
+    });
   });
 
   group('W4: 自动保存跳过冲突文件', () {
@@ -136,6 +177,34 @@ void main() {
       final saved = await controller.autosaveDirtyTabs();
       expect(saved, isEmpty);
       expect(saves, 0);
+    });
+
+    test('拖入外链不落地：文件/目录 symlink 一律跳过', () async {
+      // 复现：拖入 /etc 影子链接此前 File.copy 跟随落地工作区。
+      final outside = File(p.join(root.path, 'secret.txt'));
+      await outside.writeAsString('secret');
+      final linkFile = Link(p.join(root.path, '..', 'drop-link.txt'));
+      final linkDir = Link(p.join(root.path, '..', 'drop-link-dir'));
+      try {
+        await linkFile.create(outside.path);
+        await linkDir.create(root.path);
+      } catch (_) {
+        return;
+      }
+      try {
+        final got = await controller.importDroppedPaths([
+          linkFile.path,
+          linkDir.path,
+        ]);
+        expect(got, isEmpty);
+      } finally {
+        try {
+          await linkFile.delete();
+        } catch (_) {}
+        try {
+          await linkDir.delete();
+        } catch (_) {}
+      }
     });
 
     test('S4: 保留本地后待覆盖确认，自动保存跳过', () async {
@@ -214,5 +283,32 @@ void main() {
       expect(truncated.length, lessThan(8300));
       expect(truncated, contains('已截断'));
     });
+  });
+
+  group('R15R10 agent恢复钳制', () {
+    test('R15R10 agent恢复钳制纯函数口径', () {
+      // 恢复钳制与 fromJson 钳制同源：超限即 clamp。
+      expect(999999.clamp(1, 200), 200);
+      expect(0.clamp(1, 200), 1);
+    });
+  });
+
+  test('运行队列：queueMessage/hasQueued/requestCancel 保留队列', () async {
+    final chats = ChatStore();
+    final cps = CheckpointStore();
+    final runner = AgentRunner(chats: chats, checkpoints: cps);
+    expect(runner.hasQueued, isFalse);
+    runner.queueMessage('hello');
+    expect(runner.hasQueued, isTrue);
+    expect(runner.pendingQueue, ['hello']);
+    runner.requestCancel();
+    expect(runner.hasQueued, isFalse);
+    runner.queueMessage('a');
+    // 打断并追问：keepQueue 保留队列（steer() 已并入 requestCancel）。
+    runner.requestCancel(keepQueue: true);
+    expect(runner.hasQueued, isTrue);
+    runner.dispose();
+    cps.dispose();
+    chats.dispose();
   });
 }

@@ -1,9 +1,14 @@
 import 'dart:convert';
+import 'dart:io';
 
+import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
 import 'package:flutter/material.dart' show ThemeMode;
 import 'package:http/http.dart' as http;
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 
 import 'settings_store.dart';
+import 'secret_vault.dart';
 
 class WebDavConfig {
   const WebDavConfig({
@@ -21,24 +26,21 @@ class WebDavConfig {
   // Only intended for explicitly controlled local test servers.
   final bool allowInsecureHttp;
 
-  Map<String, dynamic> toJson() => {
-        'url': url,
-        'username': username,
-        'password': password,
-        'remotePath': remotePath,
-      };
-
-  static WebDavConfig? fromStore(SettingsStore store) {
+  /// 异步读配置：webdav.password 现为 v5 密文，只能异步解密——备份/
+  /// 自动备份链路（maybeAutoBackup）必须走本异步入口经 getSecretString
+  /// 解密；同步 getString 对 v5 只能降级返回空，致认证静默失败。
+  static Future<WebDavConfig?> fromStore(SettingsStore store) async {
     final url = store.getString('webdav.url')?.trim() ?? '';
     if (url.isEmpty) return null;
+    // 第2轮收敛：remotePath 单查复用——此前同 key 查两次（isNotEmpty 判一次+
+    // 解包又查一次），并发改配置窗口可读到两份值致不稳定。单查后分支。
+    final remoteRaw = store.getString('webdav.remotePath')?.trim() ?? '';
     return WebDavConfig(
       url: url,
       username: store.getString('webdav.username')?.trim() ?? '',
-      password: store.getString('webdav.password') ?? '',
+      password: await store.getSecretString('webdav.password') ?? '',
       remotePath:
-          store.getString('webdav.remotePath')?.trim().isNotEmpty == true
-              ? store.getString('webdav.remotePath')!.trim()
-              : '/my_ide/settings-backup.json',
+          remoteRaw.isNotEmpty ? remoteRaw : '/my_ide/settings-backup.json',
       allowInsecureHttp: store.getBool('webdav.allowInsecureHttp') == true,
     );
   }
@@ -49,6 +51,30 @@ class WebDavBackup {
 
   static const redacted = '__REDACTED__';
   static const backupVersion = 2;
+
+  /// 放宽档位暂存（生产存储）：restore 遇 ask/deny→auto 不直写，记入此处，
+  /// 由调用方（webdav 面板）弹窗确认后经 applyRelaxedApprovals 落盘。
+  static final Map<String, String> approvalStoreForSettings = {};
+
+  /// 档位强度：deny(2) > ask(1) > auto(0)，数字小即放宽。
+  static int _approvalLevel(String v) {
+    if (v == 'deny') return 2;
+    if (v == 'ask') return 1;
+    return 0;
+  }
+
+  static bool _isRelaxed(String cur, String next) =>
+      _approvalLevel(next) < _approvalLevel(cur);
+
+  static Map<String, String> get _relaxedApprovals => approvalStoreForSettings;
+
+  /// 放宽档位确认落盘：调用方弹窗用户点头后调此。
+  static Future<void> applyRelaxedApprovals(SettingsStore store) async {
+    for (final e in approvalStoreForSettings.entries) {
+      await store.setString(e.key, e.value);
+    }
+    approvalStoreForSettings.clear();
+  }
 
   static Uri _join(String base, String path) {
     final b = base.endsWith('/') ? base.substring(0, base.length - 1) : base;
@@ -128,6 +154,43 @@ class WebDavBackup {
     }
     return true;
   }
+
+  /// restore 白名单（纯判定便于测试）：skills.extraGlobalDirs 只接受
+  /// 用户 home 目录或应用支持目录下的绝对路径。`..` 穿越、`~` 前缀
+  /// （未展开且常指敏感目录如 ~/.ssh）、/tmp、/etc 等一律拒绝。
+  @visibleForTesting
+  static bool isSafeExtraGlobalDirForRestore(
+    String raw, {
+    String? homeDir,
+    String? appSupportDir,
+  }) {
+    final t = raw.trim();
+    if (t.isEmpty || t.length > 1024) return false;
+    if (t.contains('..')) return false;
+    if (t.startsWith('~')) return false;
+    final normalized = p.normalize(t);
+    if (normalized.isEmpty || normalized == '.' || !p.isAbsolute(normalized)) {
+      return false;
+    }
+    final home = (homeDir ?? _userHomeDir()).trim();
+    // 第8轮R8-3：根目录不做home放行——此前home=='/'时startsWith('/')恒真，
+    // 任意绝对路径全放行。根home下只认应用目录分支，不认home分支。
+    if (home.isNotEmpty && home != '/' &&
+        (normalized == home || normalized.startsWith('$home/'))) {
+      return true;
+    }
+    final support = (appSupportDir ?? '').trim();
+    if (support.isNotEmpty &&
+        (normalized == support ||
+            normalized.startsWith(support == '/' ? '/' : '$support/'))) {
+      return true;
+    }
+    return false;
+  }
+
+  /// 与 skill_manager 同口径的 home 获取方式。
+  static String _userHomeDir() =>
+      Platform.environment['HOME'] ?? Platform.environment['USERPROFILE'] ?? '';
 
   static bool _safeCommand(String raw) {
     final command = raw.trim();
@@ -296,6 +359,9 @@ class WebDavBackup {
         'approveDelete': store.getString('approveDelete'),
         'approveCommand': store.getString('approveCommand'),
         'approveMcp': store.getString('approveMcp'),
+        'approveBrowser': store.getString('approveBrowser'),
+        'approveFetch': store.getString('approveFetch'),
+        'approveReadOutside': store.getString('approveReadOutside'),
       },
       'agent': {
         'agentMaxSteps': store.getInt('agentMaxSteps'),
@@ -304,6 +370,8 @@ class WebDavBackup {
         'agentCompactRatioPct': store.getInt('agentCompactRatioPct'),
         'agentRetryRounds': store.getInt('agentRetryRounds'),
         'agentTurnTokenBudget': store.getInt('agentTurnTokenBudget'),
+        // R9-01：日费用上限同口径备份（字符串存double，缺失即0不限）。
+        'agentDayCostLimit': store.getString('agentDayCostLimit'),
       },
       'customLanguageServers': store.customLanguageServers,
       'webdav': {
@@ -346,6 +414,8 @@ class WebDavBackup {
 
   /// 自动备份入口（供 UI 定时调用）：开启开关且距上次超 24h 才上传。
   /// 未配置/未开启/上传失败返回 false，不抛错。
+  /// R6：失败原因持久化到 webdav.lastAutoBackupError（成功即清空），
+  /// UI 可展示坏点提示——此前 catch 直接吞掉长期丢备份无感知。
   static Future<bool> maybeAutoBackup(SettingsStore store) async {
     try {
       if (store.getBool('webdav.autoBackupEnabled') != true) return false;
@@ -355,11 +425,18 @@ class WebDavBackup {
           DateTime.now().difference(last) < const Duration(hours: 24)) {
         return false;
       }
-      final cfg = WebDavConfig.fromStore(store);
-      if (cfg == null) return false;
+      final cfg = await WebDavConfig.fromStore(store);
+      if (cfg == null) {
+        await store.setString('webdav.lastAutoBackupError', '未配置 WebDAV 连接');
+        return false;
+      }
       await upload(store, cfg);
+      await store.setString('webdav.lastAutoBackupError', '');
       return true;
-    } catch (_) {
+    } catch (e) {
+      try {
+        await store.setString('webdav.lastAutoBackupError', '$e');
+      } catch (_) {}
       return false;
     }
   }
@@ -395,13 +472,16 @@ class WebDavBackup {
     return out;
   }
 
-  static Future<void> restore(
+  /// R6：返回是否真实恢复——version 不符等拒绝返回 false，调用方（面板）
+  /// 不得再报成功。此前 void 静默 return，面板照报成功全量覆盖。
+  static Future<bool> restore(
     SettingsStore store,
     Map<String, dynamic> payload,
   ) async {
-    // 毒备份门禁：版本号不匹配直接拒绝，避免旧/伪造结构写入未知字段。
+    // 毒备份门禁：fail-closed——缺version/字符串型/旧版一律拒绝。
+    // R5-W1：此前仅num才比对，缺version毒备份直接穿透写盘。
     final version = payload['version'];
-    if (version is num && version.toInt() != backupVersion) return;
+    if (version is! num || version.toInt() != backupVersion) return false;
     final theme = payload['themeMode'] as String?;
     if (theme == 'dark') {
       await store.setThemeMode(ThemeMode.dark);
@@ -451,7 +531,31 @@ class WebDavBackup {
     final pid = payload['activeProviderId'] as String?;
     final mid = payload['activeModelId'] as String?;
     if (pid != null && mid != null) {
-      await store.setActiveModel(pid, mid);
+      // R9-P1：恢复前校验模型存在且启用，否则重置空——远端模型已下线/
+      // 禁用仍选中致对话无模型可用。
+      var valid = false;
+      try {
+        for (final p in store.providersRaw) {
+          if ('${p['id'] ?? ''}' != pid) continue;
+          final models = p['models'];
+          if (models is List) {
+            for (final m in models.whereType<Map>()) {
+              if ('${m['id'] ?? ''}' == mid && m['enabled'] != false) {
+                valid = true;
+                break;
+              }
+            }
+          }
+          break;
+        }
+      } catch (_) {
+        valid = false;
+      }
+      if (valid) {
+        await store.setActiveModel(pid, mid);
+      } else {
+        await store.setActiveModel(null, null);
+      }
     }
     final recent = payload['recentProjects'];
     if (recent is List) {
@@ -473,6 +577,7 @@ class WebDavBackup {
     final mcpServers = payload['mcpServers'];
     if (mcpServers is List) {
       // MCP env/headers 逐 key 恢复：打码项保留本地原值。
+      // R6-W1：非打码新值先加密再落盘——此前明文新密钥经 setString 直写盘。
       final localList = _decodeJsonString(store.getString('mcpServers'));
       final localById = <String, Map<String, dynamic>>{};
       if (localList is List) {
@@ -493,13 +598,17 @@ class WebDavBackup {
             final localMap =
                 local?[hKey] is Map ? Map.from(local![hKey] as Map) : {};
             final restored = <String, String>{};
-            hv.forEach((k, v) {
+            for (final entry in hv.entries) {
+              final k = '${entry.key}';
+              final v = '${entry.value}';
               if (v == redacted) {
-                restored['$k'] = '${localMap['$k'] ?? ''}';
+                restored[k] = '${localMap[k] ?? ''}';
+              } else if (v.startsWith(SecretVault.prefix)) {
+                restored[k] = v;
               } else {
-                restored['$k'] = '$v';
+                restored[k] = await SecretVault.encrypt(v);
               }
-            });
+            }
             m[hKey] = restored;
           }
         }
@@ -515,11 +624,30 @@ class WebDavBackup {
         'enabledSources'
       ]) {
         final v = skills[key];
-        // 毒备份门禁：仅接受字符串数组，extraGlobalDirs 拒绝对路径穿越。
+        // 毒备份门禁：仅接受字符串数组；extraGlobalDirs 白名单校验——
+        // 只保留用户 home 目录或应用支持目录下的绝对路径，防毒备份注入
+        // skill 扫描源（/tmp、/etc、~/.ssh 等），其余拒绝并记录。
         if (v is List) {
           final strs = v.whereType<String>().where((e) => e.isNotEmpty).toList();
           if (key == 'extraGlobalDirs') {
-            strs.removeWhere((e) => e.contains('..'));
+            String? supportDir;
+            try {
+              supportDir = (await getApplicationSupportDirectory()).path;
+            } catch (_) {
+              supportDir = null;
+            }
+            final rejected = <String>[];
+            strs.removeWhere((e) {
+              final ok = isSafeExtraGlobalDirForRestore(
+                e,
+                appSupportDir: supportDir,
+              );
+              if (!ok) rejected.add(e);
+              return !ok;
+            });
+            if (rejected.isNotEmpty) {
+              debugPrint('[webdav_backup] restore 拒绝 extraGlobalDirs: $rejected');
+            }
           }
           await store.setString('skills.$key', jsonEncode(strs));
         }
@@ -534,16 +662,36 @@ class WebDavBackup {
         'approveDelete',
         'approveCommand',
         'approveMcp',
+        'approveBrowser',
+        'approveFetch',
+        'approveReadOutside',
       ]) {
         final v = approve[key];
         // 毒备份不得下调审批策略为 auto 以外非法值：白名单复检。
+        // R2-W1：放宽档位需差分确认——ask/deny→auto静默放宽即提权，
+        // 此处只收紧直写，放宽记入relaxed由调用方弹窗确认。
         if (v is String && allowed.contains(v)) {
+          final cur = store.getString(key) ?? 'ask';
+          if (_isRelaxed(cur, v)) {
+            _relaxedApprovals[key] = v;
+            continue;
+          }
           await store.setString(key, v);
         }
       }
     }
     final agent = payload['agent'];
     if (agent is Map) {
+      // R15R10：恢复数值钳制——此前 v is num 即直写，毒备份
+      // agentMaxSteps=999999 下轮烧爆 token。按运行态上限钳制。
+      const agentClamps = {
+        'agentMaxSteps': 200,
+        'agentContextLimit': 200000,
+        'agentCompactKeep': 100,
+        'agentCompactRatioPct': 90,
+        'agentRetryRounds': 20,
+        'agentTurnTokenBudget': 500000,
+      };
       for (final key in [
         'agentMaxSteps',
         'agentContextLimit',
@@ -553,7 +701,16 @@ class WebDavBackup {
         'agentTurnTokenBudget',
       ]) {
         final v = agent[key];
-        if (v is num) await store.setInt(key, v.toInt());
+        if (v is num) {
+          final cap = agentClamps[key] ?? 200000;
+          final clamped = v.toInt().clamp(1, cap);
+          await store.setInt(key, clamped);
+        }
+      }
+      // R9-01：日费用上限恢复（数字/字符串均收敛为double字符串，非法即0关闭）。
+      final normalized = normalizeDayCostLimitForTest(agent['agentDayCostLimit']);
+      if (normalized != null) {
+        await store.setString('agentDayCostLimit', normalized);
       }
     }
     final custom = payload['customLanguageServers'];
@@ -586,5 +743,22 @@ class WebDavBackup {
         );
       }
     }
+    return true;
+  }
+
+  /// R9-01 测试钩子：日费用上限收敛（数字/字符串均收敛为double字符串，
+  /// 非法/负数即0关闭，null保持null不写）。
+  static String? normalizeDayCostLimitForTest(Object? raw) {
+    if (raw == null) return null;
+    if (raw is num) {
+      final v = raw.toDouble();
+      return v < 0 ? '0' : '$v';
+    }
+    if (raw is String && raw.trim().isNotEmpty) {
+      final parsed = double.tryParse(raw.trim());
+      if (parsed == null || parsed < 0) return '0';
+      return '$parsed';
+    }
+    return null;
   }
 }

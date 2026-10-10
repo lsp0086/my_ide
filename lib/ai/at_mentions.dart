@@ -28,15 +28,16 @@ class AtChip {
 
 /// Composer chip 数据源：@file/@folder/@problems/@symbol/@diff。
 List<AtChip> listChips() => const [
-      AtChip(id: 'file', label: '@file', hint: '引用单个文件内容'),
-      AtChip(id: 'folder', label: '@folder', hint: '引用目录结构'),
-      AtChip(id: 'problems', label: '@problems', hint: '引用当前诊断'),
-      AtChip(id: 'symbol', label: '@symbol', hint: '引用符号定义'),
-      AtChip(id: 'diff', label: '@diff', hint: '引用未提交差异'),
-    ];
+  AtChip(id: 'file', label: '@file', hint: '引用单个文件内容'),
+  AtChip(id: 'folder', label: '@folder', hint: '引用目录结构'),
+  AtChip(id: 'problems', label: '@problems', hint: '引用当前诊断'),
+  AtChip(id: 'symbol', label: '@symbol', hint: '引用符号定义'),
+  AtChip(id: 'diff', label: '@diff', hint: '引用未提交差异'),
+];
 
-final _mentionPattern =
-    RegExp(r'@(file|folder|problems|symbol|diff)\b([^\n@]*)');
+final _mentionPattern = RegExp(
+  r'@(file|folder|problems|symbol|diff)\b([^\n@]*)',
+);
 
 /// 提取文本中的 @ 引用。保持出现顺序，去重连续重复。
 List<AtMention> parseAtMentions(String text) {
@@ -79,7 +80,7 @@ Future<String> resolveAtMentions(
           if (block != null) buf.writeln('\n\n$block');
           break;
         case AtMentionKind.folder:
-          final block = _resolveFolder(m.arg, rootPath);
+          final block = await _resolveFolder(m.arg, rootPath);
           if (block != null) buf.writeln('\n\n$block');
           break;
         case AtMentionKind.problems:
@@ -94,7 +95,8 @@ Future<String> resolveAtMentions(
           final lines = symbolLookup?.call(m.arg) ?? const <String>[];
           if (lines.isNotEmpty) {
             buf.writeln(
-                '\n\n【@symbol ${m.arg}】\n${_truncate(lines.take(20).join('\n'), 6000)}');
+              '\n\n【@symbol ${m.arg}】\n${_truncate(lines.take(20).join('\n'), 6000)}',
+            );
           }
           break;
         case AtMentionKind.diff:
@@ -126,7 +128,7 @@ Future<String?> _resolveFile(String arg, String? rootPath) async {
   return '【@file $rel】\n${_truncate(content, 8000)}';
 }
 
-String? _resolveFolder(String arg, String? rootPath) {
+Future<String?> _resolveFolder(String arg, String? rootPath) async {
   final rel = _firstToken(arg);
   if (rel.isEmpty || rootPath == null) return null;
   final fs = WorkspaceFs(rootPath: rootPath);
@@ -135,7 +137,9 @@ String? _resolveFolder(String arg, String? rootPath) {
   if (!dir.existsSync()) return null;
   final entries = <String>[];
   try {
-    for (final e in dir.listSync(followLinks: false).take(100)) {
+    // R9-A5 真流式截断：listSync().take(100)此前全量具化后才take，
+    // 万级目录即卡死。现异步流take(100)，够即停。
+    await for (final e in dir.list(followLinks: false).take(100)) {
       entries.add(p.basename(e.path));
     }
   } catch (_) {

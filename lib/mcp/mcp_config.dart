@@ -96,22 +96,41 @@ class McpServerConfig {
   factory McpServerConfig.fromJson(Map<String, dynamic> json) {
     final transportRaw = '${json['transport'] ?? ''}'.toLowerCase();
     final hasUrl = '${json['url'] ?? ''}'.trim().isNotEmpty;
+    // 轮次1：transportRaw 已 toLowerCase，与 'streamableHttp'（含大写 H）
+    // 比较恒 false，且 http 兜底分支要求 transportRaw 为空——
+    // "transport": "streamableHttp" + url 的常见配置被误判 stdio
+    // （command 空）致连接必失败。改比对全小写字面量。
     final transport = (transportRaw == 'http' ||
             transportRaw == 'sse' ||
-            transportRaw == 'streamableHttp' ||
+            transportRaw == 'streamablehttp' ||
             (transportRaw.isEmpty && hasUrl))
         ? McpTransportType.http
         : McpTransportType.stdio;
+    // R15R10：args/env 有界——毒 JSON 万条 args 撑上下文+spawn 超长命令行。
+    // args 限 50 条各 512 字，env 限 50 键各 key64/value2K。
+    final rawArgs = ((json['args'] as List?) ?? const []);
+    final boundedArgs = <String>[];
+    for (final e in rawArgs) {
+      if (boundedArgs.length >= 50) break;
+      final s = '$e';
+      boundedArgs.add(s.length > 512 ? s.substring(0, 512) : s);
+    }
+    final rawEnv = _stringMap(json['env']);
+    final boundedEnv = <String, String>{};
+    for (final e in rawEnv.entries) {
+      if (boundedEnv.length >= 50) break;
+      final k = e.key.length > 64 ? e.key.substring(0, 64) : e.key;
+      final v = e.value.length > 2048 ? e.value.substring(0, 2048) : e.value;
+      boundedEnv[k] = v;
+    }
     return McpServerConfig(
       id: '${json['id'] ?? DateTime.now().millisecondsSinceEpoch}',
       name: '${json['name'] ?? json['id'] ?? 'MCP'}',
       enabled: json['enabled'] != false,
       transport: transport,
       command: '${json['command'] ?? ''}',
-      args: ((json['args'] as List?) ?? const [])
-          .map((e) => '$e')
-          .toList(growable: false),
-      env: _stringMap(json['env']),
+      args: boundedArgs,
+      env: boundedEnv,
       cwd: json['cwd'] == null ? null : '${json['cwd']}',
       url: '${json['url'] ?? ''}',
       headers: _stringMap(json['headers']),
@@ -162,12 +181,23 @@ class McpConfigImporter {
   }
 
   /// 配置校验：command/url 缺失告警，返回告警列表（空=通过）。
+  /// http 同样校验 scheme：file:// 内网穿透此前可配，连接时才拒。
   static List<String> validateConfig(McpServerConfig cfg) {
     final out = <String>[];
     if (cfg.transport == McpTransportType.stdio) {
       if (cfg.command.trim().isEmpty) out.add('stdio 缺少 command');
     } else {
-      if (cfg.url.trim().isEmpty) out.add('http 缺少 url');
+      final url = cfg.url.trim();
+      if (url.isEmpty) {
+        out.add('http 缺少 url');
+      } else {
+        final uri = Uri.tryParse(url);
+        if (uri == null ||
+            (uri.scheme != 'http' && uri.scheme != 'https') ||
+            uri.host.isEmpty) {
+          out.add('http url 仅支持 http(s)');
+        }
+      }
     }
     return out;
   }
@@ -274,6 +304,23 @@ class McpConfigImporter {
 
   /// 脱敏导出：env/headers 的值全部打码，仅保留 key 与是否已配置，
   /// 避免复制分享时泄漏密钥。导入该脱敏 JSON 后需重新填写密钥。
+  static String redactUrl(String raw) {
+    final uri = Uri.tryParse(raw.trim());
+    if (uri == null || !uri.hasQuery) return raw;
+    const sensitive = {'token', 'api_key', 'access_token', 'key'};
+    final kept = <String, String>{};
+    var changed = false;
+    uri.queryParameters.forEach((k, v) {
+      if (sensitive.contains(k.toLowerCase())) {
+        changed = true;
+        return;
+      }
+      kept[k] = v;
+    });
+    if (!changed) return raw;
+    return uri.replace(queryParameters: kept.isEmpty ? null : kept).toString();
+  }
+
   static String exportRedactedJson(List<McpServerConfig> servers) {
     Map<String, String> redact(Map<String, String> m) => {
           for (final e in m.entries) e.key: '<已脱敏，需重新填写>',
@@ -291,7 +338,7 @@ class McpConfigImporter {
             'args': s.args,
             if (s.env.isNotEmpty) 'env': redact(s.env),
             'cwd': s.cwd,
-            'url': s.url,
+            'url': redactUrl(s.url),
             if (s.headers.isNotEmpty) 'headers': redact(s.headers),
           },
       ],
@@ -304,7 +351,7 @@ class McpConfigImporter {
               if (s.env.isNotEmpty) 'env': redact(s.env),
               if (s.cwd != null && s.cwd!.isNotEmpty) 'cwd': s.cwd,
             } else ...{
-              'url': s.url,
+              'url': redactUrl(s.url),
               if (s.headers.isNotEmpty)
                 'headers': redact(s.headers),
             },

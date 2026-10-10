@@ -51,10 +51,15 @@ Future<PastedImage?> readClipboardImage() async {
         text.endsWith('.gif'))) {
       return null;
     }
-    final path =
-        text.startsWith('file://') ? Uri.parse(text).toFilePath() : text;
+    final path = text.startsWith('file://')
+        ? Uri.parse(text).toFilePath()
+        : text;
     final f = File(path);
     if (!await f.exists()) return null;
+    // R10-A3 先判大小再读：此前readAsBytes后才判8MB，大文件先全量进内存。
+    try {
+      if (await f.length() > 8 * 1024 * 1024) return null;
+    } catch (_) {}
     final bytes = await f.readAsBytes();
     if (bytes.isEmpty || bytes.length > 8 * 1024 * 1024) return null;
     final mime = _mimeFromPath(path);

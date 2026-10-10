@@ -29,7 +29,8 @@ class DiagnosticsStore extends ChangeNotifier {
   }
 
   List<IdeDiagnostic> diagnosticsOf(String path) {
-    return List.unmodifiable(_byFile[path] ?? const []);
+    return List.unmodifiable(
+        _dedupKeepFirst(_byFile[path] ?? const <IdeDiagnostic>[]));
   }
 
   List<IdeDiagnostic> get allDiagnostics {
@@ -37,15 +38,15 @@ class DiagnosticsStore extends ChangeNotifier {
     for (final list in _byFile.values) {
       out.addAll(list);
     }
-    out.sort(_compare);
-    return List.unmodifiable(out);
+    final deduped = _dedupKeepFirst(out)..sort(_compare);
+    return List.unmodifiable(deduped);
   }
 
   int get errorCount => _countSeverity(DiagnosticSeverity.error);
   int get warningCount => _countSeverity(DiagnosticSeverity.warning);
   int get infoCount => _countSeverity(DiagnosticSeverity.info);
   int get totalCount =>
-      _byFile.values.fold<int>(0, (sum, list) => sum + list.length);
+      _byFile.values.fold<int>(0, (sum, list) => sum + _dedupKeepFirst(list).length);
 
   int errorCountOf(String path) =>
       _countSeverityOf(path, DiagnosticSeverity.error);
@@ -55,7 +56,8 @@ class DiagnosticsStore extends ChangeNotifier {
 
   Map<int, DiagnosticSeverity> severitiesByLine(String path) {
     final map = <int, DiagnosticSeverity>{};
-    for (final d in _byFile[path] ?? const <IdeDiagnostic>[]) {
+    for (final d
+        in _dedupKeepFirst(_byFile[path] ?? const <IdeDiagnostic>[])) {
       final existing = map[d.startLine];
       if (existing == null || _rank(d.severity) < _rank(existing)) {
         map[d.startLine] = d.severity;
@@ -65,6 +67,8 @@ class DiagnosticsStore extends ChangeNotifier {
   }
 
   /// 整文件替换某一来源；其它来源保留。
+  /// 迟到包防护：incoming 版本低于已存同源版本时直接丢弃，
+  /// 否则慢回包会覆盖用户新编辑后的诊断（此前按到达时版本写入必覆盖）。
   void setForFileSource({
     required String path,
     required String source,
@@ -72,10 +76,24 @@ class DiagnosticsStore extends ChangeNotifier {
     int? contentVersion,
   }) {
     final version = contentVersion ?? (_contentVersion[path] ?? 0);
-    final others = (_byFile[path] ?? const <IdeDiagnostic>[])
-        .where((d) => d.source != source)
-        .toList();
-    final incoming = diagnostics
+    final existing = _byFile[path] ?? const <IdeDiagnostic>[];
+    var newestSameSource = -1;
+    for (final d in existing) {
+      if (d.source == source && d.contentVersion > newestSameSource) {
+        newestSameSource = d.contentVersion;
+      }
+    }
+    if (newestSameSource > version) return;
+    final others =
+        existing.where((d) => d.source != source).toList();
+    // R4-A5 单源上限2000：恶意 LSP 十万条此前常驻内存。
+    // 轮次1：先按 _compare 排序再取尾部——此前截断在排序前，"保留最新"
+    // 依赖调用方传入顺序，不保证最新。排序用副本（调用方可能传 unmodifiable）。
+    var capped = List.of(diagnostics)..sort(_compare);
+    if (capped.length > 2000) {
+      capped = capped.sublist(capped.length - 2000);
+    }
+    final incoming = capped
         .map((d) => IdeDiagnostic(
               filePath: d.filePath,
               startLine: d.startLine,
@@ -101,11 +119,12 @@ class DiagnosticsStore extends ChangeNotifier {
   /// 整文件替换全部来源。
   void setForFile(String path, List<IdeDiagnostic> diagnostics) {
     final version = _contentVersion[path] ?? 0;
+    // 轮次1：copyWith 后 contentVersion 恒等于 version，冗余 where 过滤
+    // 为死代码，删除。
     final next = diagnostics
         .map((d) => d.contentVersion == version
             ? d
             : d.copyWith(contentVersion: version))
-        .where((d) => d.contentVersion == version)
         .toList()
       ..sort(_compare);
     if (next.isEmpty) {
@@ -118,6 +137,9 @@ class DiagnosticsStore extends ChangeNotifier {
 
   void clearFile(String path) {
     if (_byFile.remove(path) == null) return;
+    // R15R9：清文件即删版本键——此前版本残留，重建同路径后旧诊断
+    // 按 bump 后的新版本误收（迟到包防护 newestSameSource>version 失效）。
+    _contentVersion.remove(path);
     notifyListeners();
   }
 
@@ -143,13 +165,30 @@ class DiagnosticsStore extends ChangeNotifier {
   void clearAll() {
     if (_byFile.isEmpty) return;
     _byFile.clear();
+    // R15R9：同 clearFile，版本键同步清空。
+    _contentVersion.clear();
     notifyListeners();
+  }
+
+  /// 展示层去重：各 source（lsp:xxx / local:tsc / …）对同一位置同一问题
+  /// （line/col/code/message）各存一份，读取时保留首个 source 的条目，
+  /// 问题面板不再重复展示。存储不动：条目仍归属各自 source，clearSource
+  /// 清空某来源时仅移除属于它的条目，另一来源的条目照常显示。
+  static List<IdeDiagnostic> _dedupKeepFirst(Iterable<IdeDiagnostic> input) {
+    final seen = <String>{};
+    final out = <IdeDiagnostic>[];
+    for (final d in input) {
+      final key = '${d.filePath}\u0000${d.startLine}\u0000${d.startChar}'
+          '\u0000${d.code ?? ''}\u0000${d.message}';
+      if (seen.add(key)) out.add(d);
+    }
+    return out;
   }
 
   int _countSeverity(DiagnosticSeverity severity) {
     var n = 0;
     for (final list in _byFile.values) {
-      for (final d in list) {
+      for (final d in _dedupKeepFirst(list)) {
         if (d.severity == severity) n++;
       }
     }
@@ -158,7 +197,7 @@ class DiagnosticsStore extends ChangeNotifier {
 
   int _countSeverityOf(String path, DiagnosticSeverity severity) {
     var n = 0;
-    for (final d in _byFile[path] ?? const <IdeDiagnostic>[]) {
+    for (final d in _dedupKeepFirst(_byFile[path] ?? const <IdeDiagnostic>[])) {
       if (d.severity == severity) n++;
     }
     return n;

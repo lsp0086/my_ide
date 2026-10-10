@@ -20,6 +20,9 @@ class _WebDavPanelState extends State<WebDavPanel> {
   late final TextEditingController _remotePath;
   bool _passwordVisible = false;
   bool _busy = false;
+  // 轮次1：已存密文损坏标记——v5 密文同步解密失败 getString 返回 null，
+  // 面板此前与"未设置"无法区分且无任何提示。
+  bool _pwDamaged = false;
 
   static const _defaultRemotePath = '/my_ide/settings-backup.json';
 
@@ -30,8 +33,11 @@ class _WebDavPanelState extends State<WebDavPanel> {
     _url = TextEditingController(text: store.getString('webdav.url') ?? '');
     _username =
         TextEditingController(text: store.getString('webdav.username') ?? '');
-    _password =
-        TextEditingController(text: store.getString('webdav.password') ?? '');
+    // 轮次1：区分"未设置"与"密文损坏"——损坏时留空并提示重填，
+    // 保存输入后走正常覆盖路径。
+    final storedPw = store.getString('webdav.password');
+    _pwDamaged = storedPw == null && store.hasEncryptedRaw('webdav.password');
+    _password = TextEditingController(text: storedPw ?? '');
     final path = store.getString('webdav.remotePath')?.trim();
     _remotePath = TextEditingController(
       text: (path == null || path.isEmpty) ? _defaultRemotePath : path,
@@ -144,7 +150,45 @@ class _WebDavPanelState extends State<WebDavPanel> {
       try {
         await _saveConfig();
         final payload = await WebDavBackup.download(cfg);
-        await WebDavBackup.restore(SettingsStore.instance, payload);
+        // R6：restore 拒绝（version 不符等）返回 false，不得再报成功。
+        final restored =
+            await WebDavBackup.restore(SettingsStore.instance, payload);
+        if (!restored) {
+          _snack('远端备份版本不兼容，已拒绝恢复（本地设置未动）');
+          return;
+        }
+        // R4-W1：放宽档位次确认——restore只收紧直写，放宽暂存。
+        // 非空即毒备份试图ask/deny→auto，弹窗点头后才落盘。
+        final relaxed = WebDavBackup.approvalStoreForSettings;
+        if (relaxed.isNotEmpty && mounted) {
+          final names = relaxed.entries.map((e) => '${e.key}→${e.value}').join('\n');
+          final ok = await showDialog<bool>(
+                context: context,
+                builder: (c) => AlertDialog(
+                  title: const Text('远端备份请求放宽审批'),
+                  content: Text('以下审批策略将被放宽（更宽松），确认吗？\n$names'),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.of(c).pop(false),
+                      child: const Text('保持本地'),
+                    ),
+                    TextButton(
+                      onPressed: () => Navigator.of(c).pop(true),
+                      child: const Text('确认放宽'),
+                    ),
+                  ],
+                ),
+              ) ??
+              false;
+          if (ok) {
+            await WebDavBackup.applyRelaxedApprovals(SettingsStore.instance);
+            _snack('已从远端恢复设置（含放宽确认）');
+          } else {
+            relaxed.clear();
+            _snack('已恢复设置（放宽项已保持本地）');
+          }
+          return;
+        }
         _snack('已从远端恢复设置');
       } catch (e) {
         _snack('恢复失败：$e');
@@ -275,18 +319,47 @@ class _WebDavPanelState extends State<WebDavPanel> {
                             decoration: _fieldDeco(
                               colors,
                               label: '密码',
-                              suffix: IconButton(
-                                tooltip:
-                                    _passwordVisible ? '隐藏密码' : '显示密码',
-                                onPressed: () => setState(
-                                    () => _passwordVisible = !_passwordVisible),
-                                icon: Icon(
-                                  _passwordVisible
-                                      ? Icons.visibility_off_outlined
-                                      : Icons.visibility_outlined,
-                                  size: 18,
-                                  color: colors.textMuted,
-                                ),
+                              hint: _pwDamaged ? '已存密码损坏，请重新输入' : null,
+                              suffix: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  IconButton(
+                                    tooltip: '清除已存密码',
+                                    onPressed: _pwDamaged || _password.text.isEmpty
+                                        ? null
+                                        : () async {
+                                            try {
+                                              await SettingsStore.instance
+                                                  .removeSecret(
+                                                      'webdav.password');
+                                            } catch (_) {}
+                                            if (mounted) {
+                                              setState(() {
+                                                _password.clear();
+                                                _pwDamaged = false;
+                                              });
+                                            }
+                                          },
+                                    icon: Icon(
+                                      Icons.delete_outline_rounded,
+                                      size: 18,
+                                      color: colors.textMuted,
+                                    ),
+                                  ),
+                                  IconButton(
+                                    tooltip:
+                                        _passwordVisible ? '隐藏密码' : '显示密码',
+                                    onPressed: () => setState(
+                                        () => _passwordVisible = !_passwordVisible),
+                                    icon: Icon(
+                                      _passwordVisible
+                                          ? Icons.visibility_off_outlined
+                                          : Icons.visibility_outlined,
+                                      size: 18,
+                                      color: colors.textMuted,
+                                    ),
+                                  ),
+                                ],
                               ),
                             ),
                           ),

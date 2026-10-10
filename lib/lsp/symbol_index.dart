@@ -27,21 +27,19 @@ class IndexedSymbol {
   final SymbolKind kind;
   final int priority;
 
-  LspLocation toLocation() => LspLocation(
-        filePath: filePath,
-        line: line,
-        character: character,
-      );
+  LspLocation toLocation() =>
+      LspLocation(filePath: filePath, line: line, character: character);
 }
 
 /// LSP 引用查询注入点：由外部（如 DefinitionService/LSP 客户端）注入，
 /// 无注入时回退本地正则索引。
-typedef LspReferencesQuery = Future<List<LspLocation>> Function({
-  required String filePath,
-  required String name,
-  required int line,
-  required int character,
-});
+typedef LspReferencesQuery =
+    Future<List<LspLocation>> Function({
+      required String filePath,
+      required String name,
+      required int line,
+      required int character,
+    });
 
 /// 工作区符号索引：打开项目时后台扫描，跳转优先查表。
 class SymbolIndex {
@@ -50,12 +48,15 @@ class SymbolIndex {
 
   /// 可注入的 LSP references 查询；测试可替换。
   LspReferencesQuery? queryReferencesLsp;
+
   /// 索引文件数上限；复用 prefs `workspaceMaxFiles`（默认 8000）。
   int maxFilesOverride = 8000;
 
   String? _rootPath;
+
   /// name -> 候选定义（按 priority 降序）
   final Map<String, List<IndexedSymbol>> _byName = {};
+
   /// name -> 引用位置（不含定义行）
   final Map<String, List<LspLocation>> _refsByName = {};
   final Map<String, String> _fileHash = {};
@@ -64,6 +65,7 @@ class SymbolIndex {
   int _symbolCount = 0;
   int _refCount = 0;
   String? _status;
+
   /// 超时文件提示：超 maxFiles 后不被静默丢，状态里看得见。
   int _skippedFiles = 0;
   bool get hasSkipped => _skippedFiles > 0;
@@ -123,10 +125,12 @@ class SymbolIndex {
     _indexing = true;
     _status = '索引中…';
     try {
+      // R4-06：rebuild超时30s——compute无超时，大仓慢扫卡死常驻indexing。
+      // 超时抛错走catch记状态，代际仍丢弃旧扫。
       final result = await compute(_indexIsolate, <String, Object?>{
         'rootPath': root,
         'maxFiles': maxFilesOverride,
-      });
+      }).timeout(const Duration(seconds: 30));
       if (gen != _generation) return;
       _byName
         ..clear()
@@ -136,21 +140,28 @@ class SymbolIndex {
         ..addAll(_deserializeRefs(result['refs'] as Map? ?? const {}));
       _fileHash
         ..clear()
-        ..addAll(
-          (result['hashes'] as Map).map(
-            (k, v) => MapEntry('$k', '$v'),
-          ),
-        );
+        ..addAll((result['hashes'] as Map).map((k, v) => MapEntry('$k', '$v')));
       _symbolCount = (result['count'] as num?)?.toInt() ?? 0;
       _refCount = (result['refCount'] as num?)?.toInt() ?? 0;
       _skippedFiles = (result['skipped'] as num?)?.toInt() ?? 0;
-      _status = '已索引 $_symbolCount 个符号 / $_refCount 处引用'
-          '${_skippedFiles > 0 ? '（超时省略 $_skippedFiles 个超大/超量文件）' : ''}';
+      _status =
+          '已索引 $_symbolCount 个符号 / $_refCount 处引用'
+          '${_skippedFiles > 0 ? '（省略 $_skippedFiles 个超大/超量/超深文件）' : ''}';
     } catch (e) {
       if (gen != _generation) return;
-      _status = '索引失败：$e';
+      // R5-06：超时可观测——TimeoutException记超时状态，下次bind/rebuild可重试。
+      if (e is TimeoutException) {
+        _status = '索引超时（30s），已中断，下次打开重试';
+      } else {
+        _status = '索引失败：$e';
+      }
     } finally {
-      if (gen == _generation) _indexing = false;
+      // 无条件复位 _indexing：bindProject(null) 在 rebuild 进行中也会
+      // ++_generation，按世代条件复位会让在途 rebuild 永久卡在
+      // indexing=true（builtin_definition 的 !indexing 恒假）。
+      // 竞态窗口（复位时恰有更新的 rebuild 已在途）代价仅为一次冗余重建，
+      // 比永久卡死安全。
+      _indexing = false;
     }
   }
 
@@ -158,7 +169,25 @@ class SymbolIndex {
   Future<void> reindexFile(String absolutePath, {String? content}) async {
     final root = _rootPath;
     if (root == null) return;
-    if (!p.isWithin(root, absolutePath) && !p.equals(root, p.dirname(absolutePath))) {
+    // R3-10：realpath 收敛——absolutePath 经区外 symlink 传入时此前词法
+    // 在区内即索引，区外路径污染索引。现先 realpath，区外直接拒。
+    String canon = absolutePath;
+    try {
+      canon = File(absolutePath).resolveSymbolicLinksSync();
+    } catch (_) {
+      try {
+        canon = p.normalize(absolutePath);
+      } catch (_) {}
+    }
+    String rootReal = root;
+    try {
+      rootReal = Directory(root).resolveSymbolicLinksSync();
+    } catch (_) {
+      rootReal = p.normalize(root);
+    }
+    if (canon != rootReal && !p.isWithin(rootReal, canon)) return;
+    if (!p.isWithin(root, absolutePath) &&
+        !p.equals(root, p.dirname(absolutePath))) {
       // 允许根下任意文件
       final rel = p.relative(absolutePath, from: root);
       if (rel.startsWith('..')) return;
@@ -173,26 +202,32 @@ class SymbolIndex {
       if (content == null) {
         final size = await File(absolutePath).length();
         if (size > 1024 * 1024) return;
+      } else if (content.length > 1024 * 1024) {
+        // R8-内存传入同样门禁：编辑器未保存大文本此前直进 encode+正则，
+        // 与落盘同口径按 1MB 拒收，避免击键卡顿。
+        return;
       }
       text = content ?? await File(absolutePath).readAsString();
     } catch (_) {
       return;
     }
     final hash = sha1.convert(utf8.encode(text)).toString();
-    if (_fileHash[absolutePath] == hash) return;
+    // R6-A3 统一canon键：此前判区用canon、存取用absolutePath，
+    // 同文件经symlink双路径即双条目。现hash/符号/引用全用canon。
+    if (_fileHash[canon] == hash) return;
 
     // 先删掉该文件旧符号 / 引用
     _byName.removeWhere((_, list) {
-      list.removeWhere((s) => p.equals(s.filePath, absolutePath));
+      list.removeWhere((s) => p.equals(s.filePath, canon));
       return list.isEmpty;
     });
     _refsByName.removeWhere((_, list) {
-      list.removeWhere((s) => p.equals(s.filePath, absolutePath));
+      list.removeWhere((s) => p.equals(s.filePath, canon));
       return list.isEmpty;
     });
 
     final extracted = extractSymbols(
-      filePath: absolutePath,
+      filePath: canon,
       source: text,
       rules: rules,
     );
@@ -206,10 +241,10 @@ class SymbolIndex {
     // 用当前全量定义名重建本文件引用
     final definedNames = _byName.keys.toSet();
     final defKeys = <String>{
-      for (final sym in extracted) '$absolutePath#${sym.name}#${sym.line}',
+      for (final sym in extracted) '$canon#${sym.name}#${sym.line}',
     };
     final refs = extractReferences(
-      filePath: absolutePath,
+      filePath: canon,
       source: text,
       definedNames: definedNames,
       definitionKeys: defKeys,
@@ -218,7 +253,7 @@ class SymbolIndex {
       (_refsByName[entry.key] ??= <LspLocation>[]).addAll(entry.value);
     }
 
-    _fileHash[absolutePath] = hash;
+    _fileHash[canon] = hash;
     _symbolCount = _byName.values.fold<int>(0, (n, e) => n + e.length);
     _refCount = _refsByName.values.fold<int>(0, (n, e) => n + e.length);
     _status = '已索引 $_symbolCount 个符号 / $_refCount 处引用';
@@ -275,9 +310,7 @@ class SymbolIndex {
   }) {
     final raw = _refsByName[name] ?? const <LspLocation>[];
     final defs = _byName[name] ?? const <IndexedSymbol>[];
-    final defKeys = {
-      for (final d in defs) '${d.filePath}#${d.line}',
-    };
+    final defKeys = {for (final d in defs) '${d.filePath}#${d.line}'};
     final out = <LspLocation>[];
     for (final r in raw) {
       final key = '${r.filePath}#${r.line}';
@@ -366,14 +399,12 @@ class SymbolIndex {
     final byName = <String, List<Map<String, Object?>>>{};
     final refs = <String, List<Map<String, Object?>>>{};
     final hashes = <String, String>{};
-    final fileTexts = <String, String>{};
     var count = 0;
     var refCount = 0;
     var skipped = 0;
     const maxFileBytes = 1024 * 1024;
     final maxFiles = (job['maxFiles'] as num?)?.toInt() ?? 8000;
 
-    var filesDone = 0;
     final root = Directory(rootPath);
     if (!root.existsSync()) {
       return {
@@ -385,8 +416,20 @@ class SymbolIndex {
       };
     }
 
-    void walk(Directory dir) {
-      if (filesDone >= maxFiles) return;
+    // 两遍扫描：第一遍只收集候选路径（扩展名/大小/二进制采样等基本过滤），
+    // 不读全文；第二遍逐文件读取、提取符号+hash 后立即丢弃文本。
+    // 引用提取依赖全量 definedNames，故对已处理文件再逐个重读提取，
+    // 任意时刻内存中至多一个文件全文，峰值不再随文件数线性膨胀。
+    final candidates = <String>[];
+
+    void walk(Directory dir, [int depth = 0]) {
+      // R6-A1 深度上限32：此前无depth参数，深树/链环可致栈溢出（与R5-A5同类）。
+      // R16R5：深度/数量截断同样计入skipped——此前只计大小/二进制，
+      // hasSkipped假阴性致UI显示“已索引N”实为partial。
+      if (candidates.length >= maxFiles || depth > 32) {
+        if (depth > 32) skipped++;
+        return;
+      }
       late final List<FileSystemEntity> entities;
       try {
         entities = dir.listSync(followLinks: false);
@@ -394,14 +437,14 @@ class SymbolIndex {
         return;
       }
       for (final entity in entities) {
-        if (filesDone >= maxFiles) return;
+        if (candidates.length >= maxFiles) return;
         final name = p.basename(entity.path);
         if (entity is Directory) {
           if (_skipDirs.contains(name) ||
               (name.startsWith('.') && name != '.github')) {
             continue;
           }
-          walk(entity);
+          walk(entity, depth + 1);
           continue;
         }
         if (entity is! File) continue;
@@ -415,37 +458,60 @@ class SymbolIndex {
             continue;
           }
           final raf = entity.openSync();
-          final sample = raf.readSync(min(512, length));
-          raf.closeSync();
-          if (sample.contains(0)) {
-            skipped++;
-            continue;
+          try {
+            final sample = raf.readSync(min(512, length));
+            if (sample.contains(0)) {
+              skipped++;
+              continue;
+            }
+          } finally {
+            // R6-A2 fd泄漏收敛：readSync抛错此前跳过closeSync。
+            try {
+              raf.closeSync();
+            } catch (_) {}
           }
-          final text = entity.readAsStringSync();
-          hashes[entity.path] = sha1.convert(utf8.encode(text)).toString();
-          fileTexts[entity.path] = text;
-          final symbols = extractSymbols(
-            filePath: entity.path,
-            source: text,
-            rules: rules,
-          );
-          for (final s in symbols) {
-            (byName[s.name] ??= <Map<String, Object?>>[]).add({
-              'name': s.name,
-              'filePath': s.filePath,
-              'line': s.line,
-              'character': s.character,
-              'kind': s.kind.index,
-              'priority': s.priority,
-            });
-            count++;
-          }
-          filesDone++;
+          candidates.add(entity.path);
         } catch (_) {}
       }
     }
 
     walk(root);
+
+    final processed = <String>[];
+    for (final path in candidates) {
+      if (processed.length >= maxFiles) break;
+      try {
+        final rules = rulesForExtension(p.extension(path).toLowerCase());
+        if (rules == null) continue;
+        // R7-A2 读前复检：候选与读之间文件可膨胀（TOCTOU），此前直读全文进内存。
+        // 现读前再length一次，超1MB跳过（与第一遍maxFileBytes同口径）。
+        try {
+          if (File(path).lengthSync() > maxFileBytes) {
+            skipped++;
+            continue;
+          }
+        } catch (_) {}
+        final text = File(path).readAsStringSync();
+        hashes[path] = sha1.convert(utf8.encode(text)).toString();
+        final symbols = extractSymbols(
+          filePath: path,
+          source: text,
+          rules: rules,
+        );
+        for (final s in symbols) {
+          (byName[s.name] ??= <Map<String, Object?>>[]).add({
+            'name': s.name,
+            'filePath': s.filePath,
+            'line': s.line,
+            'character': s.character,
+            'kind': s.kind.index,
+            'priority': s.priority,
+          });
+          count++;
+        }
+        processed.add(path);
+      } catch (_) {}
+    }
 
     final definedNames = byName.keys.toSet();
     final definitionKeys = <String>{};
@@ -456,31 +522,40 @@ class SymbolIndex {
         );
       }
     }
-    // 内存不常住全文：边遍历边遍，用完即清，避免常驻全量文本。
-    final refKeys = fileTexts.keys.toList();
-    for (final key in refKeys) {
-      final found = extractReferences(
-        filePath: key,
-        source: fileTexts.remove(key)!,
-        definedNames: definedNames,
-        definitionKeys: definitionKeys,
-      );
-      found.forEach((name, locs) {
-        final bucket = refs[name] ??= <Map<String, Object?>>[];
-        for (final loc in locs) {
-          bucket.add({
-            'filePath': loc.filePath,
-            'line': loc.line,
-            'character': loc.character,
-          });
-          refCount++;
-        }
-      });
+    // 引用提取同样即读即弃，不保留全文。
+    for (final path in processed) {
+      try {
+        // R7-A2同口径：第三遍重读同样复检，防processed后膨胀。
+        try {
+          if (File(path).lengthSync() > maxFileBytes) continue;
+        } catch (_) {}
+        final text = File(path).readAsStringSync();
+        final found = extractReferences(
+          filePath: path,
+          source: text,
+          definedNames: definedNames,
+          definitionKeys: definitionKeys,
+        );
+        found.forEach((name, locs) {
+          final bucket = refs[name] ??= <Map<String, Object?>>[];
+          for (final loc in locs) {
+            bucket.add({
+              'filePath': loc.filePath,
+              'line': loc.line,
+              'character': loc.character,
+            });
+            refCount++;
+          }
+        });
+      } catch (_) {}
     }
 
     for (final list in byName.values) {
-      list.sort((a, b) =>
-          ((b['priority'] as int?) ?? 0).compareTo((a['priority'] as int?) ?? 0));
+      list.sort(
+        (a, b) => ((b['priority'] as int?) ?? 0).compareTo(
+          (a['priority'] as int?) ?? 0,
+        ),
+      );
     }
     return {
       'symbols': byName,
@@ -504,14 +579,16 @@ class SymbolIndex {
         final kind = (kindIndex >= 0 && kindIndex < SymbolKind.values.length)
             ? SymbolKind.values[kindIndex]
             : SymbolKind.other;
-        list.add(IndexedSymbol(
-          name: item['name'] as String? ?? name,
-          filePath: item['filePath'] as String? ?? '',
-          line: (item['line'] as num?)?.toInt() ?? 0,
-          character: (item['character'] as num?)?.toInt() ?? 0,
-          kind: kind,
-          priority: (item['priority'] as num?)?.toInt() ?? 0,
-        ));
+        list.add(
+          IndexedSymbol(
+            name: item['name'] as String? ?? name,
+            filePath: item['filePath'] as String? ?? '',
+            line: (item['line'] as num?)?.toInt() ?? 0,
+            character: (item['character'] as num?)?.toInt() ?? 0,
+            kind: kind,
+            priority: (item['priority'] as num?)?.toInt() ?? 0,
+          ),
+        );
       }
       if (list.isNotEmpty) out[name] = list;
     });
@@ -526,11 +603,13 @@ class SymbolIndex {
       final list = <LspLocation>[];
       for (final item in value) {
         if (item is! Map) continue;
-        list.add(LspLocation(
-          filePath: item['filePath'] as String? ?? '',
-          line: (item['line'] as num?)?.toInt() ?? 0,
-          character: (item['character'] as num?)?.toInt() ?? 0,
-        ));
+        list.add(
+          LspLocation(
+            filePath: item['filePath'] as String? ?? '',
+            line: (item['line'] as num?)?.toInt() ?? 0,
+            character: (item['character'] as num?)?.toInt() ?? 0,
+          ),
+        );
       }
       if (list.isNotEmpty) out[name] = list;
     });
@@ -574,14 +653,16 @@ List<IndexedSymbol> extractSymbols({
       if (seen.contains(key)) continue;
       seen.add(key);
       final col = line.indexOf(name, m.start);
-      out.add(IndexedSymbol(
-        name: name,
-        filePath: filePath,
-        line: i,
-        character: col >= 0 ? col : m.start,
-        kind: rule.kind,
-        priority: rule.priority,
-      ));
+      out.add(
+        IndexedSymbol(
+          name: name,
+          filePath: filePath,
+          line: i,
+          character: col >= 0 ? col : m.start,
+          kind: rule.kind,
+          priority: rule.priority,
+        ),
+      );
       break; // 一行只取最高优先级匹配（rules 已大致按优先级排）
     }
   }
@@ -612,11 +693,9 @@ Map<String, List<LspLocation>> extractReferences({
       if (!definedNames.contains(name)) continue;
       if (_keywords.contains(name)) continue;
       if (definitionKeys.contains('$filePath#$name#$i')) continue;
-      (out[name] ??= <LspLocation>[]).add(LspLocation(
-        filePath: filePath,
-        line: i,
-        character: m.start,
-      ));
+      (out[name] ??= <LspLocation>[]).add(
+        LspLocation(filePath: filePath, line: i, character: m.start),
+      );
     }
   }
   return out;

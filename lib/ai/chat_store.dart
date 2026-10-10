@@ -99,13 +99,24 @@ class _ChatCodec {
 
   static Future<void> _enqueue(String path, Future<void> Function() task) {
     final previous = _writes[path] ?? Future<void>.value();
-    final current = previous.catchError((_) {}).then((_) => task());
+    // R3-A9：队头阻塞熔断——同 path 串行无超时，队头写挂盘（gzip 大文件/
+    // 磁盘 stall）致后续 save/journal/delete 全堵在 50ms 轮询上。
+    // 现单任务 30s 超时即失败摘队，后续写入正常推进；调用方 _save 已有
+    // 重试+lastSaveError 上报通道。
+    final current = previous.catchError((_) {}).then((_) => task()).timeout(
+      const Duration(seconds: 30),
+      onTimeout: () {
+        throw StateError('写盘任务超时（30s）已摘队：$path');
+      },
+    );
     late final Future<void> queued;
     queued = current.whenComplete(() {
       if (identical(_writes[path], queued)) _writes.remove(path);
     });
+    // R3-A6 返回 queued：此前返回 current，queued 的 whenComplete 错误
+    // 成 unhandled 异步错误。高频写下异常窗口可触发 zone 未捕获。
     _writes[path] = queued;
-    return current;
+    return queued;
   }
 
   /// 排队删除：与排队写同 key 串行，避免 delete 与在途 write 竞态复活。
@@ -153,11 +164,11 @@ class CommandRecord {
   final bool background;
 
   Map<String, dynamic> toJson() => {
-    'command': command,
+    'command': AppLogger.redactSensitiveText(command),
     if (output.isNotEmpty)
       'output': output.length > 12000
-          ? '${output.substring(0, 12000)}…（命令输出已截断）'
-          : output,
+          ? '${AppLogger.redactSensitiveText(output.substring(0, 12000))}…（命令输出已截断）'
+          : AppLogger.redactSensitiveText(output),
     if (exitCode != null) 'exitCode': exitCode,
     'ok': ok,
     if (background) 'background': true,
@@ -188,9 +199,9 @@ class SubAgentRecord {
   final bool done;
 
   Map<String, dynamic> toJson() => {
-    'task': task,
-    if (thought.isNotEmpty) 'thought': thought,
-    if (output.isNotEmpty) 'output': output,
+    'task': AppLogger.redactSensitiveText(task),
+    if (thought.isNotEmpty) 'thought': AppLogger.redactSensitiveText(thought),
+    if (output.isNotEmpty) 'output': AppLogger.redactSensitiveText(output),
     'done': done,
   };
 
@@ -286,11 +297,11 @@ class ChatMessage {
   Map<String, dynamic> toJson() => {
     'id': id,
     'role': role,
-    'text': text,
+    'text': AppLogger.redactSensitiveText(text),
     if (thinking != null)
       'thinking': thinking!.length > 120000
-          ? '${thinking!.substring(0, 120000)}…（思考内容已截断）'
-          : thinking,
+          ? '${AppLogger.redactSensitiveText(thinking!.substring(0, 120000))}…（思考内容已截断）'
+          : AppLogger.redactSensitiveText(thinking!),
     'files': files,
     'createdAt': (createdAt ?? DateTime.now()).toIso8601String(),
     if (!thinkingCollapsed) 'thinkingCollapsed': false,
@@ -424,12 +435,13 @@ class ChatSession {
 
   Map<String, dynamic> toJson() => {
     'id': id,
-    'title': title,
+    'title': AppLogger.redactSensitiveText(title),
     'titleAuto': titleAuto,
     'pinned': pinned,
     'archived': archived,
     'messages': messages.map((e) => e.toJson()).toList(),
-    if (compactionSummary != null) 'compactionSummary': compactionSummary,
+    if (compactionSummary != null)
+      'compactionSummary': AppLogger.redactSensitiveText(compactionSummary!),
     if (compactionUntilMessageId != null)
       'compactionUntilMessageId': compactionUntilMessageId,
     if (compactedAt != null) 'compactedAt': compactedAt!.toIso8601String(),
@@ -453,7 +465,7 @@ class ChatSession {
   );
 }
 
-/// 对话落盘：项目级 .my_ide/chats/<id>.json，全局 activeChatId。
+/// 对话落盘：项目级 `.my_ide/chats/[id].json`，全局 activeChatId。
 class ChatScope extends InheritedNotifier<ChatStore> {
   const ChatScope({super.key, required ChatStore store, required super.child})
     : super(notifier: store);
@@ -473,6 +485,41 @@ class ChatStore extends ChangeNotifier {
   String? _lastSaveError;
   bool _dirty = false;
   int _saveRetries = 0;
+  // R9：会话删除通知钩子——AgentRunner 挂载后在此登记 dropSessionState，
+  // deleteChat/clearChats/clearAll/loadForProject 切项目时同步清运行时残留
+  // （Runner 侧排队桶/流式态/命令轨迹、Gate 审批队列/信任桶、Registry 分账）。
+  // 钩子一律 try/catch 包裹，清理失败不阻断删除主流程。
+  final List<Future<void> Function(String sessionId)> _sessionDropHooks = [];
+  void addSessionDropHook(Future<void> Function(String sessionId) hook) {
+    _sessionDropHooks.add(hook);
+  }
+
+  void _fireSessionDropHooks(String sessionId) {
+    if (sessionId.isEmpty) return;
+    for (final hook in List.of(_sessionDropHooks)) {
+      try {
+        final f = hook(sessionId);
+        // fire-and-forget：删除主流程不等待清理完成。
+        // ignore: unawaited_futures
+        f.catchError((_) {});
+      } catch (_) {}
+    }
+  }
+  // dispose 后守卫：解锁触发的自动补载是 fire-and-forget 异步，
+  // 可能与 store 释放竞速，notifyListeners 不得在 dispose 后调用。
+  bool _disposed = false;
+
+  @override
+  void dispose() {
+    _disposed = true;
+    super.dispose();
+  }
+
+  @override
+  void notifyListeners() {
+    if (_disposed) return;
+    super.notifyListeners();
+  }
 
   /// 运行锁：AgentRunner.run() 起止之间锁定会话，防回退/删除与
   /// 运行中遍历（预算计算/responseId 反查）竞争导致长度突变或索引越界。
@@ -480,12 +527,29 @@ class ChatStore extends ChangeNotifier {
   /// runner 自身写压缩需放行：加 [internal] 旁路。
   final Set<String> _lockedSessions = {};
   void lockSession(String sessionId) => _lockedSessions.add(sessionId);
-  void unlockSession(String sessionId) => _lockedSessions.remove(sessionId);
+
+  /// 运行锁期间收到过的切项目/关项目请求：最后一个锁释放后需补载的目标根。
+  /// 此前锁定期间 loadForProject 只更新 _projectRoot 不动会话列表，
+  /// 内存（旧项目会话）与 _projectRoot（新项目）错位，_save 会把旧项目
+  /// 会话写进新项目 .my_ide/chats，跨项目污染。
+  String? _pendingReloadRoot;
+  void unlockSession(String sessionId) {
+    _lockedSessions.remove(sessionId);
+    // 最后一个运行锁释放且有挂起的切项目请求：自动补载目标项目。
+    if (_lockedSessions.isEmpty && _pendingReloadRoot != null) {
+      final root = _pendingReloadRoot;
+      _pendingReloadRoot = null;
+      if (root != _projectRoot) {
+        loadForProject(root);
+      }
+    }
+  }
+
   bool isSessionLocked(String sessionId) => _lockedSessions.contains(sessionId);
 
   String? get projectRoot => _projectRoot;
 
-  /// 对话图片资产目录：<root>/.my_ide/chat_assets/<sessionId>/img-<ts>-<rand>.<ext>。
+  /// 对话图片资产目录：`[root]/.my_ide/chat_assets/[sessionId]/img-[ts]-[rand].[ext]`。
   /// dataUrl 仅内存传输，落盘一律转独立文件引用 `asset:<相对路径>`，
   /// 避免 5MB base64 反复进出 chats/*.json 压爆体积。
   Future<String> saveChatImageAsset({
@@ -495,13 +559,37 @@ class ChatStore extends ChangeNotifier {
   }) async {
     final root = _projectRoot;
     if (root == null) throw StateError('未打开项目，图片无法落盘');
-    final ext = mime.contains('jpeg') || mime.contains('jpg')
+    if (!RegExp(r'^[A-Za-z0-9_-]{1,64}$').hasMatch(sessionId)) {
+      throw StateError('会话 id 非法，图片已拒绝');
+    }
+    // R8-A1：mime 白名单+大小上限——_parseChatImageDataUrl 只认 image/ 前缀，
+    // image/svg+xml 等可执行载荷此前直落盘、同目录 .my_ide 下可被 file:// 读走
+    // 成 XSS 跳板；超大字节此前只在解析侧限 8MB，save 直调可绕过。现白名单
+    // 5 种位图+mime 与魔数双认（后缀可伪造），超 8MB 直接拒。
+    final normMime = mime.trim().toLowerCase().split(';').first;
+    const allowed = {
+      'image/png',
+      'image/jpeg',
+      'image/gif',
+      'image/webp',
+      'image/bmp',
+    };
+    if (!allowed.contains(normMime)) {
+      throw StateError('不支持的图片类型，已拒绝：$mime');
+    }
+    if (bytes.isEmpty || bytes.length > 8 * 1024 * 1024) {
+      throw StateError('图片过大或为空，已拒绝（上限 8MB）');
+    }
+    if (!_imageMagicMatches(normMime, bytes)) {
+      throw StateError('图片魔数与类型不符，已拒绝：$mime');
+    }
+    final ext = normMime == 'image/jpeg'
         ? 'jpg'
-        : mime.contains('gif')
+        : normMime == 'image/gif'
         ? 'gif'
-        : mime.contains('webp')
+        : normMime == 'image/webp'
         ? 'webp'
-        : mime.contains('bmp')
+        : normMime == 'image/bmp'
         ? 'bmp'
         : 'png';
     final stamp = DateTime.now().microsecondsSinceEpoch.toRadixString(36);
@@ -543,6 +631,8 @@ class ChatStore extends ChangeNotifier {
     final rel = trimmed.substring('asset:'.length).trim();
     // B11：规范化 + isWithin 门禁 + 拒 symlink，不只拦 `..`。
     if (rel.isEmpty) return null;
+    final normRel = p.normalize(rel).replaceAll('\\', '/');
+    if (!normRel.startsWith('chat_assets/')) return null;
     try {
       final base = p.normalize(p.join(root, '.my_ide'));
       final abs = p.normalize(p.join(base, rel));
@@ -594,6 +684,46 @@ class ChatStore extends ChangeNotifier {
     return 'image/png';
   }
 
+  /// R8-A1 魔数双认（测试可见）：后缀可伪造，mime 必须与文件头一致。
+  static bool imageMagicMatchesForTest(String mime, List<int> bytes) =>
+      _imageMagicMatches(mime, bytes);
+
+  static bool _imageMagicMatches(String mime, List<int> bytes) {
+    bool head(List<int> sig) {
+      if (bytes.length < sig.length) return false;
+      for (var i = 0; i < sig.length; i++) {
+        if (bytes[i] != sig[i]) return false;
+      }
+      return true;
+    }
+
+    switch (mime) {
+      case 'image/png':
+        return head([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+      case 'image/jpeg':
+        return bytes.length >= 3 &&
+            bytes[0] == 0xFF &&
+            bytes[1] == 0xD8 &&
+            bytes[2] == 0xFF;
+      case 'image/gif':
+        return head([0x47, 0x49, 0x46, 0x38]);
+      case 'image/webp':
+        return bytes.length >= 12 &&
+            bytes[0] == 0x52 &&
+            bytes[1] == 0x49 &&
+            bytes[2] == 0x46 &&
+            bytes[3] == 0x46 &&
+            bytes[8] == 0x57 &&
+            bytes[9] == 0x45 &&
+            bytes[10] == 0x42 &&
+            bytes[11] == 0x50;
+      case 'image/bmp':
+        return head([0x42, 0x4D]);
+      default:
+        return false;
+    }
+  }
+
   /// 删除会话时同步清理其图片资产目录，避免孤儿图片堆积。
   Future<void> _deleteChatAssets(String sessionId) async {
     final root = _projectRoot;
@@ -641,16 +771,25 @@ class ChatStore extends ChangeNotifier {
     // T4 切项目不再清运行中会话：UI 层切项目已有 guardAiRunning，
     // 此处是纵深——在途 run 按 runSessionId 持有 session 引用，
     // _sessions.clear 会让其变孤儿，后续 addMessageTo 找不到直接 return
-    // 丢整轮结果。运行中有锁定时只切 _projectRoot/日志绑定，会话列表保持，
-    // 待 run 结束解锁后由调用方重进 load 刷新。
+    // 丢整轮结果。运行中有锁定时会话列表与 _projectRoot 都保持（内存与
+    // 落盘根一致，防 _save 跨项目污染），只切日志绑定；目标根记入
+    // _pendingReloadRoot，待最后一个锁释放后由 unlockSession 自动补载。
     if (_lockedSessions.isNotEmpty) {
-      _projectRoot = rootPath;
+      // 内存仍是旧项目的会话列表：此轮不更新 _projectRoot，保持内存与
+      // 落盘根一致（否则 _save 会把旧项目会话写进新项目 .my_ide/chats）。
+      // 记下目标根，最后一个运行锁释放后由 unlockSession 自动补载。
+      _pendingReloadRoot = rootPath;
       AppLogger.instance.bindProject(rootPath);
       notifyListeners();
       return;
     }
+    _pendingReloadRoot = null;
     _projectRoot = rootPath;
     AppLogger.instance.bindProject(rootPath);
+    // R9：切项目同步清旧会话运行时残留（旧项目 id 永不复用，不清即常驻泄漏）。
+    for (final s in _sessions) {
+      _fireSessionDropHooks(s.id);
+    }
     _sessions.clear();
     _activeId = null;
     notifyListeners();
@@ -664,6 +803,19 @@ class ChatStore extends ChangeNotifier {
     }
     final loaded = <ChatSession>[];
     final files = await dir.list().toList();
+    // 崩溃残留清扫：tmp 写盘与 rename 之间被杀会在目录里留下 *.tmp
+    // （会话与 journal 的临时文件），此前永不清扫。加载时顺带删除
+    // 超期（>1天）残留；新近 tmp 可能是在途写入，保留不动。
+    final now = DateTime.now();
+    for (final f in files) {
+      if (f is! File || !f.path.endsWith('.tmp')) continue;
+      try {
+        final modified = (await f.stat()).modified;
+        if (now.difference(modified).inMinutes > 24 * 60) {
+          await f.delete();
+        }
+      } catch (_) {}
+    }
     for (final f in files) {
       if (f is! File || !f.path.endsWith('.json')) continue;
       try {
@@ -671,19 +823,37 @@ class ChatStore extends ChangeNotifier {
         if (j != null) {
           loaded.add(ChatSession.fromJson(j));
         }
-      } catch (_) {}
+      } catch (e) {
+        // 损坏会话隔离：解析失败即改名为 *.json.corrupt（同目录），
+        // 不再每次启动重复解析、静默跳过导致该会话永久不可见。
+        // 经 lastSaveError 通道暴露一条提示（UI 侧已有错误横幅展示）。
+        try {
+          await f.rename('${f.path}.corrupt');
+        } catch (_) {}
+        _lastSaveError = '对话文件损坏已隔离：${p.basename(f.path)}';
+        AppLogger.instance.error('chat', _lastSaveError!, e);
+        notifyListeners();
+      }
     }
     // 打开过程中若又切项目 / 新建对话，丢弃过期结果，避免冲掉当前 UI。
     if (gen != _loadGeneration) return;
     // 恢复崩溃前的进行中断点日志：assistant 消息只在整轮结束才落盘，
     // 崩溃时把断点日志中的部分内容补回会话，避免"文件已改、对话无记录"。
+    // journal 与会话同 id 即视为“正常结束未清干净”：正常落盘后必调
+    // clearTurnJournal，残留 journal 说明 save 成功→clear 之间崩溃，
+    // 此时会话尾部已是完整 assistant 消息，不再重复补一条中断恢复。
     for (final f in files) {
       if (f is! File || !f.path.endsWith('.journal')) continue;
       final sessionId = p.basenameWithoutExtension(f.path);
       try {
         final j = await _ChatCodec.readJsonFile(f);
         final text = (j?['text'] as String?) ?? '';
-        if (text.trim().isEmpty) continue;
+        if (text.trim().isEmpty) {
+          try {
+            await f.delete();
+          } catch (_) {}
+          continue;
+        }
         ChatSession? target;
         for (final s in loaded) {
           if (s.id == sessionId) {
@@ -692,6 +862,45 @@ class ChatStore extends ChangeNotifier {
           }
         }
         if (target == null) continue;
+        // 幂等：journal 文本已是某条 assistant 正文子串时视为已落盘，
+        // 只删 journal 不再补消息（此前 save→clear 间崩溃会重复一条）。
+        // R3-J1：全文哈希比对——此前只查尾3条+前200字，
+        // 长回复截断/尾部滚动即误恢复重复。现全量扫+全文contains。
+        // R5：恢复消息带“⚠️ …”前缀：去前缀后比对，否则二次崩溃时新
+        // journal 更长既不被包含、反向 500 字也对不上前缀，全量扫描仍
+        // 重复补一条。
+        const recoveredPrefix = '⚠️ 上次回答被异常中断，以下为已恢复的部分内容：\n\n';
+        bool mentionsJournal(String body) {
+          final plain = body.startsWith(recoveredPrefix)
+              ? body.substring(recoveredPrefix.length)
+              : body;
+          if (plain.contains(text)) return true;
+          if (text.length > 500 &&
+              text.contains(
+                plain.length > 500 ? plain.substring(0, 500) : plain,
+              )) {
+            return true;
+          }
+          // 同一轮续写：新 journal 是已恢复正文的超集（同一 sessionId 下
+          // journal 单文件覆盖写），视为同一中断不重复补。
+          if (plain.isNotEmpty && text.contains(plain)) return true;
+          return false;
+        }
+
+        var alreadySaved = false;
+        for (var i = target.messages.length - 1; i >= 0; i--) {
+          final m = target.messages[i];
+          if (m.role == 'assistant' && mentionsJournal(m.text)) {
+            alreadySaved = true;
+            break;
+          }
+        }
+        if (alreadySaved) {
+          try {
+            await f.delete();
+          } catch (_) {}
+          continue;
+        }
         final rawFiles = j?['files'];
         final rawCommands = j?['commands'];
         target.messages.add(
@@ -891,8 +1100,10 @@ class ChatStore extends ChangeNotifier {
         );
         await tmp.writeAsString(
           jsonEncode({
-            'text': text,
-            'thinking': thinking,
+            'text': AppLogger.redactSensitiveText(text),
+            'thinking': thinking == null
+                ? null
+                : AppLogger.redactSensitiveText(thinking),
             'files': files,
             'commands': commands.map((e) => e.toJson()).toList(),
             'updatedAt': DateTime.now().toIso8601String(),
@@ -1009,7 +1220,9 @@ class ChatStore extends ChangeNotifier {
     if (dropCount <= 0) return;
     final dropped = s.messages.sublist(0, dropCount);
     final buf = StringBuffer('【手动压缩要点】\n');
-    for (final m in dropped.take(20)) {
+    // R1-D1：全量摘要——此前只取前20但until标全量，尾部文件/版本静默丢失。
+    // 现全量遍历（单条仍截断），until与实际摘要边界一致。
+    for (final m in dropped) {
       final first = m.text
           .split('\n')
           .firstWhere((l) => l.trim().isNotEmpty, orElse: () => '');
@@ -1129,7 +1342,9 @@ class ChatStore extends ChangeNotifier {
     }
 
     final userMsg = session.messages[userIndex];
-    final cutFrom = mode == ChatRevertMode.toTurn ? userIndex : userIndex;
+    // 两种模式起点相同（都从本轮 user 消息起删）；差别只在终点：
+    // toTurn 删到会话末尾，onlyTurn 只删本轮。此前是两分支相同的死条件。
+    final cutFrom = userIndex;
     final cutTo = mode == ChatRevertMode.toTurn
         ? session.messages.length
         : turnEndExclusive;
@@ -1233,7 +1448,8 @@ class ChatStore extends ChangeNotifier {
       }
     }
     if (session == null) return;
-    session.compactionSummary = summary;
+    final safeSummary = AppLogger.redactSensitiveText(summary);
+    session.compactionSummary = safeSummary;
     if (untilMessageId != null) {
       session.compactionUntilMessageId = untilMessageId;
     }
@@ -1251,9 +1467,9 @@ class ChatStore extends ChangeNotifier {
           File(p.join(dir.path, '$sessionId.json')),
           jsonEncode({
             'chatId': sessionId,
-            'summary': summary,
+            'summary': safeSummary,
             'droppedCount': droppedCount,
-            if (untilMessageId != null) 'untilMessageId': untilMessageId,
+            'untilMessageId': ?untilMessageId,
             'updatedAt': DateTime.now().toIso8601String(),
           }),
         );
@@ -1268,6 +1484,8 @@ class ChatStore extends ChangeNotifier {
     if (_activeId == id) {
       _activeId = _sessions.isEmpty ? null : _sessions.first.id;
     }
+    // R9：删会话同步清运行时残留（Runner/Gate/Registry 三侧按会话键残留）。
+    _fireSessionDropHooks(id);
     final root = _projectRoot;
     if (root != null) {
       // 进队列删：此前直接 exists+delete，与排队中的写竞态可复活空文件。
@@ -1333,10 +1551,26 @@ class ChatStore extends ChangeNotifier {
   /// 运行锁定时拒绝：任一会话运行中都不允许批量清空。
   Future<void> clearChats() async {
     if (_lockedSessions.isNotEmpty) return;
+    // R9：批量清空同步清运行时残留。
+    for (final s in _sessions) {
+      _fireSessionDropHooks(s.id);
+    }
+    final doomedChats = List.of(_sessions);
     _sessions.clear();
     _activeId = null;
     final root = _projectRoot;
     if (root != null) {
+      // Round3：目录删同样进排队——此前直接 delete(recursive:true)，
+      // 与在途 _save 排队写竞态可复活空文件。先逐个排队删已知会话文件，
+      // 再删目录收尾残留（含 journal/tmp）。
+      for (final s in doomedChats) {
+        await _ChatCodec.deleteJsonFile(
+          File(p.join(root, '.my_ide', 'chats', '${s.id}.json')),
+        );
+        await _ChatCodec.deleteJsonFile(
+          File(p.join(root, '.my_ide', 'chats', '${s.id}.journal')),
+        );
+      }
       final dir = Directory(p.join(root, '.my_ide', 'chats'));
       if (await dir.exists()) await dir.delete(recursive: true);
       // 全部对话清空时图片资产同步清空，否则 chat_assets 永久残留。
@@ -1350,10 +1584,23 @@ class ChatStore extends ChangeNotifier {
   /// 运行锁定时拒绝，同 clearChats。
   Future<void> clearAll({bool includeMemory = true}) async {
     if (_lockedSessions.isNotEmpty) return;
+    // R9：批量清空同步清运行时残留。
+    for (final s in _sessions) {
+      _fireSessionDropHooks(s.id);
+    }
+    final doomed = List.of(_sessions);
     _sessions.clear();
     _activeId = null;
     final root = _projectRoot;
     if (root != null) {
+      for (final s in doomed) {
+        await _ChatCodec.deleteJsonFile(
+          File(p.join(root, '.my_ide', 'chats', '${s.id}.json')),
+        );
+        await _ChatCodec.deleteJsonFile(
+          File(p.join(root, '.my_ide', 'chats', '${s.id}.journal')),
+        );
+      }
       final dir = Directory(p.join(root, '.my_ide', 'chats'));
       if (await dir.exists()) await dir.delete(recursive: true);
       final assets = Directory(p.join(root, '.my_ide', 'chat_assets'));
@@ -1441,7 +1688,16 @@ class ChatStore extends ChangeNotifier {
     }
     // 落盘前收敛图片：残留 dataUrl 在这里统一转资产文件，toJson 只写引用。
     // 在内存态直接改写（调用方持有同一对象可见），失败则保留原值不阻断落盘。
+    // R7-A1：只收敛脏条目——此前每轮全量逐条 await（含已收敛条目的
+    // 空跑调度），大会话每轮阻塞。现先 O(n) 收集脏下标，全干净零 IO；
+    // 有脏只收敛脏条目，已收敛条目不再进 await。
+    final dirtyIdx = <int>[];
     for (var i = 0; i < s.messages.length; i++) {
+      if (s.messages[i].images.any((e) => e.startsWith('data:'))) {
+        dirtyIdx.add(i);
+      }
+    }
+    for (final i in dirtyIdx) {
       try {
         await _convergeMessageImages(s, i);
       } catch (_) {}
@@ -1492,10 +1748,13 @@ class ChatStore extends ChangeNotifier {
     }
     if (s == null) return '';
     final buf = StringBuffer();
-    buf.writeln('# 轨迹回放：${s.title}');
+    buf.writeln('# 轨迹回放：${AppLogger.redactSensitiveText(s.title)}');
     buf.writeln();
     buf.writeln('session: ${s.id}');
-    for (var i = 0; i < s.messages.length; i++) {
+    // R9-轨迹有界：大会话 StringBuffer 全量拼+showDialog 一次渲染，
+    // 此前无界。现最多导出最近 200 条消息，与加载上限 50 会话同量级有界口径。
+    final start = s.messages.length > 200 ? s.messages.length - 200 : 0;
+    for (var i = start; i < s.messages.length; i++) {
       final m = s.messages[i];
       buf.writeln();
       buf.writeln('## [$i] ${m.role} ${m.id}');
@@ -1504,28 +1763,51 @@ class ChatStore extends ChangeNotifier {
           '版本: before=${m.beforeVersionId ?? '-'} after=${m.afterVersionId ?? '-'}',
         );
       }
-      if (m.text.isNotEmpty) buf.writeln(m.text);
+      // R5-GAP04：子 Agent 轨迹同样导出——此前只导 files/commands，
+      // subAgents 输出不在轨迹里，离线复核丢调研链。现按步导出任务/
+      // 输出摘要，与 OpenHands 事件轨迹同口径可复演（来源
+      // https://docs.openhands.dev/sdk/arch/events.md ，采纳：事件可
+      // 追溯导出；不采纳：确定性离线重放到同 patch，交互模型不适用）。
+      if (m.subAgents.isNotEmpty) {
+        buf.writeln('subAgents:');
+        for (final sa in m.subAgents) {
+          buf.writeln('- ${AppLogger.redactSensitiveText(sa.task)}');
+          if (sa.output.isNotEmpty) {
+            final first = sa.output.split('\n').firstWhere(
+                (l) => l.trim().isNotEmpty,
+                orElse: () => '');
+            if (first.isNotEmpty) {
+              buf.writeln('  ↳ ${AppLogger.redactSensitiveText(first)}');
+            }
+          }
+        }
+      }
+      if (m.text.isNotEmpty) {
+        buf.writeln(AppLogger.redactSensitiveText(m.text));
+      }
       if (m.files.isNotEmpty) {
         buf.writeln('tool/files:');
         for (final f in m.files) {
-          buf.writeln('- $f');
+          buf.writeln('- ${AppLogger.redactSensitiveText(f)}');
         }
       }
       if (m.commands.isNotEmpty) {
         buf.writeln('tool/commands:');
         for (final c in m.commands) {
           buf.writeln(
-              '- \$ ${c.command}${c.exitCode == null ? '' : ' [exit ${c.exitCode}]'}${c.ok ? '' : '（失败）'}');
+              '- \$ ${AppLogger.redactSensitiveText(c.command)}${c.exitCode == null ? '' : ' [exit ${c.exitCode}]'}${c.ok ? '' : '（失败）'}');
           if (c.output.isNotEmpty) {
             final first = c.output.split('\n').firstWhere(
                 (l) => l.trim().isNotEmpty,
                 orElse: () => '');
-            if (first.isNotEmpty) buf.writeln('  ↳ $first');
+            if (first.isNotEmpty) {
+              buf.writeln('  ↳ ${AppLogger.redactSensitiveText(first)}');
+            }
           }
         }
       }
       if (m.stopReason != null && m.stopReason!.isNotEmpty) {
-        buf.writeln('stop: ${m.stopReason}');
+        buf.writeln('stop: ${AppLogger.redactSensitiveText(m.stopReason!)}');
       }
     }
     return buf.toString();
@@ -1537,19 +1819,19 @@ class ChatStore extends ChangeNotifier {
     // 流式写盘：大会话不再 StringBuffer 一次拼全串，避免 OOM。
     final sink = file.openWrite();
     try {
-      sink.writeln('# ${s.title}\n');
+      sink.writeln('# ${AppLogger.redactSensitiveText(s.title)}\n');
       if (s.compactionSummary != null && s.compactionSummary!.isNotEmpty) {
         sink.writeln('> 历史摘要（压缩记忆，丢弃 ${s.compactedDropped} 条）：');
-        sink.writeln('> ${s.compactionSummary!.replaceAll('\n', '\n> ')}\n');
+        sink.writeln('> ${AppLogger.redactSensitiveText(s.compactionSummary!).replaceAll('\n', '\n> ')}\n');
       }
       for (final m in s.messages) {
         sink.writeln(m.role == 'user' ? '## 用户' : '## 助手');
         if (m.thinking != null && m.thinking!.isNotEmpty) {
           sink.writeln(
-            '\n<details><summary>思考</summary>\n\n${m.thinking}\n\n</details>\n',
+            '\n<details><summary>思考</summary>\n\n${AppLogger.redactSensitiveText(m.thinking!)}\n\n</details>\n',
           );
         }
-        sink.writeln(m.text);
+        sink.writeln(AppLogger.redactSensitiveText(m.text));
         if (m.images.isNotEmpty) {
           // 图片已资产化：导出只列引用路径，不再贴 base64。
           sink.writeln('\n附图 ${m.images.length} 张：');
@@ -1560,20 +1842,20 @@ class ChatStore extends ChangeNotifier {
         if (m.files.isNotEmpty) {
           sink.writeln('\n操作文件：');
           for (final f in m.files) {
-            sink.writeln('- $f');
+            sink.writeln('- ${AppLogger.redactSensitiveText(f)}');
           }
         }
         if (m.commands.isNotEmpty) {
           sink.writeln('\n执行命令：');
           for (final c in m.commands) {
             sink.writeln(
-                '- \$ ${c.command}${c.exitCode == null ? '' : ' [exit ${c.exitCode}]'}${c.ok ? '' : '（失败）'}');
+                '- \$ ${AppLogger.redactSensitiveText(c.command)}${c.exitCode == null ? '' : ' [exit ${c.exitCode}]'}${c.ok ? '' : '（失败）'}');
           }
         }
         if (m.userEditedFiles.isNotEmpty) {
           sink.writeln('\n用户改动：');
           for (final f in m.userEditedFiles) {
-            sink.writeln('- $f');
+            sink.writeln('- ${AppLogger.redactSensitiveText(f)}');
           }
         }
         sink.writeln();

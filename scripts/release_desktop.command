@@ -80,7 +80,11 @@ strip_language_bundles() {
 build_macos() {
   local app_path zip_path
   echo "--> 构建 macOS Release..."
-  flutter build macos --release
+  # Flutter 3.38.6 thinFramework bug：xcode_backend 把 ARCHS="arm64 x86_64"
+  # 透传给 lipo -verify_arch 多架构（lipo 一次只接受单架构），必报
+  # does not contain architectures。Release 走通用 destination 本机单架构即可。
+  FLUTTER_XCODE_ARCHS="$ARCH" FLUTTER_XCODE_ONLY_ACTIVE_ARCH=YES \
+    flutter build macos --release || return 1
   app_path="build/macos/Build/Products/Release/${APP_NAME}.app"
   if [[ ! -d "$app_path" ]]; then
     # 少数工程显示名与 package name 不一致，取唯一 .app
@@ -91,8 +95,20 @@ build_macos() {
     return 1
   fi
   strip_language_bundles "$ROOT/$app_path"
+  # 误报兜底：set -e 在 if "$fn" 调用的函数体内失效，flutter 失败仍会
+  # 走到这里打空包。校验可执行文件与包体积，不合格即标记失败。
+  if [[ ! -x "$app_path/Contents/MacOS/${APP_NAME}" ]] && [[ -z "$(find "$app_path/Contents/MacOS" -maxdepth 1 -type f | head -1)" ]]; then
+    echo "    .app 内无可执行文件，视为构建失败" >&2
+    return 1
+  fi
   zip_path="$OUT_DIR/${APP_NAME}-${VERSION}-macos-${ARCH}.zip"
   zip_dir "$ROOT/$app_path" "$zip_path"
+  local zip_size
+  zip_size="$(stat -f%z "$zip_path" 2>/dev/null || stat -c%s "$zip_path" 2>/dev/null || echo 0)"
+  if [[ "${zip_size:-0}" -lt 1048576 ]]; then
+    echo "    产物 zip 仅 ${zip_size}B（<1MB），视为构建失败" >&2
+    return 1
+  fi
 }
 
 build_linux() {

@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
@@ -10,6 +9,7 @@ import 'package:re_editor/re_editor.dart';
 import 'package:re_highlight/languages/all.dart';
 import 'package:re_highlight/re_highlight.dart';
 
+import '../ai/agent_tools.dart';
 import '../diagnostics/diagnostics_store.dart';
 import '../diagnostics/ide_diagnostic.dart';
 import '../diagnostics/local_integrity_checker.dart';
@@ -67,6 +67,9 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
   DiagnosticsStore? _diagnostics;
   Timer? _localCheckTimer;
   int _docVersion = 0;
+  // 最近一次同步给 LSP 的文档版本：诊断回调按此快照版本写入，
+  // 迟到包（旧版本回包）由 store 侧按版本号丢弃，不覆盖新编辑诊断。
+  int _syncLspVersion = 0;
   Map<String, CodeHighlightThemeMode>? _cachedHighlightLanguages;
   String? _cachedHighlightLanguageId;
   final Set<String> _promptingPackIds = {};
@@ -89,6 +92,9 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
   bool get isDirty => _dirty;
   bool get isSaving => _saving;
   String get path => widget.path;
+
+  /// 当前加载进编辑器的行数（大文件窗口化时为窗口行数；测试/调试用）。
+  int get loadedLineCount => _controller.codeLines.length;
 
   bool get _gotoModifierPressed {
     final pressed = HardwareKeyboard.instance.logicalKeysPressed;
@@ -274,6 +280,9 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
       _languageMode = builtinAllLanguages[_language.id];
       _seenContentEpoch = _workspace?.contentEpochOf(widget.path) ?? 0;
       _docVersion = 0;
+      // 换文件必须重置“加载全部”开关，否则 A 文件点过加载全部后，
+      // 打开另一大文件会静默整载（绕过大文件窗口化保护）。
+      _largeFileExpanded = false;
       _load();
     }
   }
@@ -581,12 +590,16 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
         p.extension(widget.path).toLowerCase(),
       );
       if (spec != null) {
+        final diagnosticsVersion = DiagnosticsScope.maybeOf(
+          context,
+        )?.contentVersionOf(widget.path);
         final overrideCmd = settings.languageServerCommand(spec.id);
         final client = await DefinitionService.instance.clientFor(
           rootPath: root,
           spec: spec,
           commandOverride: overrideCmd,
         );
+        if (!mounted) return;
         if (client != null) {
           final lspLang = spec.languageIds.contains(_language.id)
               ? _language.id
@@ -597,8 +610,8 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
             widget.path,
             _controller.text,
             version:
-                (_diagnostics ?? DiagnosticsScope.maybeOf(context))
-                    ?.contentVersionOf(widget.path) ??
+                diagnosticsVersion ??
+                    _diagnostics?.contentVersionOf(widget.path) ??
                 1,
             languageId: lspLang,
           );
@@ -900,12 +913,15 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
       spec: spec,
       commandOverride: overrideCmd,
     );
-    if (client == null || !mounted) {
+    if (client == null) {
+      if (!mounted) return;
       final err = DefinitionService.instance.lastStartError;
       if (err != null && err.isNotEmpty) {
         // 写一条可见诊断，避免「装了但完全没反馈」。
-        final store = _diagnostics ?? DiagnosticsScope.maybeOf(context);
-        store?.setForFileSource(
+        // mounted 已守卫后同步取 scope：同一帧内安全，后续回调不再碰 context。
+        final fallbackStore =
+            _diagnostics ?? DiagnosticsScope.maybeOf(context);
+        fallbackStore?.setForFileSource(
           path: widget.path,
           source: 'lsp:${spec.id}',
           diagnostics: [
@@ -920,19 +936,24 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
               source: 'lsp:${spec.id}',
             ),
           ],
-          contentVersion: store.contentVersionOf(widget.path),
+          contentVersion: fallbackStore.contentVersionOf(widget.path),
         );
       }
       return;
     }
+    if (!mounted) return;
     final lspLang = spec.languageIds.contains(_language.id)
         ? _language.id
         : (spec.languageIds.isNotEmpty ? spec.languageIds.first : _language.id);
     client.ensureDiagnosticsHandler((path, diagnostics) {
-      final store = _diagnostics ?? DiagnosticsScope.maybeOf(context);
+      final store = _diagnostics;
       if (store == null) return;
-      // 当前文件：用到达时的 contentVersion 写入，避免异步诊断被后续编辑误丢。
-      final versionNow = store.contentVersionOf(path);
+      // 当前文件：用回调注册时的文档版本写入，迟到包（旧版本回包）由
+      // store 侧丢弃，不再按到达时版本覆盖新编辑后的诊断。
+      // 非当前文件（同 server 多文件）：到达时版本即最新，无需快照。
+      final versionNow = path == widget.path
+          ? _syncLspVersion
+          : store.contentVersionOf(path);
       final clamped = diagnostics
           .map(
             (d) => _clampDiagnostic(
@@ -949,11 +970,11 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
       );
     });
     // 同步最新文本；若上面安装较慢，用当前文档版本。
-    final latestVersion =
-        (_diagnostics ?? DiagnosticsScope.maybeOf(context))?.contentVersionOf(
-          widget.path,
-        ) ??
-        version;
+    // mounted 已守卫后同步取值，同一帧内不再跨 async gap。
+    // 快照本次同步版本：诊断回调按此版本写入，迟到包由 store 丢弃。
+    final latestStore = _diagnostics ?? DiagnosticsScope.maybeOf(context);
+    final latestVersion = latestStore?.contentVersionOf(widget.path) ?? version;
+    _syncLspVersion = latestVersion <= 0 ? 1 : latestVersion;
     client.didChangeIncremental(
       widget.path,
       _controller.text,
@@ -1019,12 +1040,25 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
 
     try {
       final stat = await File(widget.path).stat();
-      final fullContent = await _readText(widget.path);
-      if (!mounted) return;
       final isLarge = stat.size > _largeFileBytes;
-      final content = isLarge && !_largeFileExpanded
-          ? fullContent.split('\n').take(_largeFileWindowLines).join('\n')
-          : fullContent;
+      final windowed = isLarge && !_largeFileExpanded;
+      String content;
+      if (windowed) {
+        // 流式只读前 N 行即停，避免超大文件先全量读入内存。
+        try {
+          content = await _readHeadLines(
+            widget.path,
+            _largeFileWindowLines,
+          );
+        } catch (_) {
+          // 非 UTF-8（latin1/UTF-16）等解码失败时退回全量读再截断。
+          final full = await _readText(widget.path);
+          content = full.split('\n').take(_largeFileWindowLines).join('\n');
+        }
+      } else {
+        content = await _readText(widget.path);
+      }
+      if (!mounted) return;
       _savedContent = content;
       _controller.text = content;
       setState(() {
@@ -1054,10 +1088,14 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
     if (widget.readOnly || _loading || _error != null || _saving) {
       return false;
     }
-    if (_isLargeFile && !_largeFileExpanded && !_largeFileEditMode) {
+    if (_isLargeFile && !_largeFileExpanded) {
+      // R4-A1 窗口态一律禁存：此前局部编辑模式放行保存，doSave 把仅
+      // 2000 行窗口文本覆盖原文件致尾部丢失（对标 Cursor 8MiB 截断丢数据
+      // https://forum.cursor.com/t/agent-strreplace-truncates-files-8-mib-silent-data-loss/166573）。
+      // 现窗口态必须先加载全部，局部编辑键只放行只读浏览不放行保存。
       if (mounted) {
         ScaffoldMessenger.maybeOf(context)?.showSnackBar(
-          const SnackBar(content: Text('大文件窗口化：请先加载全部或开启局部编辑后再保存')),
+          const SnackBar(content: Text('大文件窗口化：仅加载前2000行，保存会截断丢数据，请先点加载全部')),
         );
       }
       return false;
@@ -1102,22 +1140,34 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
     }
 
     setState(() => _saving = true);
-    try {
+    // R3-02：编辑器落盘进 Agent 写链——与 Agent 写同键串行，避免手工保存
+    // 与 Agent 写并发互盖；tmp 唯一随机后缀防同微秒互盖。
+    final saveText = _controller.text;
+    final savePath = widget.path;
+    Future<bool> doSave() async {
       // 原子写：tmp+flush+rename，避免与 Agent/自动保存并发时半写；
       // 写后更新磁盘戳，避免外部监听把自写误判为冲突。
-      final target = File(widget.path);
-      final tmp = File('${widget.path}.${DateTime.now().microsecondsSinceEpoch}.tmp');
-      await tmp.writeAsString(_controller.text, encoding: utf8, flush: true);
+      final target = File(savePath);
+      final rand = DateTime.now().microsecondsSinceEpoch.toRadixString(36);
+      final tmp = File('$savePath.$rand-${saveText.hashCode.toRadixString(36)}.tmp');
+      await tmp.writeAsString(saveText, encoding: utf8, flush: true);
       try {
-        await tmp.rename(widget.path);
+        await tmp.rename(savePath);
       } catch (_) {
-        await target.writeAsString(_controller.text, encoding: utf8, flush: true);
+        await target.writeAsString(saveText, encoding: utf8, flush: true);
         try {
           if (await tmp.exists()) await tmp.delete();
         } catch (_) {}
       }
+      return true;
+    }
+
+    try {
+      await AgentTools.serializeFileWrites([savePath], doSave);
       if (!mounted) return true;
-      _savedContent = _controller.text;
+      // R4-07：保存文本一致——用落盘快照 saveText，不用回读 _controller.text，
+      // 保存中击键此前误标已保存致脏检查漏检。
+      _savedContent = saveText;
       setState(() {
         _dirty = false;
         _saving = false;
@@ -1245,7 +1295,8 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
                   Expanded(
                     child: Text(
                       _largeFileEditMode
-                          ? '大文件局部编辑模式：保存前请确认。'
+                          // R4-A1：窗口态一律禁存，局部编辑仅浏览不落盘。
+                          ? '大文件局部编辑模式（只读浏览）：保存已禁用，请先点加载全部。'
                           : '文件较大，默认安全只读打开；可切换局部编辑模式。',
                       style: TextStyle(color: colors.textMuted, fontSize: 12),
                     ),
@@ -1410,28 +1461,23 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
                                 ),
                                 SizedBox(
                                   width: 10,
-                                  child: AnimatedBuilder(
-                                    animation: Listenable.merge([
-                                      notifier,
-                                      if (store != null) store,
-                                    ]),
-                                    builder: (context, _) {
-                                      final map =
+                                  child: CustomPaint(
+                                    size: Size(
+                                      10,
+                                      MediaQuery.sizeOf(context).height,
+                                    ),
+                                    painter: _DiagnosticGutterPainter(
+                                      repaints: Listenable.merge([
+                                        notifier,
+                                        ?store,
+                                      ]),
+                                      notifier: notifier,
+                                      severitiesOf: () =>
                                           store?.severitiesByLine(
                                             widget.path,
                                           ) ??
-                                          const <int, DiagnosticSeverity>{};
-                                      return CustomPaint(
-                                        size: Size(
-                                          10,
-                                          MediaQuery.sizeOf(context).height,
-                                        ),
-                                        painter: _DiagnosticGutterPainter(
-                                          notifier: notifier,
-                                          severities: map,
-                                        ),
-                                      );
-                                    },
+                                          const <int, DiagnosticSeverity>{},
+                                    ),
                                   ),
                                 ),
                               ],
@@ -1475,6 +1521,12 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
       return;
     }
     final selection = _controller.selection;
+    // R4-A6 空文件守卫：空文档 codeLines 为空时 length-1==-1，
+    // clamp(0,-1) 抛 RangeError。此前空文件点签名即崩。
+    if (_controller.codeLines.isEmpty) {
+      setState(() => _signatureHint = '空文件无签名');
+      return;
+    }
     final line = selection.extentIndex.clamp(
       0,
       _controller.codeLines.length - 1,
@@ -1614,6 +1666,39 @@ class _CodeFindBar extends StatelessWidget implements PreferredSizeWidget {
   }
 }
 
+/// 流式读取文件前 [maxLines] 行后立即取消订阅，不全量读入内存。
+/// 仅支持 UTF-8（含 BOM 剥离）；解码失败由调用方退回 _readText。
+Future<String> _readHeadLines(String path, int maxLines) {
+  final completer = Completer<String>();
+  final lines = <String>[];
+  late final StreamSubscription<String> sub;
+  sub = File(path)
+      .openRead()
+      .transform(utf8.decoder)
+      .transform(const LineSplitter())
+      .listen(
+        (line) {
+          if (lines.isEmpty && line.startsWith('\uFEFF')) {
+            line = line.substring(1);
+          }
+          lines.add(line);
+          if (lines.length >= maxLines) {
+            // ignore: discarded_futures
+            sub.cancel();
+            if (!completer.isCompleted) completer.complete(lines.join('\n'));
+          }
+        },
+        onDone: () {
+          if (!completer.isCompleted) completer.complete(lines.join('\n'));
+        },
+        onError: (Object e) {
+          if (!completer.isCompleted) completer.completeError(e);
+        },
+        cancelOnError: true,
+      );
+  return completer.future;
+}
+
 Future<String> _readText(String path) async {
   final bytes = await File(path).readAsBytes();
   if (bytes.isEmpty) return '';
@@ -1650,14 +1735,22 @@ String _decodeUtf16(List<int> bytes, {required bool littleEndian}) {
 }
 
 class _DiagnosticGutterPainter extends CustomPainter {
-  _DiagnosticGutterPainter({required this.notifier, required this.severities});
+  // repaints 只触发重绘不触发重建：re_editor 的 indicator notifier 在
+  // 布局期通知，AnimatedBuilder 的 setState 会报 "Build scheduled during
+  // frame"。经 CustomPainter 的 repaint 监听只走 paint 阶段。
+  _DiagnosticGutterPainter({
+    required Listenable? repaints,
+    required this.notifier,
+    required this.severitiesOf,
+  }) : super(repaint: repaints);
 
   final ValueNotifier<CodeIndicatorValue?> notifier;
-  final Map<int, DiagnosticSeverity> severities;
+  final Map<int, DiagnosticSeverity> Function() severitiesOf;
 
   @override
   void paint(Canvas canvas, Size size) {
     final value = notifier.value;
+    final severities = severitiesOf();
     if (value == null || severities.isEmpty) return;
     final paint = Paint()..style = PaintingStyle.fill;
     for (final para in value.paragraphs) {
@@ -1684,7 +1777,7 @@ class _DiagnosticGutterPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _DiagnosticGutterPainter oldDelegate) {
-    return oldDelegate.notifier != notifier ||
-        !mapEquals(oldDelegate.severities, severities);
+    // 内容变化经 repaint listenable 驱动；此处仅在 painter 语义变化时重建。
+    return oldDelegate.notifier != notifier;
   }
 }

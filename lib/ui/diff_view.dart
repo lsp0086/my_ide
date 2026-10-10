@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 
 import '../theme/app_colors.dart';
@@ -33,7 +35,21 @@ List<_DiffLine> _parseUnifiedDiff(String diff) {
   final out = <_DiffLine>[];
   var oldNo = 0;
   var newNo = 0;
-  for (final raw in diff.split('\n')) {
+  final lines = diff.split('\n');
+  for (var i = 0; i < lines.length; i++) {
+    final raw = lines[i];
+    // R4-A2 裸空行判定：仅末尾换行产生的空串跳过；中部裸空行按空
+    // 上下文推进（git diff 空上下文行虽为单空格前缀，但截断/手拼
+    // diff 中部裸空即空行内容，此前一律跳过致后续行号全错位）。
+    // 末尾判定：i 为最后一行且为空即换行产物。
+    if (raw.isEmpty) {
+      final isTrailing = i == lines.length - 1;
+      if (isTrailing) continue;
+      out.add(_DiffLine(kind: 'ctx', text: '', oldNo: oldNo, newNo: newNo));
+      oldNo++;
+      newNo++;
+      continue;
+    }
     if (raw.startsWith('@@')) {
       final m = RegExp(r'@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@')
           .firstMatch(raw);
@@ -49,6 +65,11 @@ List<_DiffLine> _parseUnifiedDiff(String diff) {
         raw.startsWith('---') ||
         raw.startsWith('+++')) {
       out.add(_DiffLine(kind: 'meta', text: raw));
+      continue;
+    }
+    if (raw.startsWith('\\')) {
+      // “\ No newline at end of file” 标记行：既不渲染也不推进行号，
+      // 否则会占一行 ctx 且让后续行号整体偏移。
       continue;
     }
     if (raw.startsWith('+')) {
@@ -387,14 +408,16 @@ class DiffDialog extends StatelessWidget {
     final lines = _parseUnifiedDiff(diff);
     final adds = lines.where((e) => e.kind == 'add').length;
     final dels = lines.where((e) => e.kind == 'del').length;
+    // 随屏自适应：小窗口下按屏幕 90% 缩，避免固定 900×600 溢出。
+    final screenSize = MediaQuery.sizeOf(context);
     return Dialog(
       backgroundColor: colors.panel,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(14),
       ),
       child: SizedBox(
-        width: 900,
-        height: 600,
+        width: math.min(900.0, screenSize.width * 0.9),
+        height: math.min(600.0, screenSize.height * 0.9),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [

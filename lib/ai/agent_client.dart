@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show HttpDate;
 import 'dart:math';
 
 import 'package:http/http.dart' as http;
@@ -47,25 +48,31 @@ class AgentClient {
   AgentClient({http.Client? httpClient, this.maxRetries = 5})
       : _http = httpClient ?? http.Client();
 
-  http.Client _http;
-  bool _aborted = false;
+  final http.Client _http;
+  final Set<String> _abortedSessions = {};
 
-  /// 中断当前流式请求：关闭底层连接，在用流会立即报错结束，
-  /// Runner 捕获后按“用户已中断”收尾，不再空转浪费 token。
-  /// 中断标记由下一轮 _sendWithRetry 成功时自动清除：此前 _aborted 只在
-  /// 2xx 成功时清零，中断一次后若无新请求则后续永远抛 StateError 卡死。
-  void abort() {
-    _aborted = true;
-    try {
-      _http.close();
-    } catch (_) {}
-    _http = http.Client();
+  /// 中断指定会话的流式请求：仅按会话标记中断，不关闭/重建共享连接，
+  /// R1-07：此前 abort('') close+重建共享 http.Client，误伤并行会话在途流。
+  /// 现只标记，全局取消由各流经 isAborted 感知退出，连接复用不断。
+  void abort({String sessionId = ''}) {
+    if (sessionId.isEmpty) {
+      _abortedSessions.add('');
+      return;
+    }
+    _abortedSessions.add(sessionId);
   }
+
+  bool isAborted(String sessionId) =>
+      _abortedSessions.contains('') || _abortedSessions.contains(sessionId);
 
   /// 新一轮开始前调用：上一轮 abort 后若尚未成功请求，允许重建连接，
   /// 避免“中断一次就永久 StateError”。运行时机由 Runner.run 入口调用。
-  void resetAbort() {
-    _aborted = false;
+  void resetAbort({String sessionId = ''}) {
+    if (sessionId.isEmpty) {
+      _abortedSessions.clear();
+      return;
+    }
+    _abortedSessions.remove(sessionId);
   }
 
   /// 非 2xx 时的额外重试次数（不含首次）。默认 5；0 表示不重试。
@@ -129,30 +136,61 @@ class AgentClient {
     }
   }
 
-  /// 指数退避延迟：400ms 起步、上限 5s，带 ±25% jitter 避免雪崩；
-  /// 429/503 优先读 Retry-After（秒/HTTP 日期），读到即用。
+  /// 指数退避延迟：默认 400ms 起步、上限 5s；503/529 过载 1s 起步、上限 8s，
+  /// 均带 ±25% jitter 避免雪崩。带 Retry-After（秒/HTTP 日期）时精确等待该
+  /// 时长（上限 30s）不加 jitter——服务端已给出确定限流窗口，按指令退避。
   static final _random = Random.secure();
 
+  /// 可注入延迟函数：测试注入 0 延迟并记录时长，避免真实等待拖慢用例。
+  Future<void> Function(Duration duration) delayFn =
+      (d) => Future<void>.delayed(d);
+
   Future<void> _backoffDelay(int attempt, {http.BaseResponse? response}) async {
-    var ms = (400 * (1 << attempt)).clamp(400, 5000);
+    // C5a：Retry-After（秒或 HTTP 日期）→ 精确等待该时长，上限 30s。
     try {
       final raw = response?.headers['retry-after']?.trim();
       if (raw != null && raw.isNotEmpty) {
+        var ms = -1;
         final secs = int.tryParse(raw);
         if (secs != null && secs >= 0) {
-          ms = (secs * 1000).clamp(0, 30000);
+          ms = secs * 1000;
         } else {
-          final date = DateTime.tryParse(raw);
-          if (date != null) {
-            ms = date.difference(DateTime.now()).inMilliseconds.clamp(0, 30000);
+          // Retry-After 日期为 RFC 1123 格式（HttpDate），DateTime.tryParse
+          // 只认 ISO8601 解析不了；ISO 串再由 tryParse 兜底。
+          var date = DateTime.now();
+          var parsed = false;
+          try {
+            date = HttpDate.parse(raw);
+            parsed = true;
+          } catch (_) {}
+          if (!parsed) {
+            final iso = DateTime.tryParse(raw);
+            if (iso != null) {
+              date = iso;
+              parsed = true;
+            }
           }
+          if (parsed) {
+            ms = date.difference(DateTime.now()).inMilliseconds;
+          }
+        }
+        if (ms >= 0) {
+          await delayFn(Duration(milliseconds: ms.clamp(0, 30000)));
+          return;
         }
       }
     } catch (_) {}
+    // C5b：503/529 过载 → 指数退避 1s 起步、上限 8s；其余（429 无
+    // Retry-After、网络错等）沿用 400ms 起步、上限 5s。均带 ±25% jitter。
+    final status = response?.statusCode;
+    final overloaded = status == 503 || status == 529;
+    final base = overloaded ? 1000 : 400;
+    final cap = overloaded ? 8000 : 5000;
+    final ms = (base * (1 << attempt)).clamp(base, cap);
     final jitter = (ms * 0.25).round();
     final delayed =
         ms - jitter + (jitter > 0 ? _random.nextInt(jitter * 2 + 1) : 0);
-    await Future<void>.delayed(Duration(milliseconds: delayed.clamp(0, 30000)));
+    await delayFn(Duration(milliseconds: delayed.clamp(0, 30000)));
   }
 
   /// 发送流式请求：仅 429/5xx/网络错重试+指数退避，401/400 直接抛；
@@ -160,19 +198,20 @@ class AgentClient {
   Future<http.StreamedResponse> _sendWithRetry(
     http.Request seed, {
     StreamBudget? budget,
+    String sessionId = '',
   }) async {
     final limit = budget ?? StreamBudget();
     final rounds = maxRetries < 0 ? 0 : maxRetries;
     Object? lastError;
     for (var attempt = 0; attempt <= rounds; attempt++) {
-      if (_aborted) throw StateError('请求已被用户中断');
+      if (isAborted(sessionId)) throw StateError('请求已被用户中断');
       final req = http.Request(seed.method, seed.url);
       req.headers.addAll(seed.headers);
       req.bodyBytes = seed.bodyBytes;
       try {
         final response = await _http.send(req).timeout(limit.connectTimeout);
         if (response.statusCode >= 200 && response.statusCode < 300) {
-          _aborted = false;
+          resetAbort(sessionId: sessionId);
           return response;
         }
         final err = await _readErrorBody(response.stream, limit);
@@ -185,11 +224,13 @@ class AgentClient {
           break;
         }
         if (attempt >= rounds) break;
+        if (isAborted(sessionId)) throw StateError('请求已被用户中断');
         await _backoffDelay(attempt, response: response);
       } catch (e) {
-        if (_aborted || e is StateError) rethrow;
+        if (isAborted(sessionId) || e is StateError) rethrow;
         lastError = e;
         if (attempt >= rounds) break;
+        if (isAborted(sessionId)) throw StateError('请求已被用户中断');
         await _backoffDelay(attempt);
       }
     }
@@ -224,6 +265,7 @@ class AgentClient {
     List<Map<String, dynamic>>? tools,
     bool toolChoiceAuto = true,
     String? previousResponseId,
+    String sessionId = '',
   }) {
     if (provider.isAnthropic) {
       return _streamAnthropic(
@@ -231,6 +273,7 @@ class AgentClient {
         model: model,
         messages: messages,
         tools: tools,
+        sessionId: sessionId,
       );
     }
     if (provider.isResponses) {
@@ -242,6 +285,7 @@ class AgentClient {
         previousResponseId: provider.responsesPreviousResponse
             ? previousResponseId
             : null,
+        sessionId: sessionId,
       );
     }
     return _streamOpenAi(
@@ -250,6 +294,7 @@ class AgentClient {
       messages: messages,
       tools: tools,
       toolChoiceAuto: toolChoiceAuto,
+      sessionId: sessionId,
     );
   }
 
@@ -260,6 +305,7 @@ class AgentClient {
     required List<Map<String, dynamic>> messages,
     List<Map<String, dynamic>>? tools,
     bool toolChoiceAuto = true,
+    String sessionId = '',
   }) async* {
     final url = Uri.parse(provider.chatCompletionsUrl);
     final body = <String, dynamic>{
@@ -285,7 +331,7 @@ class AgentClient {
     request.body = jsonEncode(body);
 
     // 非 2xx 静默重试，始终复用上面这份初次请求内容
-    final response = await _sendWithRetry(request);
+    final response = await _sendWithRetry(request, sessionId: sessionId);
 
     final budget = StreamBudget();
     final toolBuffers = <int, Map<String, dynamic>>{};
@@ -297,6 +343,9 @@ class AgentClient {
         if (line == '[DONE]') {
           for (final entry in toolBuffers.entries) {
             final buf = entry.value;
+            // 空名工具不 yield：与 Responses/Anthropic 口径对齐，
+            // 否则空参幻觉 tool 会进入下游执行。
+            if ('${buf['name'] ?? ''}'.isEmpty) continue;
             yield AgentStreamEvent(
               toolCall: AgentToolCall(
                 id: '${buf['id'] ?? 'call_${entry.key}'}',
@@ -308,14 +357,24 @@ class AgentClient {
           yield AgentStreamEvent(done: true);
           return;
         }
+        Map<String, dynamic> data;
         try {
-          final data = jsonDecode(line) as Map<String, dynamic>;
+          data = jsonDecode(line) as Map<String, dynamic>;
+        } catch (e) {
+          if (e is StateError || e is TimeoutException) rethrow;
+          continue;
+        }
+        try {
           final usage = data['usage'] as Map<String, dynamic>?;
           if (usage != null) {
+            // total 缺失回退为 prompt+completion 之和，不留 null 误导预算。
+            final prompt = (usage['prompt_tokens'] as num?)?.toInt();
+            final completion = (usage['completion_tokens'] as num?)?.toInt();
             yield AgentStreamEvent(
-              promptTokens: (usage['prompt_tokens'] as num?)?.toInt(),
-              completionTokens: (usage['completion_tokens'] as num?)?.toInt(),
-              totalTokens: (usage['total_tokens'] as num?)?.toInt(),
+              promptTokens: prompt,
+              completionTokens: completion,
+              totalTokens: (usage['total_tokens'] as num?)?.toInt() ??
+                  ((prompt ?? 0) + (completion ?? 0)),
             );
           }
           final choices = data['choices'] as List?;
@@ -336,7 +395,38 @@ class AgentClient {
           if (toolCalls != null) {
             for (final tc in toolCalls) {
               final m = tc as Map<String, dynamic>;
-              final index = (m['index'] as num?)?.toInt() ?? 0;
+              final rawIndex = (m['index'] as num?)?.toInt();
+              // 索引碰撞修复：无 index 的 tool_call 不再全归 0 互拼参数，
+              // 按 id 分桶，缺省用负序号独立缓冲，避免幻觉空参循环。
+              // 显式 index>=0 仍按协议复用（同 index 即同 tool_call 续包）。
+              var index = rawIndex ?? -1;
+              if (index < 0) {
+                final callId = '${m['id'] ?? ''}';
+                if (callId.isNotEmpty) {
+                  final existing = toolBuffers.entries.where(
+                    (e) => '${e.value['id'] ?? ''}' == callId,
+                  );
+                  if (existing.isNotEmpty) {
+                    index = existing.first.key;
+                  } else {
+                    // 负序号分配后必须确认未被占用：hash 碰撞即另找空位，
+                    // 此前直接覆盖旧桶致参数互拼。
+                    // R1-Hash：换稳定DJB2——此前String.hashCode进程随机，
+                    // 跨进程日志/回放无法对齐。
+                    var candidate = -(_stableHash(callId) & 0x3fffffff) - 1;
+                    while (toolBuffers.containsKey(candidate)) {
+                      candidate -= 1;
+                    }
+                    index = candidate;
+                  }
+                } else {
+                  var candidate = -(toolBuffers.length + 1);
+                  while (toolBuffers.containsKey(candidate)) {
+                    candidate -= 1;
+                  }
+                  index = candidate;
+                }
+              }
               final buf = toolBuffers.putIfAbsent(
                   index, () => {'arguments': ''});
               if (m['id'] != null) buf['id'] = m['id'];
@@ -346,17 +436,23 @@ class AgentClient {
                 if (fn['arguments'] != null) {
                   buf['arguments'] =
                       '${buf['arguments'] ?? ''}${fn['arguments']}';
-                  budget.checkToolArgs('${buf['arguments']}'.length);
+                  budget.checkToolArgs(_utf8Length('${buf['arguments']}'));
                 }
               }
             }
           }
-        } catch (_) {
+        } catch (e) {
+          // 预算类错误（工具参数/行缓冲超限）必须上抛中断流，
+          // 不能当“非 JSON 行”吞掉，否则限额被绕过。
+          if (e is StateError || e is TimeoutException) rethrow;
           // 忽略非 JSON 行
         }
     }
     for (final entry in toolBuffers.entries) {
       final buf = entry.value;
+      // R1-08：异常尾刷同样过滤空名工具——此前仅[DONE]分支过滤，
+      // 此处未过滤，空参幻觉tool可进下游审批/执行。与三通道口径对齐。
+      if ('${buf['name'] ?? ''}'.isEmpty) continue;
       yield AgentStreamEvent(
         toolCall: AgentToolCall(
           id: '${buf['id'] ?? 'call_${entry.key}'}',
@@ -377,6 +473,7 @@ class AgentClient {
     List<Map<String, dynamic>>? tools,
     bool toolChoiceAuto = true,
     String? previousResponseId,
+    String sessionId = '',
   }) async* {
     final url = Uri.parse(provider.responsesUrl);
     final body = <String, dynamic>{
@@ -419,7 +516,7 @@ class AgentClient {
     request.headers.addAll(provider.authHeaders());
     request.body = jsonEncode(body);
 
-    final response = await _sendWithRetry(request);
+    final response = await _sendWithRetry(request, sessionId: sessionId);
 
     // output_index -> {call_id, name, arguments}
     final budget = StreamBudget();
@@ -469,12 +566,23 @@ class AgentClient {
         }
         if (type == 'response.function_call_arguments.delta') {
           final index = (data['output_index'] as num?)?.toInt() ?? 0;
-          final buf = toolBuffers.putIfAbsent(
-              index, () => {'arguments': ''});
+          // R1-Delta：无桶delta建暂存桶——此前added未到先到delta即continue丢弃，
+          // 服务端重排/丢added即工具调用静默丢失。现建桶+缺added标记，
+          // done时带警告yield，计数进预算。
+          var buf = toolBuffers[index];
+          if (buf == null) {
+            buf = <String, dynamic>{
+              'call_id': 'call_$index',
+              'name': '',
+              'arguments': '',
+              '__missingAdded': true,
+            };
+            toolBuffers[index] = buf;
+          }
           final delta = data['delta'];
           if (delta is String) {
             buf['arguments'] = '${buf['arguments'] ?? ''}$delta';
-            budget.checkToolArgs('${buf['arguments']}'.length);
+            budget.checkToolArgs(_utf8Length('${buf['arguments']}'));
           }
           continue;
         }
@@ -482,10 +590,16 @@ class AgentClient {
           final item = data['item'] as Map<String, dynamic>?;
           if (item != null && '${item['type']}' == 'function_call') {
             final index = (data['output_index'] as num?)?.toInt() ?? 0;
+            // R2-D1：added合并暂存delta——此前直接覆盖整桶，
+            // 乱序delta→added时暂存参数被清空。现保留已有arguments，
+            // item自带arguments优先，无则沿用暂存，并清missing标记。
+            final prev = toolBuffers[index];
+            final prevArgs = '${prev?['arguments'] ?? ''}';
+            final itemArgs = '${item['arguments'] ?? ''}';
             toolBuffers[index] = {
-              'call_id': '${item['call_id'] ?? item['id'] ?? 'call_$index'}',
-              'name': '${item['name'] ?? ''}',
-              'arguments': '${item['arguments'] ?? ''}',
+              'call_id': '${item['call_id'] ?? item['id'] ?? prev?['call_id'] ?? 'call_$index'}',
+              'name': '${item['name'] ?? prev?['name'] ?? ''}',
+              'arguments': itemArgs.isNotEmpty ? itemArgs : prevArgs,
             };
           }
           continue;
@@ -571,6 +685,7 @@ class AgentClient {
     required AiModelOption model,
     required List<Map<String, dynamic>> messages,
     List<Map<String, dynamic>>? tools,
+    String sessionId = '',
   }) async* {
     final converted = _toAnthropicMessages(messages);
     final body = <String, dynamic>{
@@ -622,11 +737,15 @@ class AgentClient {
     request.body = jsonEncode(body);
 
     // 非 2xx 静默重试，始终复用上面这份初次请求内容
-    final response = await _sendWithRetry(request);
+    final response = await _sendWithRetry(request, sessionId: sessionId);
 
-    // index -> partial tool_use
+    // index -> partial tool_use（Anthropic content_block 语义：index 复用即新块，
+    // 不能无条件 putIfAbsent 互拼；先到 content_block_stop 再复用才安全）。
     final budget = StreamBudget();
     final toolBuffers = <int, Map<String, dynamic>>{};
+    // 已结算 index：stop 后复用同 index 表示新一轮 tool_use，
+    // 此前 putIfAbsent 会把新块 partial 拼到旧残留致幻觉空参循环。
+    final settledIndexes = <int>{};
     String? eventName;
     await for (var line in _sseLines(response.stream, budget)) {
         if (line.isEmpty) {
@@ -686,11 +805,15 @@ class AgentClient {
             }
           } else if (deltaType == 'input_json_delta') {
             final partial = delta['partial_json'];
+            // stop 后复用 index 即新块：旧残留已结算，不得 putIfAbsent 复用。
+            if (settledIndexes.contains(index) && !toolBuffers.containsKey(index)) {
+              settledIndexes.remove(index);
+            }
             final buf = toolBuffers.putIfAbsent(
                 index, () => {'id': 'tool_$index', 'name': '', 'arguments': ''});
             if (partial != null) {
               buf['arguments'] = '${buf['arguments'] ?? ''}$partial';
-              budget.checkToolArgs('${buf['arguments']}'.length);
+              budget.checkToolArgs(_utf8Length('${buf['arguments']}'));
             }
           } else if (deltaType == 'thinking_delta') {
             final thinking = delta['thinking'];
@@ -703,6 +826,7 @@ class AgentClient {
 
         if (type == 'content_block_stop') {
           final index = (data['index'] as num?)?.toInt() ?? 0;
+          settledIndexes.add(index);
           final buf = toolBuffers.remove(index);
           if (buf != null && '${buf['name'] ?? ''}'.isNotEmpty) {
             yield AgentStreamEvent(
@@ -1075,34 +1199,48 @@ class AgentClient {
     StreamBudget budget,
   ) async {
     final buf = StringBuffer();
+    // R15R9：超限即排空残留——此前 break 即返，残留体污染连接复用下次请求。
+    // 同 R15R3/R15R6 fetch drain 口径。
     await for (final chunk in stream.timeout(budget.connectTimeout)) {
       buf.write(utf8.decode(chunk, allowMalformed: true));
       if (buf.length >= budget.maxErrorBytes) break;
     }
+    try {
+      await stream.drain<void>().timeout(const Duration(seconds: 5));
+    } catch (_) {}
     return budget.clipError(buf.toString());
   }
+
+  /// UTF-8 字节长度：*_sseLines* 与预算口径统一按字节计数，
+  /// 中文场景 String.length（字符数）会让字节超限 2-3 倍才触发。
+  static int _utf8Length(String s) => utf8.encode(s).length;
 
   Stream<String> _sseLines(
     Stream<List<int>> byteStream,
     StreamBudget budget,
   ) async* {
     var buffer = '';
-    await for (final chunk in withIdleTimeout(byteStream, budget.idleTimeout)
-        .timeout(budget.totalDeadline)) {
-      budget.addBytes(chunk.length);
-      buffer += utf8.decode(chunk, allowMalformed: true);
-      budget.checkBuffer(buffer.length);
+    // 增量解码：多字节字符跨 chunk 时不能按包直接 utf8.decode，
+    // 否则 allowMalformed 会把半个字符替换成乱码。用 decoder 绑定字节流。
+    final textStream = utf8.decoder.bind(
+      withIdleTimeout(byteStream, budget.idleTimeout)
+          .timeout(budget.totalDeadline),
+    );
+    await for (final text in textStream) {
+      budget.addBytes(_utf8Length(text));
+      buffer += text;
+      budget.checkBuffer(_utf8Length(buffer));
       while (true) {
         final idx = buffer.indexOf('\n');
         if (idx < 0) break;
         final line = buffer.substring(0, idx).trimRight();
         buffer = buffer.substring(idx + 1);
-        budget.checkLine(line.length);
+        budget.checkLine(_utf8Length(line));
         yield line;
       }
     }
     if (buffer.isNotEmpty) {
-      budget.checkLine(buffer.length);
+      budget.checkLine(_utf8Length(buffer));
       yield buffer.trimRight();
     }
   }
@@ -1124,6 +1262,18 @@ class AgentClient {
   void dispose() {
     _http.close();
   }
+
+  /// R1-Hash：稳定DJB2哈希——String.hashCode进程随机，
+  /// 无index分桶跨进程无法对齐。DJB2确定性，同callId多进程同桶。
+  static int stableHashForTest(String s) {
+    var h = 5381;
+    for (var i = 0; i < s.length; i++) {
+      h = ((h << 5) + h + s.codeUnitAt(i)) & 0x7fffffff;
+    }
+    return h;
+  }
+
+  static int _stableHash(String s) => stableHashForTest(s);
 }
 
 class _AnthropicConverted {

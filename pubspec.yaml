@@ -30,6 +30,7 @@ dependencies:
   clipboard:
     path: packages/clipboard
   flutter_markdown: ^0.7.7+1
+  cryptography: ^2.9.0
   # MCP：自研轻量客户端（stdio / Streamable HTTP），不强制依赖第三方 SDK。
 
 dev_dependencies:

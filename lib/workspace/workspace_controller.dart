@@ -11,7 +11,7 @@ import 'package:path/path.dart' as p;
 import '../fs/workspace_fs.dart';
 import '../settings/settings_store.dart';
 
-enum FileKind { text, image, svg, unsupported }
+enum FileKind { text, image, svg, unsupported, browser }
 
 class WorkspaceFile {
   const WorkspaceFile({
@@ -43,6 +43,7 @@ class OpenEditorTab {
     required this.name,
     required this.kind,
     this.isDirty = false,
+    this.url,
   });
 
   final String path;
@@ -50,12 +51,16 @@ class OpenEditorTab {
   final FileKind kind;
   final bool isDirty;
 
+  /// 页面标签页（FileKind.browser）的完整 URL；文件标签页为 null。
+  final String? url;
+
   OpenEditorTab copyWith({bool? isDirty}) {
     return OpenEditorTab(
       path: path,
       name: name,
       kind: kind,
       isDirty: isDirty ?? this.isDirty,
+      url: url,
     );
   }
 }
@@ -96,7 +101,8 @@ class WorkspaceController extends ChangeNotifier {
   /// 外部写入（AI/回退）后递增，驱动已打开编辑器重新读盘。
   int _contentEpoch = 0;
   final Map<String, int> _pathContentEpoch = <String, int>{};
-  /// 已知磁盘 mtime（毫秒），用于切回应用时检测外部覆盖。
+  /// 已知磁盘 mtime（微秒），用于切回应用时检测外部覆盖。
+  /// 微秒精度：毫秒截断下同毫秒同大小改写漏检（与 AgentTools 快照对齐）。
   final Map<String, int> _diskMtimeMs = <String, int>{};
   bool _scanningExternal = false;
   /// 当前窗口持有的项目锁路径（`.my_ide/project.lock`）。
@@ -188,7 +194,7 @@ class WorkspaceController extends ChangeNotifier {
     try {
       final stat = File(path).statSync();
       if (stat.type == FileSystemEntityType.file) {
-        _diskMtimeMs[path] = stat.modified.millisecondsSinceEpoch;
+        _diskMtimeMs[path] = stat.modified.microsecondsSinceEpoch;
       }
     } catch (_) {}
   }
@@ -205,7 +211,7 @@ class WorkspaceController extends ChangeNotifier {
     try {
       final stat = File(path).statSync();
       if (stat.type != FileSystemEntityType.file) return null;
-      return stat.modified.millisecondsSinceEpoch;
+      return stat.modified.microsecondsSinceEpoch;
     } catch (_) {
       return null;
     }
@@ -236,16 +242,26 @@ class WorkspaceController extends ChangeNotifier {
   }
 
   /// 保存所有已挂载编辑器的脏内容。返回实际落盘的路径。
+  /// R2-A3 重入守卫：与 autosave 同口径，定时自动保存与发送前 saveAll
+  /// 可重入同一 handler；handler 须幂等，此处同样守卫防叠加。
+  bool _savingAll = false;
+
   Future<List<String>> saveAllDirtyTabs() async {
-    final saved = <String>[];
-    for (final entry in List.of(_saveHandlers.entries)) {
-      if (!_dirtyPaths.contains(entry.key)) continue;
-      try {
-        final ok = await entry.value();
-        if (ok) saved.add(entry.key);
-      } catch (_) {}
+    if (_savingAll) return const [];
+    _savingAll = true;
+    try {
+      final saved = <String>[];
+      for (final entry in List.of(_saveHandlers.entries)) {
+        if (!_dirtyPaths.contains(entry.key)) continue;
+        try {
+          final ok = await entry.value();
+          if (ok) saved.add(entry.key);
+        } catch (_) {}
+      }
+      return saved;
+    } finally {
+      _savingAll = false;
     }
-    return saved;
   }
 
   /// 周期性自动落盘：崩溃/断电时不至于丢光未保存编辑。
@@ -307,8 +323,13 @@ class WorkspaceController extends ChangeNotifier {
       final file = File(p.join(root, '.my_ide', 'session.json'));
       await file.parent.create(recursive: true);
       final payload = jsonEncode({
-        'tabs': _tabs.map((t) => t.path).toList(),
-        'active': _activePath,
+        // 页面标签页（browser:page）不落 session：页面由 Agent 会话唤起，
+        // 重启后无法也不应恢复。
+        'tabs': _tabs
+            .map((t) => t.path)
+            .where((t) => !t.startsWith(browserTabPath))
+            .toList(),
+        'active': _activePath == browserTabPath ? null : _activePath,
       });
       // 唯一侧车名：此前固定 `.tmp`，防抖落盘与退出落盘并发互盖丢布局。
       // micros+随机：纯 micros 同微秒仍可同名。
@@ -681,6 +702,20 @@ class WorkspaceController extends ChangeNotifier {
     final myPid = pid;
     try {
       await Directory(p.dirname(lockPath)).create(recursive: true);
+      // R2-A4 exclusive 抢占：先尝试独占创建，成功即持有；
+      // 已存在才走存活判定（陈旧锁覆盖），缩小 exists→write 竞速窗口。
+      var created = false;
+      try {
+        await lockFile.create(exclusive: true);
+        await lockFile.writeAsString('$myPid\n');
+        created = true;
+      } catch (_) {
+        created = false;
+      }
+      if (created) {
+        _heldLockPath = lockPath;
+        return null;
+      }
       if (await lockFile.exists()) {
         final raw = (await lockFile.readAsString()).trim();
         final parts = raw.split(RegExp(r'\s+'));
@@ -1012,6 +1047,9 @@ class WorkspaceController extends ChangeNotifier {
       }
       // 跨目录 move 时自动建父目录；同目录 rename 不需要。
       await Directory(p.dirname(newAbs)).create(recursive: true);
+      // R2-UI1：建后二次复检——检查→create窗口父链被换成外链时，
+      // create在区外建目录且rename移出区外。现不通过即中止。
+      if (!_insideAfterRealpath(root, newAbs)) return null;
       if (type == FileSystemEntityType.directory) {
         await Directory(oldAbs).rename(newAbs);
       } else if (type == FileSystemEntityType.file) {
@@ -1064,6 +1102,13 @@ class WorkspaceController extends ChangeNotifier {
     final root = _rootPath;
     if (root == null || absolutePaths.isEmpty) return const [];
     final deletedRel = <String>[];
+    // R3-03：UI 删除同样走回收站。此前 Directory.delete(recursive:true) 永久删除，
+    // 与 AgentTools._delete（回收站）口径不一致，误删不可恢复。
+    final trashDir = Directory(p.join(root, '.my_ide', 'trash'));
+    try {
+      await trashDir.create(recursive: true);
+    } catch (_) {}
+    final stamp = DateTime.now().millisecondsSinceEpoch;
     for (final raw in absolutePaths) {
       final abs = p.normalize(raw);
       if (!p.isWithin(root, abs) && abs != root) continue;
@@ -1077,10 +1122,72 @@ class WorkspaceController extends ChangeNotifier {
       }
       try {
         final type = FileSystemEntity.typeSync(abs, followLinks: false);
+        final destBase =
+            '${stamp}_${pid}_${_rng.nextInt(1 << 32).toRadixString(36)}_${p.basename(abs)}';
+        Future<String> uniqueDest() async {
+          var dest = p.join(trashDir.path, destBase);
+          var i = 0;
+          while (await File(dest).exists() ||
+              await Directory(dest).exists() ||
+              await Link(dest).exists()) {
+            i++;
+            dest = p.join(trashDir.path, '${stamp}_${i}_${p.basename(abs)}');
+          }
+          return dest;
+        }
+
         if (type == FileSystemEntityType.directory) {
-          await Directory(abs).delete(recursive: true);
+          // 链接本身不跟随：rename 链接本体进回收站，不删目标。
+          // 跨盘 rename 失败回退拷贝+删除（与 AgentTools._moveToTrash 同口径）。
+          // R2-A6 回退校验：拷贝不完整即不删源，此前半截亦删源致丢数据。
+          final dest = await uniqueDest();
+          try {
+            await Directory(abs).rename(dest);
+          } catch (_) {
+            await Directory(dest).create(recursive: true);
+            var copyOk = true;
+            try {
+              await for (final child in Directory(
+                abs,
+              ).list(recursive: true, followLinks: false)) {
+                if (child is Link) continue;
+                final rel = p.relative(child.path, from: abs);
+                final target = p.join(dest, rel);
+                if (child is Directory) {
+                  await Directory(target).create(recursive: true);
+                } else if (child is File) {
+                  await File(target).parent.create(recursive: true);
+                  await File(child.path).copy(target);
+                }
+              }
+            } catch (_) {
+              copyOk = false;
+            }
+            if (copyOk) {
+              try {
+                await Directory(abs).delete(recursive: true);
+              } catch (_) {}
+            }
+          }
         } else if (type == FileSystemEntityType.file) {
-          await File(abs).delete();
+          final dest = await uniqueDest();
+          try {
+            await File(abs).rename(dest);
+          } catch (_) {
+            // R2-A6 同上：拷贝失败不删源。
+            try {
+              await File(abs).copy(dest);
+              await File(abs).delete();
+            } catch (_) {}
+          }
+        } else if (type == FileSystemEntityType.link) {
+          // 链接本身进回收站：此前 else 分支直接跳过，UI 删链接无效果。
+          final dest = await uniqueDest();
+          try {
+            await Link(abs).rename(dest);
+          } catch (_) {
+            await Link(abs).delete();
+          }
         } else {
           continue;
         }
@@ -1130,8 +1237,17 @@ class WorkspaceController extends ChangeNotifier {
     final imported = <String>[];
     for (final raw in sourcePaths) {
       if (raw.isEmpty) continue;
-      final entityType = FileSystemEntity.typeSync(raw, followLinks: false);
-      if (entityType == FileSystemEntityType.notFound) continue;
+      // 外链入口即跳过：文件/目录 symlink 不跟随，防区外内容落地工作区。
+      FileSystemEntityType entityType;
+      try {
+        entityType = FileSystemEntity.typeSync(raw, followLinks: false);
+      } catch (_) {
+        continue;
+      }
+      if (entityType == FileSystemEntityType.link ||
+          entityType == FileSystemEntityType.notFound) {
+        continue;
+      }
       final name = p.basename(raw);
       if (name.isEmpty || name == '.' || name == '..') continue;
       // 拖拽同样拦敏感名：此 dropping .git/hooks/post-checkout 此前可落地执行。
@@ -1151,6 +1267,9 @@ class WorkspaceController extends ChangeNotifier {
           await target.parent.create(recursive: true);
           await src.copy(dest);
           imported.add(p.relative(dest, from: root));
+        } else {
+          // 其他类型一律跳过。
+          continue;
         }
       } catch (_) {
         // 单个失败继续
@@ -1187,6 +1306,7 @@ class WorkspaceController extends ChangeNotifier {
   Future<void> _copyDirectory(Directory src, Directory dest) async {
     if (p.equals(src.path, dest.path)) return;
     // 递归同样拦敏感名：顶层只拦了入口名，子目录含 .git/hooks 等此前可落地。
+    // 外链同样跳过：src 内 symlink 此前跟随复制，/etc 链接文件可落地工作区。
     final root = _rootPath;
     if (root != null) {
       final rel = p.isWithin(root, dest.path)
@@ -1196,6 +1316,15 @@ class WorkspaceController extends ChangeNotifier {
     }
     await dest.create(recursive: true);
     await for (final entity in src.list(recursive: false, followLinks: false)) {
+      // 外链不跟随：目录/文件 symlink 一律跳过，防区外内容落地工作区。
+      try {
+        if (FileSystemEntity.typeSync(entity.path, followLinks: false) ==
+            FileSystemEntityType.link) {
+          continue;
+        }
+      } catch (_) {
+        continue;
+      }
       final name = p.basename(entity.path);
       final next = p.join(dest.path, name);
       if (entity is Directory) {
@@ -1261,6 +1390,48 @@ class WorkspaceController extends ChangeNotifier {
       _selectedPath = next.path;
     }
 
+    notifyListeners();
+    scheduleSessionPersist();
+  }
+
+  /// 页面标签页固定路径：同一时刻一个"当前页面"标签，Agent 每次打开即更新它。
+  static const browserTabPath = 'browser:page';
+
+  /// Agent 唤起页面标签页（Trae 式"打开即看"）：browser_open 成功后由
+  /// shell 经 BrowserService.pageOpened 调入。同路径更新 URL/标题并激活。
+  void openBrowserTab(String url) {
+    final clean = url.trim();
+    if (clean.isEmpty) return;
+    var name = clean;
+    try {
+      final uri = Uri.parse(clean);
+      final host = uri.host.isEmpty ? uri.scheme : uri.host;
+      name = host.isEmpty
+          ? clean
+          : '$host${uri.path == '/' || uri.path.isEmpty ? '' : uri.path}';
+    } catch (_) {}
+    if (name.length > 40) name = '${name.substring(0, 40)}…';
+    final idx = _tabs.indexWhere((t) => t.path == browserTabPath);
+    if (idx >= 0) {
+      _tabs[idx] = OpenEditorTab(
+        path: browserTabPath,
+        name: name,
+        kind: FileKind.browser,
+        isDirty: false,
+        url: clean,
+      );
+    } else {
+      _tabs.add(
+        OpenEditorTab(
+          path: browserTabPath,
+          name: name,
+          kind: FileKind.browser,
+          url: clean,
+        ),
+      );
+    }
+    _activePath = browserTabPath;
+    _selectedPath = browserTabPath;
     notifyListeners();
     scheduleSessionPersist();
   }

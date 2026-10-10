@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
@@ -22,6 +23,7 @@ class SkillManager extends ChangeNotifier {
   static const _disabledKey = 'skills.disabledIds';
   static const _extraGlobalDirsKey = 'skills.extraGlobalDirs';
   static const _enabledSourcesKey = 'skills.enabledSources';
+  static final _tmpRand = Random.secure();
 
   /// 可开关的来源 id → 相对/逻辑路径。
   static const Map<String, String> knownSourceIds = {
@@ -56,10 +58,30 @@ class SkillManager extends ChangeNotifier {
 
   bool isEnabled(AgentSkill skill) => !_disabledIds.contains(skill.id);
 
+  Future<void>? _loadFuture;
+
   Future<void> ensureLoaded({
     String? workspaceRoot,
     bool forceRefresh = false,
-  }) async {
+  }) {
+    // 轮次1：首次加载挂起期间并发调用——此前 _loaded 已同步置 true，
+    // 并发方直接返回未加载的空 skills 列表。现合并返回在途 future。
+    final inFlight = _loadFuture;
+    if (inFlight != null && !forceRefresh) return inFlight;
+    final f = _ensureLoadedInner(workspaceRoot, forceRefresh);
+    _loadFuture = f;
+    // 完成后清占位：下一次 rootChanged/forceRefresh 触发新加载。
+    // ignore: unawaited_futures
+    f.whenComplete(() {
+      if (identical(_loadFuture, f)) _loadFuture = null;
+    });
+    return f;
+  }
+
+  Future<void> _ensureLoadedInner(
+    String? workspaceRoot,
+    bool forceRefresh,
+  ) async {
     final first = !_loaded;
     if (first) {
       _loaded = true;
@@ -143,6 +165,10 @@ class SkillManager extends ChangeNotifier {
   Future<void> refresh() async {
     final found = <AgentSkill>[];
     final seenDirs = <String>{};
+    // 轮次1：多源失败错误累积——此前 _lastError 只保留最后一个来源的
+    // 失败，前序错误被覆盖；成功时旧错误也不清理。现逐源收集，
+    // 刷新结束统一落 _lastError（成功即清）。
+    final errors = <String>[];
 
     Future<void> scanRoot(
       String root,
@@ -152,10 +178,28 @@ class SkillManager extends ChangeNotifier {
       final normalized = p.normalize(root);
       if (!seenDirs.add(normalized)) return;
       final dir = Directory(normalized);
+      // 扫描上限 200 目录：用户 skills 目录被塞文件时无界 list 即卡 UI。
+      // R7-链接/路径门禁：scanRoot 走外部目录时此前 followLinks:false 仅禁
+      // 顶层链接，顶层目录本身是链接（custom:$extra 指到 /etc）仍展开扫描。
+      // 现顶层先判 link，链接即拒扫（与写侧 _isWriteLinkTarget 同口径）。
+      try {
+        if (FileSystemEntity.typeSync(normalized, followLinks: false) ==
+            FileSystemEntityType.link) {
+          errors.add('跳过链接技能目录 $sourceLabel');
+          return;
+        }
+      } catch (_) {}
+      var seen = 0;
       if (!await dir.exists()) return;
       try {
         await for (final entity in dir.list(followLinks: false)) {
+          // 顶层链接（目录/文件）一律不展开也不加载，记录跳过原因便于排查。
+          if (entity is Link) {
+            errors.add('跳过链接技能目录 $sourceLabel/${p.basename(entity.path)}');
+            continue;
+          }
           if (entity is! Directory) continue;
+          if (++seen > 200) break;
           final skill = await _tryLoadSkillDir(
             entity,
             scope: scope,
@@ -164,7 +208,7 @@ class SkillManager extends ChangeNotifier {
           if (skill != null) found.add(skill);
         }
       } catch (e) {
-        _lastError = '扫描 $sourceLabel 失败：$e';
+        errors.add('扫描 $sourceLabel 失败：$e');
       }
     }
 
@@ -229,6 +273,7 @@ class SkillManager extends ChangeNotifier {
       ..clear()
       ..addAll(byName.values.toList()
         ..sort((a, b) => a.name.compareTo(b.name)));
+    _lastError = errors.isEmpty ? null : errors.join('\n');
     notifyListeners();
   }
 
@@ -264,6 +309,14 @@ class SkillManager extends ChangeNotifier {
     required String sourceLabel,
   }) async {
     try {
+      // 大文件门禁：SKILL.md 先 stat，超 1MB 即拒载（8000 截断在拼接后，
+      // 无门禁时大文件全量进内存可 OOM）。
+      try {
+        if (await file.length() > 1024 * 1024) {
+          debugPrint('Skill too large, skip ${file.path}');
+          return null;
+        }
+      } catch (_) {}
       final raw = await file.readAsString();
       final parsed = SkillMdParser.parse(
         raw,
@@ -329,12 +382,63 @@ class SkillManager extends ChangeNotifier {
 
   /// `/skill-name` 硬路由：用户消息以 / 开头时解析 skill 名。
   /// 返回 null 表示不是 skill 调用；返回 '' 表示格式错误（只有 /）。
+  /// 第6轮R6-3：路由正则含下划线——此前[A-Za-z0-9-]+在下划线处截断，
+  /// /foo_bar误路由到foo调起完全错误的skill。磁盘已存在下划线名时须完整解析，
+  /// 找不到再由调用方判空（不放宽导入校验，只修截断误路由）。
   static String? parseSkillRoute(String userText) {
     final text = userText.trimLeft();
     if (!text.startsWith('/')) return null;
-    final match = RegExp(r'^/([A-Za-z0-9-]+)').firstMatch(text);
+    final match = RegExp(r'^/([A-Za-z0-9_-]+)').firstMatch(text);
     if (match == null) return '';
     return match.group(1);
+  }
+
+  /// allowed-tools 别名映射：Read/Edit/Bash 等常见别名 → 标准工具名。
+  /// allowedToolNames 与 normalizeToolToken 共用，保证校验口径一致。
+  static const _toolAliases = <String, String>{
+    'read': 'read_file',
+    'edit': 'edit_file',
+    'patch': 'apply_patch',
+    'apply': 'apply_patch',
+    'write': 'write_file',
+    'delete': 'delete_file',
+    'move': 'move_file',
+    'rename': 'move_file',
+    'mkdir': 'make_dir',
+    'copy': 'copy_file',
+    'list': 'list_files',
+    'search': 'search_text',
+    'semantic': 'semantic_search',
+    'repomap': 'repo_map',
+    'definition': 'lsp_definition',
+    'references': 'lsp_references',
+    'hover': 'lsp_hover',
+    'fetch': 'fetch_url',
+    'web': 'fetch_url',
+    'todo': 'todo_write',
+    'todos': 'todo_write',
+    'task': 'todo_write',
+    'bash': 'run_command',
+    'terminal': 'terminal_write',
+    'question': 'ask_question',
+    'subagent': 'spawn_subagent',
+    'skill': 'load_skill',
+  };
+
+  /// allowed-tools 单 token 归一化（共享纯函数）：剥括号限定由调用方处理，
+  /// 此处做小写 + 别名映射；mcp__ 工具名保留原始大小写（服务端大小写敏感），
+  /// 限定符内含斜杠/点/空格时返回 null（调用方跳过）。空 token 与 `*` 返回 null。
+  static String? normalizeToolToken(String raw) {
+    final t = raw.trim();
+    if (t.isEmpty || t == '*') return null;
+    if (t.toLowerCase().startsWith('mcp__')) {
+      // 限定符内斜杠/点/空格直接拒：`mcp__a/b` 经 ToolRegistry 前缀匹配
+      // 可穿透到未授权 server，此前仅判前缀即收录。
+      if (t.contains('/') || t.contains('.') || t.contains(' ')) return null;
+      return t;
+    }
+    final lower = t.toLowerCase();
+    return _toolAliases[lower] ?? lower;
   }
 
   /// allowed-tools 解析为标准工具名集合；null 表示不限制。
@@ -345,35 +449,6 @@ class SkillManager extends ChangeNotifier {
     final skill = findByName(skillName);
     final raw = skill?.allowedTools?.trim();
     if (skill == null || raw == null || raw.isEmpty) return null;
-    const aliases = <String, String>{
-      'read': 'read_file',
-      'edit': 'edit_file',
-      'patch': 'apply_patch',
-      'apply': 'apply_patch',
-      'write': 'write_file',
-      'delete': 'delete_file',
-      'move': 'move_file',
-      'rename': 'move_file',
-      'mkdir': 'make_dir',
-      'copy': 'copy_file',
-      'list': 'list_files',
-      'search': 'search_text',
-      'semantic': 'semantic_search',
-      'repomap': 'repo_map',
-      'definition': 'lsp_definition',
-      'references': 'lsp_references',
-      'hover': 'lsp_hover',
-      'fetch': 'fetch_url',
-      'web': 'fetch_url',
-      'todo': 'todo_write',
-      'todos': 'todo_write',
-      'task': 'todo_write',
-      'bash': 'run_command',
-      'terminal': 'terminal_write',
-      'question': 'ask_question',
-      'subagent': 'spawn_subagent',
-      'skill': 'load_skill',
-    };
     final out = <String>{};
     for (final token in raw.split(RegExp(r'[\s,;|]+'))) {
       var t = token.trim();
@@ -381,17 +456,12 @@ class SkillManager extends ChangeNotifier {
       if (t == '*') return null;
       // 去掉 Bash(git:*) 这类括号限定
       final paren = t.indexOf('(');
-      if (paren >= 0) t = t.substring(0, paren);
-      t = t.trim();
-      if (t.isEmpty || t == '*') return null;
-      if (t.toLowerCase().startsWith('mcp__')) {
-        // MCP 工具名大小写敏感：保留原始大小写。
-        out.add(t);
-        continue;
-      }
-      final lower = t.toLowerCase();
-      final mapped = aliases[lower] ?? lower;
-      out.add(mapped);
+      if (paren >= 0) t = t.substring(0, paren).trim();
+      if (t.isEmpty) continue;
+      if (t == '*') return null;
+      final norm = normalizeToolToken(t);
+      if (norm == null) continue;
+      out.add(norm);
     }
     return out;
   }
@@ -409,6 +479,10 @@ class SkillManager extends ChangeNotifier {
     'apply_patch',
     'todo_write',
     'fetch_url',
+    'git_status',
+    'git_diff',
+    'git_preflight',
+    'git_blame',
     'lsp_hover',
     'lsp_definition',
     'lsp_references',
@@ -432,6 +506,38 @@ class SkillManager extends ChangeNotifier {
     'mcp_read_resource',
     'mcp_list_prompts',
     'mcp_get_prompt',
+    'browser_open',
+    'browser_read',
+    'browser_snapshot',
+    'browser_eval',
+    'browser_click',
+    'browser_fill',
+    'browser_console',
+    'browser_network',
+    'browser_screenshot',
+    'browser_reload',
+    'browser_status',
+    'browser_targets',
+    'browser_switch',
+    // B6-01 定位模拟写工具：白名单补齐，否则 validateAllowedTools 误报未知。
+    'browser_geolocate',
+    // R4 新浏览器工具：白名单补齐。
+    'browser_viewport',
+    'browser_user_agent',
+    'browser_close_target',
+    'browser_go_back',
+    'browser_stop_loading',
+    'browser_wait_network_idle',
+    'browser_drag',
+    'browser_select',
+    'browser_upload',
+    'browser_press',
+    'browser_scroll',
+    'browser_hover',
+    'browser_dialog',
+    'browser_download_dir',
+    'browser_wait',
+    'browser_frames',
   };
 
   /// 校验 skill 的 allowed-tools：返回不在白名单的未知工具名。
@@ -487,13 +593,36 @@ class SkillManager extends ChangeNotifier {
       buf.writeln('…（正文已按预算截断到 $bodyBudget 字符，可按需 read_file 读取 SKILL.md 全文）');
     }
     // 列出附属文件，便于模型用 read_file 继续加载
+    // TrustFall/SymJack 对齐：附属文件仅列常规文本扩展名，sh/js/py/bin 等
+    // 可执行与外链目标不直接暴露执行路径，模型仍需经 read_file/审批读取。
     try {
       final dir = Directory(skill.directoryPath);
       final extras = <String>[];
+      // 枚举上限500：恶意skill万级文件时recursive全量卡UI，够展示即停。
+      var scanned = 0;
+      var truncated = false;
       await for (final e in dir.list(recursive: true, followLinks: false)) {
+        if (++scanned > 500) {
+          truncated = true;
+          break;
+        }
         if (e is! File) continue;
         final rel = p.relative(e.path, from: skill.directoryPath);
         if (rel == 'SKILL.md' || rel == 'skill.md') continue;
+        final ext = p.extension(rel).toLowerCase();
+        if (const {
+          '.sh',
+          '.bash',
+          '.zsh',
+          '.py',
+          '.js',
+          '.exe',
+          '.bat',
+          '.ps1',
+          '.bin',
+        }.contains(ext)) {
+          continue;
+        }
         extras.add(rel);
       }
       if (extras.isNotEmpty) {
@@ -503,7 +632,13 @@ class SkillManager extends ChangeNotifier {
         for (final f in extras.take(40)) {
           buf.writeln('- ${p.join(skill.directoryPath, f)}');
         }
+        // R6-T3：500截断可观测——此前静默丢文件，模型以为已列全。
+        if (truncated) buf.writeln('- …（附属文件过多，仅列前500项）');
         buf.writeln('说明：工作区外的 skill 附属文件请用绝对路径 read_file（需审批）。');
+      } else if (truncated) {
+        // R6-T3同口径：无文本附属但扫描截断同样告警。
+        buf.writeln();
+        buf.writeln('附属文件过多，仅列前500项。');
       }
     } catch (_) {}
     return SkillLoadResult(ok: true, body: buf.toString());
@@ -534,12 +669,48 @@ class SkillManager extends ChangeNotifier {
   }
 
   Future<void> addExtraGlobalDir(String path) async {
-    final normalized = p.normalize(path.trim());
-    if (normalized.isEmpty) return;
+    // R7-K1：外部目录门禁——此前仅normalize即落盘，../可穿越、超长可撑prefs。
+    final raw = path.trim();
+    if (raw.isEmpty || raw.length > 1024) return;
+    // 轮次1：按路径分段判断穿越——此前 contains('..') 子串判断，
+    // 合法路径（如 /Users/a..b/skills）被误拒。
+    if (_hasDotDotSegment(raw)) return;
+    final normalized = p.normalize(raw);
+    if (normalized.isEmpty ||
+        normalized == '.' ||
+        _hasDotDotSegment(normalized) ||
+        !p.isAbsolute(normalized)) {
+      return;
+    }
     if (_extraGlobalDirs.contains(normalized)) return;
     _extraGlobalDirs.add(normalized);
     await _persistExtraDirs();
     await refresh();
+  }
+
+  /// 轮次1：'..' 路径分段判定（测试可见，与子串 contains 区分合法路径）。
+  static bool hasDotDotSegmentForTest(String path) => _hasDotDotSegment(path);
+
+  static bool _hasDotDotSegment(String path) {
+    for (final seg in path.split('/')) {
+      if (seg == '..') return true;
+    }
+    return false;
+  }
+
+  /// 测试可见：R7-K1 门禁纯判定。
+  static bool isSafeExtraGlobalDirForTest(String raw) {
+    final t = raw.trim();
+    if (t.isEmpty || t.length > 1024) return false;
+    if (_hasDotDotSegment(t)) return false;
+    final normalized = p.normalize(t);
+    if (normalized.isEmpty ||
+        normalized == '.' ||
+        _hasDotDotSegment(normalized) ||
+        !p.isAbsolute(normalized)) {
+      return false;
+    }
+    return true;
   }
 
   Future<void> removeExtraGlobalDir(String path) async {
@@ -584,6 +755,17 @@ class SkillManager extends ChangeNotifier {
             !p.isWithin(p.normalize(root), p.normalize(dest.path)))) {
       throw StateError('skill 目标路径越界，已拒绝导入');
     }
+    // 轮次1：src==dest（用户在文件选择器中选中应用全局目录内已存在的
+    // 同名 skill 目录）此前先递归删 dest（=源）再拷已删源必抛错，
+    // skill 数据全丢且无回滚。已在位：跳过删除与拷贝直接刷新加载。
+    if (p.equals(p.normalize(src.path), p.normalize(dest.path))) {
+      await refresh();
+      final existing = findByName(parsed.name);
+      if (existing == null) {
+        throw StateError('导入后未能加载 skill「${parsed.name}」');
+      }
+      return existing;
+    }
     if (await dest.exists()) {
       await dest.delete(recursive: true);
     }
@@ -617,7 +799,13 @@ class SkillManager extends ChangeNotifier {
       await dest.create(recursive: true);
     }
     final skillFile = File(p.join(dest.path, 'SKILL.md'));
-    final tmp = File('${skillFile.path}.${DateTime.now().microsecondsSinceEpoch}.tmp');
+    // 第5轮收敛：tmp 命名加随机后缀——此前仅微秒戳，同微秒并发导入同名 skill
+    // 即互盖侧车。对齐 checkpoint/workspace_fs 原子写 nonce 口径。
+    // 来源 Agent Skills 导入并发安全（openclaw skills install 同类语义）。
+    final rand = _tmpRand.nextInt(1 << 32).toRadixString(36);
+    final tmp = File(
+      '${skillFile.path}.${DateTime.now().microsecondsSinceEpoch}-$rand.tmp',
+    );
     await tmp.writeAsString(raw, flush: true);
     try {
       await tmp.rename(skillFile.path);
@@ -639,6 +827,16 @@ class SkillManager extends ChangeNotifier {
     await dest.create(recursive: true);
     await for (final entity in src.list(recursive: false, followLinks: false)) {
       final name = p.basename(entity.path);
+      // 导入跳过外链：copy 语义跟随外链会把区外文件拷入 skills，
+      // 此前 Directory/File 分支按实体类型仍会拷贝外链目标内容。
+      try {
+        if (FileSystemEntity.typeSync(entity.path, followLinks: false) ==
+            FileSystemEntityType.link) {
+          continue;
+        }
+      } catch (_) {
+        continue;
+      }
       if (entity is Directory) {
         await _copyDir(entity, Directory(p.join(dest.path, name)));
       } else if (entity is File) {
@@ -715,11 +913,16 @@ class SkillManager extends ChangeNotifier {
           .toList();
       final known = knownTools ?? knownToolNames;
       for (final t in tools) {
-        final base = t.contains('(') ? t.substring(0, t.indexOf('(')) : t;
-        final lower = base.trim().toLowerCase();
-        if (lower.isEmpty || lower == '*') continue;
-        if (lower.startsWith('mcp__')) continue;
-        if (!known.contains(lower)) out.add('allowed-tools 未知项：$t');
+        var base = t;
+        if (base.contains('(')) {
+          base = base.substring(0, base.indexOf('('));
+        }
+        // 归一化套用与 allowedToolNames 相同的别名表：read/bash 等
+        // 合法别名不再误报未知项。
+        final norm = normalizeToolToken(base);
+        if (norm == null) continue;
+        if (norm.startsWith('mcp__')) continue;
+        if (!known.contains(norm)) out.add('allowed-tools 未知项：$t');
       }
     }
     if (parsed.warning != null && parsed.warning!.isNotEmpty) {
@@ -729,8 +932,10 @@ class SkillManager extends ChangeNotifier {
   }
 
   /// 生成 skill 模板文本：含 frontmatter + 正文骨架。
+  /// R15R3：模板去 TODO 占位——此前正文含 TODO，Agent 经 load_skill
+  /// 可直接注入半成品指令。现给可用最小骨架，无 TODO 即投产。
   static String skillTemplate(String name) {
     final n = name.trim().isEmpty ? 'my-skill' : name.trim();
-    return '---\nname: $n\ndescription: TODO 一句话描述该 skill 的用途\nallowed-tools: read_file, edit_file\n---\n\n# $n\n\n## 用法\n\n- TODO 补充触发条件与步骤\n';
+    return '---\nname: $n\ndescription: 一句话描述该 skill 的用途\nallowed-tools: read_file, edit_file\n---\n\n# $n\n\n## 用法\n\n- 补充触发条件与步骤\n';
   }
 }

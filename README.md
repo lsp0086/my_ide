@@ -7,21 +7,19 @@
 ## 版本更新
 
 ### 1.0.5
-- **Agent 与审批**：只读批取消感知收集（50ms复检早退，未收集回中断占位）；写/命令/终端审批后执行前取消复检；预算计入子Agent输出；多模态裁剪跳过List结构；`todo_write`同id冲突盘上优先+判脏加size维度；切换项目运行时会话保持
-- **写冲突与文件安全**：搜索上下文回读钳制审批目录内；删除预览/复制源端/回收站恢复补link检查；后台冲突目录级前缀匹配
-- **MCP**：安装目录删除收敛到应用托管根（`~/.cache/my_ide/mcp-installs`下两层），系统前缀与HOME缺失fail-closed
+- **Agent 与审批**：只读并行 + 写串行调度、审批后复检；会话/排队/规则分桶与 glob 通配、追问轮末续轮；子 Agent 按步聚合与整批超时，超时按 spawnId 精确取消；token 增量入账防双计；审批超时/拒绝/取消三口径可区分（超时可重试）；untrusted 外联及网络命令恒提级；429 按 Retry-After、5xx 指数退避；命令重定向分区；MCP 敏感兜底、日志打码、导出去 token、毒配置持久化禁用；三档沙箱 + Docker 包装（镜像可配）；hook sha256 钉死并记审计行；cron 分桶与固定频率；用量 NaN/Infinity 钳制
+- **文件安全与版本**：拒链接/越界 + 乐观锁 + 提交期重读；同文件写串行；journal/manifest fail-closed、GC 不误删 live；恢复拒绝覆盖未记录改动，失败回滚按提交前字节；大文件直通 + 版本 diff 贪心防 OOM；对话图片限 5 种位图（魔数 + 8MB）；轨迹导出含子 Agent；补丁说明支持 Conventional Commits 校验；WebDAV 密码与设置写盘串行防撕裂
+- **自研浏览器**：30 工具 + SSRF 校验；click/fill 走 Input 域、select/fill 统一 base64；wait_for 显式等待防 SPA 空骨架；上传/下载工作区门禁防 TOCTOU；Chrome 退出同步关 CDP；弹窗按子会话路由；控制台脱敏与敏感 query 掩码；iframe 穿透查询、evaluate 超时终止；click/hover 遮挡检查；视口/UA 模拟；连接世代防串扰，资源释放有界
+- **编辑器与诊断**：大文件窗口化；诊断 gutter 不在布局期 setState；快捷键落盘；粘贴图片先判大小；本地检查 + LSP 合并（JSON 偏移映射、行列钳制、非法 glob 回空）；终端 unset 全分隔符检出；密钥与日志脱敏补全（含审计行）
 
 ### 1.0.4
-- **版本管理**：手动保存记 `user-edit` 并挂气泡；版本页只看红绿行；支持单块/单文件/整轮回退；超 3 文件折叠；Restore 前自动记现场可 Redo；二进制纳入快照；版本库损坏直接报错；补记漂移与防抖版本；checkpoint 附 git 状态；回滚/快照恢复全走原子写；drop 持锁防并发（回退借位重入）；manifest 备份经 `.new` 原子转正；快照跳过口径对齐；恢复提交前复检；侧车名加随机
-- **写冲突与崩溃恢复**：写盘前查脏缓冲，保存前比 mtime 转冲突抉择，手动保存同样走冲突门禁 + 覆盖二次确认；每批次写 journal，重启恢复中断；脏编辑器定时落盘；落盘失败标 dirty 重试 + 退出 flush；随机侧车名原子写（含编辑器手动保存）；落盘前二次复检；乐观锁 + 后台冲突确认；快照超限强制确认；空白 `oldText` 直接拒绝防文件头误插；补丁同文件按绝对路径去重、提交重读限 1MB；移动/写/改预览补链检查；todos 侧车加随机；回收站命名加 pid/随机、恢复剥离对齐防错位
-- **Agent 与审批**：状态驱动 + 审批队列串行，超时按项移除，取消级联；子 Agent 按实例隔离、世代丢弃（含 progress 回调隔离）、同批并发不误拒，用量计入预算熔断（新轮按在途重建预占防空窗，子预算加回工具输出防低估）；只读可并行、写串行，超时熔断回填占位，只读批取消即回中断，重复 tool_call.id 首个 wins；`todo_write` 禁 Chat/Plan 落盘；安全命令本轮信任 + 自动审批规则；命令沙箱分词判定，终端状态变更强制再审；统一进程树管理；敏感路径永拒；密钥 v3 随机 nonce；docker 去硬编码用户；命令气泡随对话落盘；运行中会话锁定，回退/删除/清空/并发压缩在运行中拒绝；历史提级含压缩摘要与命令输出；中途裁剪扩至正文大段
-- **MCP / Skills / 规则**：MCP 内置 stdio/Streamable HTTP，三级审批与开关，resources/prompts 聚合为只读工具，工具聚合快照遍历防并发修改，重连加代际防禁用后复活；响应加 deadline/超时/内存上限（截断 + 节流）；Skills 兼容 SKILL.md，多源发现 + 硬路由，导入加名称规范与路径越界门禁、外链删除拦截、SKILL.md 原子写；子代理只读派生；`AGENTS.md` 每轮注入；composer 模板 chip；会话可分叉；`mcp_get_prompt` 支持带参；项目规则按改动文件自动挂载
-- **多窗口与外部打开**：原生多窗口 + 新进程直达项目；双锁防重复打开，对话运行中锁回退/删除/清空；支持 Finder/Dock 拖入；标签/活动态持久化，启动重开最近项目；工作区 dispose 后在途监听不再刷 UI
-- **模型与上下文**：OpenAI Responses（复用 + `web_search`/`code_interpreter`），兼容 Azure 与自定义头/参数；图片多模态，落盘为 `chat_assets` 引用；每轮记耗时/stopReason/token；超预算滚动压缩；请求加 deadline
-- **搜索/诊断/LSP**：`search_text` 重排；新增 `repo_map`/`semantic_search`/`lsp_definition`/`lsp_references` 只读工具并可并行；问题面板一键"AI 修复"；LSP 修截断、didChange 真节流合并、防僵尸连接、订阅取消 await，Windows 适配，支持自定义服务；外部 lint 聚合并做参数隔离与截断；诊断统一标不可信并提级；结构化日志
-- **编辑器**：大文件窗口化只读，支持"加载全部"/局部编辑两种放行路径
-- **发布**：Windows 打包改 `pwsh` 原生压缩，不再经 bash 调 powershell；CI 沿用三端 analyze + 全量测试
-- **其他**：贡献统计热力图；外部内容 UNTRUSTED_DATA 围栏 + 审批提级，`fetch_url` 限私网/元数据地址；WebDAV 恢复加版本校验、MCP 命令白名单、审批值白名单、skills 路径穿越过滤
+- **版本与恢复**：完善用户/AI 编辑快照、单块/单文件/整轮回退、Redo、二进制快照、Git 状态记录与损坏校验；回滚、快照和 manifest 均采用原子写与并发保护。
+- **写入安全与崩溃恢复**：增加脏缓冲/mtime/后台修改冲突确认、乐观锁、补丁与链接校验、journal 中断恢复、定时落盘重试、回收站及 todos 侧车安全处理。
+- **Agent、审批与子 Agent**：审批队列、取消级联、超时熔断、只读并行/写串行、预算控制、命令沙箱、终端状态复审、敏感路径保护、运行中会话锁及外部内容提级。
+- **MCP、Skills 与规则**：支持 stdio/Streamable HTTP、resources/prompts、三级审批、超时限流、SKILL.md 多源发现与硬路由、路径/外链校验、子代理只读派生，以及每轮注入 `AGENTS.md`。
+- **窗口、模型与上下文**：支持多窗口、项目去重锁、Finder/Dock 拖入、Responses/Azure/自定义协议、图片引用、多模态、token 统计、请求 deadline 与上下文压缩。
+- **搜索、诊断与编辑器**：新增 repo map、语义搜索、LSP 定义/引用等并行只读工具；完善诊断、外部 lint、问题修复入口、大文件窗口化编辑及结构化日志。
+- **发布与其他**：Windows 改用 `pwsh` 原生打包，CI 保持三端检查；补充 WebDAV 版本校验、贡献统计、UNTRUSTED_DATA 围栏、私网限制及密钥/路径安全。
 
 ### 1.0.3
 - 新增 **代码完整性 / 行号正确性检查**：本地括号与引号检查，JSON 可解析校验；统一 0-based 行号与文档版本失效
@@ -71,7 +69,8 @@
 - 供应商协议：默认 OpenAI 兼容；可切换 Anthropic Messages；新增 OpenAI Responses（`previous_response_id` 多轮复用、内置 `web_search` / `code_interpreter`）；兼容 Azure（`api-key` 头）与自定义请求头
 - 配置 Base URL / Token（Anthropic 为 x-api-key）、拉取模型、上下文长度、思考档位、模型自定义参数（表格每行一对 key/value，均非空才保存）
 - **Chat**：普通对话；**Agent**：可读写工作区文件、搜索、执行命令（高危操作需审批）；`spawn_subagent` 可派生独立只读子 Agent 执行调研任务
-- 操作审批：区内写/区外写/删除/命令/MCP 五档全局 + 逐工具·路径自动审批规则（deny 优先），审批队列串行，取消级联子 Agent 与命令
+- **自研浏览器（Agent 专属）**：无侧栏、无独立页面，只能由 Agent 经 `browser_*` 30 工具调用；`browser_open` 打开页面即在编辑器区唤起"页面标签页"（复用 headless Chrome 的 CDP `Page.startScreencast` 帧流渲染，零原生依赖），交互（点击/输入/eval/刷新/切页）全部由 Agent 执行（默认自动审核，输出标untrusted）
+- 操作审批：区内写/区外写/删除/命令/浏览器/抓取/区外读/MCP 八档全局（默认除删除文件外全部自动审核）+ 逐工具·路径自动审批规则（deny 优先），审批队列串行，取消级联子 Agent 与命令
 - 流式输出、思考内容展开、Markdown 渲染
 - 多会话切换；粘贴图片（支持 vision 的模型按多模态发送，气泡缩略展示）；每轮记录耗时与终止原因
 - 请求失败可按设置静默重试；上下文过长时自动压缩；对话本地 gzip 落盘，图片存 `.my_ide/chat_assets` 独立文件
@@ -79,7 +78,7 @@
 ### MCP 与 Skills
 - **MCP**：内置 stdio / Streamable HTTP 协议，可增删配置，按工具设只读/可写/网络三级审批与开关；resources/prompts 聚合为只读 Agent 工具（输出标 untrusted，可并行）
 - **Skills**：兼容开源 Agent Skills（SKILL.md），多源自动发现，启用/禁用，`/skill-name` 硬路由
-- **规则**：工作区根 `AGENTS.md` 每轮注入（8K 截断）；**模板**：composer"模板" chip，内置 + 项目 `.my_ide/prompts/*.md`（`{{input}}` 占位）；**分叉**：从指定消息截断复制为新会话
+- **规则**：工作区根 `AGENTS.md` 每轮注入（8K 截断，缺失回退 `CLAUDE.md`/`.cursorrules`/`.windsurfrules`首个存在者）；**模板**：composer"模板" chip，内置 + 项目 `.my_ide/prompts/*.md`（`{{input}}` 占位）；**分叉**：从指定消息截断复制为新会话
 
 ### 统计
 - 侧栏 GitHub 风格贡献热力图：按日聚合对话轮次 / token 消耗 / 文件改动 / 耗时，点击某天查看当日详情
@@ -99,7 +98,7 @@
 - 跨平台 CI：push/PR 在 ubuntu/windows/macos 跑 analyze + 全量测试
 
 ### 已知待办
-- 回退前对树外改动做隐式 checkpoint；"保留本地"后二次确认；未挂载脏 tab 缓冲取回；拖入语义（复制导入 vs 加入工作区）；git shadow 回退 / 遥测上报暂不做
+- 回退前对树外改动做隐式 checkpoint；"保留本地"后二次确认；未挂载脏 tab 缓冲取回；拖入语义（复制导入 vs 加入工作区）；git shadow 回退 / 遥测上报暂不做；中断语义：轮中取消/追问不进版本回退菜单，仅已落盘版本可回退；git锚点：自研快照为主，每需求命名commit即命名回滚点，高风险前push（对标Aider git纪律，默认不做远端）；保留口径：版本保留最近100节点（20~500可配），Redo栈20条，日志500条+512KB轮转（对标Claude保留期声明）；高危复核：静态allowlist+审批队列串行为主，暂不做LLM二次分析（对标OpenHands Security，默认不做远端）；高风险隔离：暂不做worktree自动隔离，大改先开分支/备份（对标Cursor worktree，默认不做）；沙箱：本地进程+审批门禁为主，暂不做Docker沙箱（对标OpenHands Docker，默认不做）；恢复三档：Restore前自动记现场+Redo一键恢复（对标Cline三档，暂不做影子仓，默认不做远端）
 
 ## 技术栈
 
@@ -132,6 +131,14 @@ flutter pub get
 flutter run -d macos
 ```
 
+> **macOS 27+ 自编译提醒**：新版 Xcode 下 Flutter 3.38.6 存在 thinFramework bug——通用双架构 `ARCHS="arm64 x86_64"` 透传给 `lipo -verify_arch`（一次只接受单架构）必失败。自编译请与 CI（`.github/workflows/release-desktop.yml`）保持一致，使用本机单架构：
+>
+> ```bash
+> FLUTTER_XCODE_ARCHS="$(uname -m)" FLUTTER_XCODE_ONLY_ACTIVE_ARCH=YES flutter build macos --release
+> ```
+>
+> `tool/package_macos_release.sh` 与 `scripts/release_desktop.command` 同理，可在命令前加上述两个环境变量。
+
 其他桌面平台需在对应操作系统上启用并构建，例如：
 
 ```bash
@@ -146,29 +153,13 @@ flutter build windows --release
 ```
 默认将产物输出到 `dist/`，构建前执行 `flutter analyze --no-fatal-infos` 和 `flutter test`，并为每个压缩包生成 `.sha256` 校验文件；使用 `--skip-check` 可跳过检查，使用 `--no-clean` 可保留 `build/`。macOS 产物命名包含当前架构。macOS 上通常只能打出 macOS 包；Windows / Linux 包需在对应主机或 GitHub Actions 的 Windows / Linux runner 上构建。
 
-### macOS：带语言服务的 Release（测诊断请用这个）
+### macOS：轻量 Release（语言服务按需下载）
 
-只执行 `flutter build macos --release` **不会**带语言包。请用：
+`tool/package_macos_release.sh` 会执行 `flutter build macos --release`，清理旧的预置语言包后输出 `dist/my_ide-*-macos.zip`。语言服务不随安装包发布，首次打开对应文件时按应用提示下载到 Application Support。
 
 ```bash
 bash tool/package_macos_release.sh
 ```
-
-该脚本会：
-
-1. `flutter build macos --release`
-2. 精简后压缩为 `.tar.zst`，写入 `*.app/Contents/Resources/language_archives/`
-3. 附带便携 `zstd`；输出 `dist/my_ide-*-macos.zip`
-
-验证：
-
-```bash
-APP="$(find build/macos/Build/Products/Release -maxdepth 1 -name '*.app' | head -1)"
-ls -lh "$APP/Contents/Resources/language_archives"/*.tar.zst
-```
-
-首次打开 `.js` 时会解压到 `~/Library/Application Support/.../languages/`，问题面板应出现 `Cannot find name 'consle'`。  
-参考体积（压缩后，约）：node ~几十 MB、typescript ~8MB、pyright ~3MB；远小于此前未压缩的 ~347MB 语言目录。
 
 ## 目录提示
 

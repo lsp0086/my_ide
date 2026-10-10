@@ -386,6 +386,11 @@ class DefinitionService {
       await client.start(rootPath: rootPath);
     } catch (e) {
       lastStartError = '$e';
+      // 失败实例在 start 抛错时尚未登记进 _clients，无人替它清理：
+      // 补一次 stop 复位状态机（进程 kill），否则下次重试撞 running 假活。
+      try {
+        await client.stop();
+      } catch (_) {}
       return null;
     }
     _clients[key] = client;
@@ -396,23 +401,51 @@ class DefinitionService {
 
   /// 停掉指定 root 下的旧 server：切项目时调用，避免旧 rootUri 常驻多 server 并存。
   /// key 格式 `${spec.id}::$command::$rootPath`，按后缀匹配。
-  Future<void> disposeForRoot(String rootPath) async {
+  /// 返回被停掉的 spec id 集合：调用方凭此清掉对应 `lsp:<id>` 诊断源，
+  /// 否则停掉的源残留在问题面板里（此前无源注销机制）。
+  Future<Set<String>> disposeForRoot(String rootPath) async {
     final keys = _clients.keys
         .where((k) => k.endsWith('::$rootPath'))
         .toList();
+    final stopped = <String>{};
     for (final k in keys) {
       final c = _clients.remove(k);
       _lastUsed.remove(k);
+      stopped.add(k.split('::').first);
       try {
         await c?.stop();
       } catch (_) {}
     }
+    return stopped;
   }
 
   Future<void> disposeAll() async {
-    for (final c in _clients.values) {
-      await c.stop();
+    // 快照后逐个停：stop 内 await 间隙 disposeAll 重入即 ConcurrentModification。
+    for (final c in List<LspClient>.from(_clients.values)) {
+      try {
+        await c.stop();
+      } catch (_) {}
     }
     _clients.clear();
+    _lastUsed.clear();
+  }
+
+  /// 淘汰指定 client：外部不再使用某语言服务时调用，同步清掉其诊断源。
+  /// 返回被停掉的 spec id，调用方凭此清诊断；未找到返回 null。
+  Future<String?> evictClient(LspClient client) async {
+    String? found;
+    for (final entry in _clients.entries) {
+      if (identical(entry.value, client)) {
+        found = entry.key;
+        break;
+      }
+    }
+    if (found == null) return null;
+    _clients.remove(found);
+    _lastUsed.remove(found);
+    try {
+      await client.stop();
+    } catch (_) {}
+    return found.split('::').first;
   }
 }

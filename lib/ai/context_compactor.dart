@@ -4,7 +4,19 @@ import 'agent_client.dart';
 import 'chat_store.dart';
 import 'provider_config.dart';
 
-/// Token 估算：英文 ~4 字符/token，中文 ~1.5 字符/token，emoji 按 2 token 保守估。
+/// C1（对齐 cline context management）：compact 触发阈值显式化。上下文用量
+/// 达到 [defaultCompactTriggerRatio] 即触发摘要压缩，轮首探针（shouldCompact）
+/// 与 R3 步中探针共用同一常量。取 80%：预留 20% 余量给摘要生成（待摘要历史
+/// 作为输入 + ≤800 字摘要作为输出）与当轮回复，避免压缩请求自身压爆上下文。
+/// 所有触发点一律引用本常量，不允许散落 0.8/0.85 阈值字面量。
+const double defaultCompactTriggerRatio = 0.8;
+
+/// 步中硬裁剪阈值（_trimMessagesToBudget 兜底线）：比压缩触发线高一个档，
+/// 保证「先压缩、压缩不动才硬裁」的次序，压缩/摘要请求自身不会被硬裁误伤。
+const double midLoopTrimRatio = 0.85;
+
+/// Token 估算：英文 ~4 字符/token，中文 ~1.2 字符/token（R6-05 保守：1.5 偏乐观
+/// 致压缩触发晚），emoji 按 2 token 保守估。
 /// 不准但够做触发器，服务端 usage 回来后再校准；宁可高估提前压缩，不晚触发压爆 400。
 class TokenEstimator {
   static bool _isCjk(int rune) {
@@ -13,7 +25,11 @@ class TokenEstimator {
         (rune >= 0x20000 && rune <= 0x2A6DF) ||
         (rune >= 0x3040 && rune <= 0x30FF) ||
         (rune >= 0xAC00 && rune <= 0xD7AF) ||
-        (rune >= 0x2E80 && rune <= 0x2FFF);
+        (rune >= 0x2E80 && rune <= 0x2FFF) ||
+        // R1-TK：CJK标点/全角——此前U+3000-303F中文标点、U+FF00-FFEF全角
+        // 按ascii计（，。！4字仅1token），中文长文压缩晚触发可压爆。
+        (rune >= 0x3000 && rune <= 0x303F) ||
+        (rune >= 0xFF00 && rune <= 0xFFEF);
   }
 
   static int estimate(String text) {
@@ -30,7 +46,7 @@ class TokenEstimator {
         ascii++;
       }
     }
-    return (ascii / 4 + cjk / 1.5).ceil();
+    return (ascii / 4 + cjk / 1.2).ceil();
   }
 
   /// 全量计数：content 字符串/多模态 List（含 image_url base64）、tool_calls、
@@ -116,7 +132,7 @@ class ContextCompactor {
 
   final AgentClient _client;
 
-  double triggerRatio = 0.8;
+  double triggerRatio = defaultCompactTriggerRatio;
   int keepRecent = 8;
 
   /// 摘要模型 key（prefs agentSummaryModel，可空，为空则用主模型）。
@@ -183,7 +199,33 @@ class ContextCompactor {
     );
   }
 
-  /// 单条 ChatMessage 的 token 估算：文本+思考+文件开销+图片引用，
+  /// C3（对齐 Anthropic clear_tool_uses）：压缩触发时先把旧工具结果清成
+  /// 占位符，再做摘要/续跑。只替换 role=='tool' 消息的 content 文本，
+  /// 不删除消息——assistant.tool_calls 与 tool 消息成对完整，配对不断链。
+  /// 最近 [keepRecent] 条工具结果保留原文，更早的替换为 [placeholder]。
+  /// 返回被清理的条数；重复调用幂等（已是占位符/空内容不再处理）。
+  static int clearOldToolResults(
+    List<Map<String, dynamic>> messages, {
+    int keepRecent = 6,
+    String placeholder = '[旧工具结果已清理]',
+  }) {
+    final toolIndexes = <int>[
+      for (var i = 0; i < messages.length; i++)
+        if ('${messages[i]['role'] ?? ''}' == 'tool') i,
+    ];
+    if (toolIndexes.length <= keepRecent) return 0;
+    var cleared = 0;
+    for (final i in toolIndexes.sublist(0, toolIndexes.length - keepRecent)) {
+      final content = messages[i]['content'];
+      if (content is String && content.isNotEmpty && content != placeholder) {
+        messages[i]['content'] = placeholder;
+        cleared++;
+      }
+    }
+    return cleared;
+  }
+
+  /// 单条 ChatMessage 的 token 估算：文本+思考+文件开销+图片引用+子Agent，
   /// 与 Runner._budgetHistory 同口径，避免触发偏晚或视觉轮次低估 400。
   /// 图片已资产化：`asset:` 只计路径小头；残留 dataUrl 仍按全量计。
   static int estimateChatMessage(ChatMessage m) {
@@ -200,6 +242,10 @@ class ContextCompactor {
       // dataUrl 长天然大头，无需分支，保持与 Runner 一致。
       total += TokenEstimator.estimate(ref) + 64;
     }
+    // 子Agent 输出同样计入：_budgetHistory 已计，此前此处漏记致探针晚触发。
+    for (final s in m.subAgents) {
+      total += TokenEstimator.estimate(s.output);
+    }
     return total;
   }
 
@@ -207,8 +253,13 @@ class ContextCompactor {
     required List<Map<String, dynamic>> messages,
     required AiModelOption model,
     double calibration = 1.0,
+    List<Map<String, dynamic>>? tools,
   }) {
-    final used = TokenEstimator.estimateMessages(messages) * calibration;
+    // R3-A5：探针加schema开销——此前只算消息，满MCP时实际早超限仍不压缩。
+    final used =
+        (TokenEstimator.estimateMessages(messages) +
+                TokenEstimator.estimateTools(tools)) *
+            calibration;
     return used >= contextLimitOf(model) * triggerRatio;
   }
 
@@ -367,8 +418,10 @@ $buf''';
     if (text.isEmpty) {
       // 摘要失败时退化：保留每条首行 + 操作文件 + 版本ID，
       // 此前只留首行，files/afterVersionId 全丢，恢复后断链。
+      // R1-D2：全量回退——此前只取前20但上游droppedCount仍全量，
+      // 尾部静默丢失。现全量遍历。
       final fallback = StringBuffer('【自动摘要失败，保留要点】\n');
-      for (final m in messages.take(20)) {
+      for (final m in messages) {
         final first =
             m.text.split('\n').firstWhere((l) => l.trim().isNotEmpty,
                 orElse: () => '');

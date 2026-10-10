@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -6,10 +7,6 @@ import 'package:crypto/crypto.dart';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
-
-
-
-
 
 /// 跨平台解压：不依赖 unzip/gzip 命令。
 class ArchiveExtract {
@@ -21,12 +18,29 @@ class ArchiveExtract {
 }
 
 Future<void> _extractGzip(String gzPath, String outPath) async {
+  // R8-A2 解压先判大小：语言包此前全量进内存，GB级包即OOM。
+  // 超512MB拒解（语言包正常<200MB）。
+  try {
+    if (await File(gzPath).length() > 512 * 1024 * 1024) {
+      throw StateError('语言包过大拒解：$gzPath');
+    }
+  } catch (e) {
+    if (e is StateError) rethrow;
+  }
   final bytes = await File(gzPath).readAsBytes();
   final decoded = gzip.decode(bytes);
   await File(outPath).writeAsBytes(decoded, flush: true);
 }
 
 Future<void> _extractZip(String zipPath, String destDir) async {
+  // R8-A2同口径：zip同样先判大小。
+  try {
+    if (await File(zipPath).length() > 512 * 1024 * 1024) {
+      throw StateError('语言包过大拒解：$zipPath');
+    }
+  } catch (e) {
+    if (e is StateError) rethrow;
+  }
   final bytes = await File(zipPath).readAsBytes();
   if (bytes.length < 22) throw StateError('zip 过小');
   var eocd = bytes.length - 22;
@@ -41,7 +55,8 @@ Future<void> _extractZip(String zipPath, String destDir) async {
   }
   if (eocd < 0) throw StateError('找不到 zip 目录');
   final count = bytes[eocd + 10] | (bytes[eocd + 11] << 8);
-  var offset = bytes[eocd + 16] |
+  var offset =
+      bytes[eocd + 16] |
       (bytes[eocd + 17] << 8) |
       (bytes[eocd + 18] << 16) |
       (bytes[eocd + 19] << 24);
@@ -49,20 +64,32 @@ Future<void> _extractZip(String zipPath, String destDir) async {
     if (offset + 46 > bytes.length) break;
     if (bytes[offset] != 0x50 || bytes[offset + 1] != 0x4b) break;
     final method = bytes[offset + 10] | (bytes[offset + 11] << 8);
-    final comp = bytes[offset + 20] |
+    final comp =
+        bytes[offset + 20] |
         (bytes[offset + 21] << 8) |
         (bytes[offset + 22] << 16) |
         (bytes[offset + 23] << 24);
     final nameLen = bytes[offset + 28] | (bytes[offset + 29] << 8);
     final extraLen = bytes[offset + 30] | (bytes[offset + 31] << 8);
     final commentLen = bytes[offset + 32] | (bytes[offset + 33] << 8);
-    final localOff = bytes[offset + 42] |
+    final localOff =
+        bytes[offset + 42] |
         (bytes[offset + 43] << 8) |
         (bytes[offset + 44] << 16) |
         (bytes[offset + 45] << 24);
     final name = utf8.decode(bytes.sublist(offset + 46, offset + 46 + nameLen));
     offset += 46 + nameLen + extraLen + commentLen;
     if (name.endsWith('/')) continue;
+    // R3-06：ZipSlip收敛——投毒zip含../../或绝对路径可写出支持目录外。
+    // 现清洗：空/绝对路径/含..段/盤符一律跳过，落点normalize后必须在区内。
+    if (name.isEmpty || name.startsWith('/') || name.startsWith('\\')) continue;
+    if (name.contains(':') || name.contains('\x00')) continue;
+    final segs = p.split(name.replaceAll('\\', '/'));
+    if (segs.contains('..')) continue;
+    final destAbs = p.normalize(p.join(destDir, p.joinAll(segs)));
+    final rootAbs = p.normalize(destDir);
+    if (destAbs != rootAbs && !p.isWithin(rootAbs, destAbs)) continue;
+    final dest = File(destAbs);
     final localExtra = bytes[localOff + 28] | (bytes[localOff + 29] << 8);
     final dataStart = localOff + 30 + nameLen + localExtra;
     final payload = bytes.sublist(dataStart, dataStart + comp);
@@ -74,7 +101,6 @@ Future<void> _extractZip(String zipPath, String destDir) async {
     } else {
       throw StateError('不支持的 zip 压缩方法 $method');
     }
-    final dest = File(p.join(destDir, name));
     await dest.parent.create(recursive: true);
     await dest.writeAsBytes(out, flush: true);
   }
@@ -110,14 +136,19 @@ class BundledLanguageServers {
       final exe = File(Platform.resolvedExecutable);
       final macOsDir = exe.parent; // .../Contents/MacOS
       final candidates = <Directory>[
-        Directory(p.normalize(
-            p.join(macOsDir.path, '..', 'Resources', 'language_archives'))),
+        Directory(
+          p.normalize(
+            p.join(macOsDir.path, '..', 'Resources', 'language_archives'),
+          ),
+        ),
         Directory(p.join(macOsDir.path, 'language_archives')),
         Directory(
-            p.normalize(p.join(macOsDir.path, 'data', 'language_archives'))),
+          p.normalize(p.join(macOsDir.path, 'data', 'language_archives')),
+        ),
         // 兼容旧包：未压缩 languages/
-        Directory(p.normalize(
-            p.join(macOsDir.path, '..', 'Resources', 'languages'))),
+        Directory(
+          p.normalize(p.join(macOsDir.path, '..', 'Resources', 'languages')),
+        ),
         Directory(p.join(macOsDir.path, 'languages')),
         Directory(p.normalize(p.join(macOsDir.path, 'data', 'languages'))),
       ];
@@ -181,8 +212,13 @@ class BundledLanguageServers {
       await languagesRoot.create(recursive: true);
     }
     // 解压到临时目录再替换，避免半成品。
-    final tmp = Directory(p.join(
-        support.path, 'languages', '.$folder.extracting-${DateTime.now().millisecondsSinceEpoch}'));
+    final tmp = Directory(
+      p.join(
+        support.path,
+        'languages',
+        '.$folder.extracting-${DateTime.now().millisecondsSinceEpoch}',
+      ),
+    );
     if (await tmp.exists()) await tmp.delete(recursive: true);
     await tmp.create(recursive: true);
     try {
@@ -190,8 +226,7 @@ class BundledLanguageServers {
       if (!checksum) return false;
       final zstd = await _findZstd();
       if (zstd == null) {
-        _lastError[folder] =
-            '系统未提供 zstd，已回退到在线安装；如需离线安装请随包提供 zstd';
+        _lastError[folder] = '系统未提供 zstd，已回退到在线安装；如需离线安装请随包提供 zstd';
         return false;
       }
       // zstd -dc archive | tar -x -C tmp
@@ -214,8 +249,9 @@ class BundledLanguageServers {
         await dest.delete(recursive: true);
       }
       await source.rename(dest.path);
-      await File(p.join(dest.path, markerName))
-          .writeAsString(DateTime.now().toIso8601String());
+      await File(
+        p.join(dest.path, markerName),
+      ).writeAsString(DateTime.now().toIso8601String());
       return true;
     } catch (e) {
       _lastError[folder] = '解压异常：$e';
@@ -253,7 +289,10 @@ class BundledLanguageServers {
     switch (id) {
       case 'typescript':
       case 'html-via-ts':
-        final bin = await _findNpmBin('typescript', 'typescript-language-server');
+        final bin = await _findNpmBin(
+          'typescript',
+          'typescript-language-server',
+        );
         if (bin == null) return null;
         // 预置若误装 TS7（无 tsserver.js），视为不可用，触发重装 5.8。
         final tsServer = await tsserverJsPath();
@@ -280,8 +319,13 @@ class BundledLanguageServers {
   Future<String?> tsserverJsPath() async {
     final roots = await _searchRoots('typescript');
     for (final dir in roots) {
-      final candidate =
-          p.join(dir.path, 'node_modules', 'typescript', 'lib', 'tsserver.js');
+      final candidate = p.join(
+        dir.path,
+        'node_modules',
+        'typescript',
+        'lib',
+        'tsserver.js',
+      );
       if (File(candidate).existsSync()) return candidate;
     }
     return null;
@@ -291,11 +335,15 @@ class BundledLanguageServers {
   Future<String?> tscJsPath() async {
     final roots = await _searchRoots('typescript');
     for (final dir in roots) {
-      final candidate =
-          p.join(dir.path, 'node_modules', 'typescript', 'lib', 'tsc.js');
+      final candidate = p.join(
+        dir.path,
+        'node_modules',
+        'typescript',
+        'lib',
+        'tsc.js',
+      );
       if (File(candidate).existsSync()) return candidate;
-      final bin =
-          p.join(dir.path, 'node_modules', 'typescript', 'bin', 'tsc');
+      final bin = p.join(dir.path, 'node_modules', 'typescript', 'bin', 'tsc');
       if (File(bin).existsSync()) return bin;
     }
     return null;
@@ -544,10 +592,7 @@ class BundledLanguageServers {
       go,
       ['install', packageUri],
       workingDirectory: dir.path,
-      environment: {
-        ..._toolEnv(),
-        'GOBIN': binDir.path,
-      },
+      environment: {..._toolEnv(), 'GOBIN': binDir.path},
     );
     if (result.exitCode != 0) {
       _lastError[id] = _stderrOf(result).isEmpty
@@ -687,11 +732,12 @@ class BundledLanguageServers {
     final bytes = await _download(url);
     await File(zipPath).writeAsBytes(bytes, flush: true);
 
-    final unzip = await Process.run(
-      'unzip',
-      ['-o', zipPath, '-d', dir.path],
-      workingDirectory: dir.path,
-    );
+    final unzip = await Process.run('unzip', [
+      '-o',
+      zipPath,
+      '-d',
+      dir.path,
+    ], workingDirectory: dir.path);
     if (unzip.exitCode != 0) {
       _lastError[id] = _stderrOf(unzip).isEmpty
           ? 'unzip 失败（exit ${unzip.exitCode}）'
@@ -716,10 +762,13 @@ class BundledLanguageServers {
 
   Future<Map<String, dynamic>?> _latestRelease(String repo) async {
     final uri = Uri.parse('https://api.github.com/repos/$repo/releases/latest');
-    final resp = await http.get(uri, headers: {
-      'Accept': 'application/vnd.github+json',
-      'User-Agent': 'my-ide-language-bootstrap',
-    });
+    final resp = await http.get(
+      uri,
+      headers: {
+        'Accept': 'application/vnd.github+json',
+        'User-Agent': 'my-ide-language-bootstrap',
+      },
+    );
     if (resp.statusCode != 200) return null;
     final decoded = jsonDecode(resp.body);
     if (decoded is Map<String, dynamic>) return decoded;
@@ -728,11 +777,22 @@ class BundledLanguageServers {
   }
 
   Future<List<int>> _download(String url) async {
-    final resp = await http.get(Uri.parse(url), headers: {
-      'User-Agent': 'my-ide-language-bootstrap',
-    });
+    // R8-下载有界：语言服务包数十 MB，此前 http.get 无 timeout、无大小门禁，
+    // 慢链 hang 住 UI+超大包直接进内存 OOM。现 60s 超时+50MB 上限。
+    final resp = await http
+        .get(
+          Uri.parse(url),
+          headers: {'User-Agent': 'my-ide-language-bootstrap'},
+        )
+        .timeout(
+          const Duration(seconds: 60),
+          onTimeout: () => throw TimeoutException('语言服务下载超时（60s）：$url'),
+        );
     if (resp.statusCode < 200 || resp.statusCode >= 300) {
       throw StateError('下载失败 HTTP ${resp.statusCode}: $url');
+    }
+    if (resp.bodyBytes.length > 50 * 1024 * 1024) {
+      throw StateError('语言服务包超过 50MB，拒绝载入：$url');
     }
     return resp.bodyBytes;
   }
@@ -805,7 +865,9 @@ class BundledLanguageServers {
     ];
     // 去重保序
     final seen = <String>{};
-    env['PATH'] = merged.where((e) => seen.add(e)).join(Platform.isWindows ? ';' : ':');
+    env['PATH'] = merged
+        .where((e) => seen.add(e))
+        .join(Platform.isWindows ? ';' : ':');
     return env;
   }
 
@@ -818,10 +880,24 @@ class BundledLanguageServers {
         final home = Platform.environment['HOME'];
         if (home != null) {
           supportCandidates.addAll([
-            p.join(home, 'Library', 'Application Support', 'com.example.myIde',
-                'languages', 'node', 'bin'),
-            p.join(home, 'Library', 'Application Support', 'my_ide', 'languages',
-                'node', 'bin'),
+            p.join(
+              home,
+              'Library',
+              'Application Support',
+              'com.example.myIde',
+              'languages',
+              'node',
+              'bin',
+            ),
+            p.join(
+              home,
+              'Library',
+              'Application Support',
+              'my_ide',
+              'languages',
+              'node',
+              'bin',
+            ),
           ]);
         }
       } catch (_) {}
@@ -829,10 +905,20 @@ class BundledLanguageServers {
       final macOsDir = exe.parent;
       final candidates = <String>[
         ...supportCandidates,
-        p.normalize(p.join(
-            macOsDir.path, '..', 'Resources', 'languages', 'node', 'bin')),
-        p.normalize(p.join(macOsDir.path, '..', 'Resources', 'languages', 'node',
-            'current', 'bin')),
+        p.normalize(
+          p.join(macOsDir.path, '..', 'Resources', 'languages', 'node', 'bin'),
+        ),
+        p.normalize(
+          p.join(
+            macOsDir.path,
+            '..',
+            'Resources',
+            'languages',
+            'node',
+            'current',
+            'bin',
+          ),
+        ),
         p.join(macOsDir.path, 'languages', 'node', 'bin'),
         p.join(macOsDir.path, 'languages', 'node', 'current', 'bin'),
         p.normalize(p.join(macOsDir.path, 'data', 'languages', 'node', 'bin')),
@@ -847,11 +933,23 @@ class BundledLanguageServers {
     final checksumFile = File('${archive.path}.sha256');
     final signatureFile = File('${archive.path}.sig');
     if (!await checksumFile.exists()) return true;
-    final expected = (await checksumFile.readAsString()).trim().split(RegExp(r'\s+')).first.toLowerCase();
+    final expected = (await checksumFile.readAsString())
+        .trim()
+        .split(RegExp(r'\s+'))
+        .first
+        .toLowerCase();
     if (!RegExp(r'^[0-9a-f]{64}$').hasMatch(expected)) {
-      _lastError[p.basenameWithoutExtension(archive.path)] = '语言包 SHA-256 文件格式无效';
+      _lastError[p.basenameWithoutExtension(archive.path)] =
+          '语言包 SHA-256 文件格式无效';
       return false;
     }
+    // R8-A2同口径：校验读同样先判大小，大包拒验免OOM。
+    try {
+      if (await archive.length() > 512 * 1024 * 1024) {
+        _lastError[p.basenameWithoutExtension(archive.path)] = '语言包过大拒验';
+        return false;
+      }
+    } catch (_) {}
     final actual = sha256.convert(await archive.readAsBytes()).toString();
     if (actual != expected) {
       _lastError[p.basenameWithoutExtension(archive.path)] = '语言包 SHA-256 校验失败';
@@ -879,7 +977,9 @@ class BundledLanguageServers {
     final env = _toolEnv();
     for (final name in names) {
       // 先扫补齐后的 PATH 绝对路径，避免依赖 which 的环境。
-      for (final dir in (env['PATH'] ?? '').split(Platform.isWindows ? ';' : ':')) {
+      for (final dir in (env['PATH'] ?? '').split(
+        Platform.isWindows ? ';' : ':',
+      )) {
         if (dir.isEmpty) continue;
         final candidate = p.join(dir, name);
         if (File(candidate).existsSync()) return candidate;
@@ -923,6 +1023,8 @@ class BundledTsServer {
       BundledLanguageServers.instance.binaryPathIfPresent('typescript');
 
   Future<String?> ensureInstalled({bool force = false}) =>
-      BundledLanguageServers.instance
-          .ensureInstalled('typescript', force: force);
+      BundledLanguageServers.instance.ensureInstalled(
+        'typescript',
+        force: force,
+      );
 }

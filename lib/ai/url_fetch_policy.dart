@@ -19,7 +19,10 @@ class UrlFetchPolicy {
     }
     if (uri.host.isEmpty) return 'url 缺少主机：$uri';
     if (uri.userInfo.isNotEmpty) return '拒绝带用户信息的 url：$uri';
-    final host = uri.host.toLowerCase();
+    var host = uri.host.toLowerCase();
+    // R15R2：尾点 FQDN 归一——`metadata.google.internal.` 与无点同义，
+    // 此前精确匹配即被绕过。剥尾点后再比本地域名。
+    if (host.endsWith('.')) host = host.substring(0, host.length - 1);
     if (host == 'localhost' ||
         host.endsWith('.localhost') ||
         host.endsWith('.local') ||
@@ -33,6 +36,9 @@ class UrlFetchPolicy {
     }
     // 十六进制/八进制/整数 IP 字面量：tryParse 认不出，手动归一化再判。
     final normalizedIp = _normalizeNumericIp(host);
+    if (normalizedIp == null && _looksLikeNumericIp(host)) {
+      return '拒绝异常 IP 写法：$host';
+    }
     final literal = InternetAddress.tryParse(normalizedIp ?? host);
     if (literal != null) {
       final why = rejectAddress(literal);
@@ -45,14 +51,41 @@ class UrlFetchPolicy {
   }
 
   bool _hostAllowed(String host) {
-    for (final allowed in allowedHosts) {
-      if (host == allowed || host.endsWith('.$allowed')) return true;
+    var h = host.trim().toLowerCase();
+    if (h.endsWith('.')) h = h.substring(0, h.length - 1);
+    for (var allowed in allowedHosts) {
+      var a = allowed.trim().toLowerCase();
+      if (a.endsWith('.')) a = a.substring(0, a.length - 1);
+      if (a.isEmpty) continue;
+      if (h == a || h.endsWith('.$a')) return true;
     }
     return false;
   }
 
   /// 数字 IP 归一化：0x7f.0.0.1 / 0177.0.0.1 / 2130706433 / 尾点域名。
   /// tryParse 认不出这些写法，手动转点分十进制再判，认不出返回 null。
+  /// R1-SSRF疑似数字IP兜底：四段全数字/0x前缀但解析失败（如09无效八进制、
+  /// 0xZZ非法十六进制）时_normalizeNumericIp返null，旧口径直接放行待DNS判。
+  /// DNS可解析怪写法即旁路。现数字疑似IP解析失败直接拒绝（fail-closed），
+  /// 纯字母域名不受影响（每段须数字起首或0x前缀）。
+  static bool _looksLikeNumericIp(String host) {
+    final h = host.trim().toLowerCase();
+    if (h.isEmpty) return false;
+    if (RegExp(r'^[0-9]+$').hasMatch(h)) return true;
+    if (h.startsWith('0x')) return true;
+    if (!h.contains('.')) return false;
+    final parts = h.split('.');
+    if (parts.length < 2 || parts.length > 4) return false;
+    for (final part in parts) {
+      final p = part.trim();
+      if (p.isEmpty) return false;
+      if (p.startsWith('0x')) continue;
+      if (RegExp(r'^[0-9]+$').hasMatch(p)) continue;
+      return false;
+    }
+    return true;
+  }
+
   static String? _normalizeNumericIp(String host) {
     var h = host.trim().toLowerCase();
     if (h.isEmpty) return null;
@@ -117,6 +150,25 @@ class UrlFetchPolicy {
       final b = raw.rawAddress;
       if (b.length != 16) return '拒绝异常 IPv6：${raw.address}';
       if (b.every((e) => e == 0)) return '拒绝未指定地址：${raw.address}';
+      // R15R5：AWS IPv6 元数据 fd00:ec2::254——此前仅判 IPv4 169.254.169.254，
+      // 双栈 VPC 下 IPv6 元数据漏网。来源
+      // https://pipelab.org/learn/preventing-ssrf-in-ai-agents/。
+      if (b.length == 16 &&
+          b[0] == 0xfd &&
+          b[1] == 0x00 &&
+          b[2] == 0x0e &&
+          b[3] == 0xc2 &&
+          b[14] == 0x02 &&
+          b[15] == 0x54) {
+        var midZero = true;
+        for (var i = 4; i < 14; i++) {
+          if (b[i] != 0) {
+            midZero = false;
+            break;
+          }
+        }
+        if (midZero) return '拒绝云元数据地址：${raw.address}';
+      }
       // fc00::/7 unique local
       if ((b[0] & 0xfe) == 0xfc) return '拒绝私网地址：${raw.address}';
       // 2001:db8::/32 documentation
@@ -147,7 +199,11 @@ class UrlFetchPolicy {
     if (InternetAddress.tryParse(uri.host) != null) return null;
     List<InternetAddress> addrs;
     try {
-      addrs = await InternetAddress.lookup(uri.host);
+      // R3-DNS超时收敛：无timeout时弱网/劫持DNS可挂死open/fetch整条链。
+      // 5s超时失败按可疑拒绝（fail-closed），对照chrome-devtools-mcp网络超时口径。
+      addrs = await InternetAddress.lookup(
+        uri.host,
+      ).timeout(const Duration(seconds: 5));
     } catch (e) {
       return 'DNS 解析失败：${uri.host} ($e)';
     }
@@ -157,5 +213,29 @@ class UrlFetchPolicy {
       if (why != null) return why;
     }
     return null;
+  }
+
+  /// R8-1：已校验地址集——返回首轮 lookup 中全部通过私网检查的地址，
+  /// connectionFactory 连接时直接复用，不再二次 lookup（DNS 轮转 TOCTOU）。
+  /// 任一地址命中私网/回环即返回 null（调用方回退 rejectResolved 拒掉）。
+  Future<List<InternetAddress>?> lookupChecked(String host) async {
+    final literal = InternetAddress.tryParse(host);
+    if (literal != null) {
+      return rejectAddress(literal) == null ? [literal] : null;
+    }
+    List<InternetAddress> addrs;
+    try {
+      // R3-同rejectResolved：lookupChecked同样5s超时，超时按null回退拒掉。
+      addrs = await InternetAddress.lookup(
+        host,
+      ).timeout(const Duration(seconds: 5));
+    } catch (_) {
+      return null;
+    }
+    if (addrs.isEmpty) return null;
+    for (final addr in addrs) {
+      if (rejectAddress(addr) != null) return null;
+    }
+    return addrs;
   }
 }

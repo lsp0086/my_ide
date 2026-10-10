@@ -125,6 +125,7 @@ jobs:
           set -euo pipefail
           cd "$(dirname "$0")"
           ROOT="$(pwd)"
+          mkdir -p "$HOME/.local/share/applications"
           sed "s|^Exec=.*|Exec=$ROOT/my_ide %U|" \
             "$ROOT/share/applications/com.example.my_ide.desktop" \
             > "$HOME/.local/share/applications/com.example.my_ide.desktop"
@@ -145,7 +146,12 @@ jobs:
 
       - name: Build macOS
         if: matrix.target == 'macos'
-        run: flutter build macos --release
+        # Flutter 3.38.6 thinFramework bug：ARCHS="arm64 x86_64" 透传给
+        # lipo -verify_arch（一次只接受单架构）必失败，本地已复现。
+        # Release 用本机单架构即可（与 scripts/release_desktop.command 一致）。
+        run: |
+          xcodebuild -version
+          FLUTTER_XCODE_ARCHS="$(uname -m)" FLUTTER_XCODE_ONLY_ACTIVE_ARCH=YES flutter build macos --release
 
       - name: Package macOS
         if: matrix.target == 'macos'
@@ -157,6 +163,8 @@ jobs:
           ARCH="$(uname -m)"
           APP="$(find build/macos/Build/Products/Release -maxdepth 1 -name '*.app' | head -1)"
           test -n "$APP"
+          # 误报兜底：构建失败残留旧 .app 会打出空包，校验可执行文件。
+          test -n "$(find "$APP/Contents/MacOS" -maxdepth 1 -type f | head -1)"
           rm -rf "$APP/Contents/Resources/language_archives" \
                  "$APP/Contents/Resources/languages" || true
           mkdir -p dist
@@ -164,6 +172,8 @@ jobs:
             cd "$(dirname "$APP")"
             zip -qry "$GITHUB_WORKSPACE/dist/${NAME}-${VERSION}-macos-${ARCH}.zip" "$(basename "$APP")"
           )
+          # 空包兜底：zip <1MB 即判失败（本地曾打出 898B 空包误报成功）。
+          test "$(stat -f%z "$GITHUB_WORKSPACE/dist/${NAME}-${VERSION}-macos-${ARCH}.zip" 2>/dev/null || stat -c%s "$GITHUB_WORKSPACE/dist/${NAME}-${VERSION}-macos-${ARCH}.zip")" -ge 1048576
           ls -lh dist
 
       - name: Generate SHA256 checksums

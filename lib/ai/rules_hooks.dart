@@ -10,15 +10,40 @@ import 'package:path/path.dart' as p;
 Future<String> loadRules(String? rootPath, {List<String>? changedFiles}) async {
   if (rootPath == null || rootPath.isEmpty) return '';
   final parts = <String>[];
+  var hitPrimary = false;
   for (final name in const ['AGENTS.md', 'AGENT.md']) {
     try {
       final f = File(p.join(rootPath, name));
       if (!await f.exists()) continue;
+      // 先判大小再读：GB 级规则文件此前全量进内存，与补丁 1MB 门禁同口径。
+      try {
+        if (await f.length() > 1024 * 1024) continue;
+      } catch (_) {}
       final text = (await f.readAsString()).trim();
       if (text.isEmpty) continue;
       parts.add(_truncate(text));
+      hitPrimary = true;
       break;
     } catch (_) {}
+  }
+  // C1 开源回退：AGENTS 缺失时按序取首个存在者（CLAUDE/.cursorrules/.windsurfrules），
+  // 8K 截断，只当参考不执行（与 AGENTS 同口径）。
+  if (!hitPrimary) {
+    for (final name in const ['CLAUDE.md', '.cursorrules', '.windsurfrules']) {
+      try {
+        final f = File(p.join(rootPath, name));
+        if (!await f.exists()) continue;
+        final stat = await f.stat();
+        if (stat.type == FileSystemEntityType.directory) continue;
+        try {
+          if (await f.length() > 1024 * 1024) continue;
+        } catch (_) {}
+        final text = (await f.readAsString()).trim();
+        if (text.isEmpty) continue;
+        parts.add(_truncate(text));
+        break;
+      } catch (_) {}
+    }
   }
   try {
     final dir = Directory(p.join(rootPath, '.my_ide', 'rules'));
@@ -31,6 +56,10 @@ Future<String> loadRules(String? rootPath, {List<String>? changedFiles}) async {
         ..sort((a, b) => p.basename(a.path).compareTo(p.basename(b.path)));
       for (final f in mds) {
         try {
+          // 规则片段同样先判大小：目录内大 md 此前全量读入再截断。
+          try {
+            if (await f.length() > 1024 * 1024) continue;
+          } catch (_) {}
           final text = (await f.readAsString()).trim();
           if (text.isEmpty) continue;
           final parsed = _parseRuleFrontmatter(text);

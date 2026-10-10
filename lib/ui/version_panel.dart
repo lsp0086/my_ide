@@ -86,6 +86,7 @@ class VersionPanel extends StatelessWidget {
       try {
         await WorkspaceScope.maybeOf(context)?.notifyExternalChanges();
       } catch (_) {}
+      if (!context.mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(label == null ? '无可 Redo 的现场' : '已 Redo 回到：$label'),
@@ -132,14 +133,15 @@ class VersionPanel extends StatelessWidget {
       separatorBuilder: (_, _) => const SizedBox(height: 6),
       itemBuilder: (context, index) {
         final cp = store.checkpoints[index];
-        return _VersionNodeCard(info: cp);
+        // 按 id 加 key：refresh 后列表项复用时展开态/已加载 _changes 不会错挂节点。
+        return _VersionNodeCard(key: ValueKey(cp.id), info: cp);
       },
     );
   }
 }
 
 class _VersionNodeCard extends StatefulWidget {
-  const _VersionNodeCard({required this.info});
+  const _VersionNodeCard({super.key, required this.info});
 
   final CheckpointInfo info;
 
@@ -199,6 +201,7 @@ class _VersionNodeCardState extends State<_VersionNodeCard> {
       try {
         await WorkspaceScope.maybeOf(context)?.notifyExternalChanges();
       } catch (_) {}
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('已恢复到 ${widget.info.id}，可用右上 Redo 回去')),
       );

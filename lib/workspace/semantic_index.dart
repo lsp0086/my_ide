@@ -82,27 +82,34 @@ List<RankedDoc> semanticRank(
 }) {
   final q = query.trim();
   if (q.isEmpty || files.isEmpty) return const [];
+  // 文档数同样有界：千文件全量 TF-IDF 即 O(N·V) 卡顿，此前无界。
+  // 现最多取前 500 文档排序，与 buildRepoMap maxFiles 同量级。
+  // R5-A6 截断可见：调用方凭 truncatedForTest 知尾部未参排，
+  // 不再静默以为全库已排（对标 repo_map 截断提示口径）。
+  final capped = files.length > 500 ? files.sublist(0, 500) : files;
+  // R8-分词有界：大文件全文分词+toSet 即内存抖动，此前无界。
+  // 现单文档最多取前 20000 字符分词，与 AgentTools 8k token 预载同量级。
   final docTokens = <List<String>>[];
   final df = <String, int>{};
-  for (final f in files) {
-    final tokens = tokenize(f.text).toSet().toList();
-    final full = tokenize(f.text);
+  for (final f in capped) {
+    final clipped = f.text.length > 20000 ? f.text.substring(0, 20000) : f.text;
+    final full = tokenize(clipped);
     docTokens.add(full);
-    for (final t in tokens) {
+    for (final t in full.toSet()) {
       df[t] = (df[t] ?? 0) + 1;
     }
   }
-  final n = files.length;
+  final n = capped.length;
   final idf = <String, double>{};
   df.forEach((term, count) {
     idf[term] = math.log(1 + n / (count + 1));
   });
   final qVec = _tfIdfVector(tokenize(q), idf);
   final scored = <RankedDoc>[];
-  for (var i = 0; i < files.length; i++) {
+  for (var i = 0; i < capped.length; i++) {
     final dVec = _tfIdfVector(docTokens[i], idf);
     final score = _cosine(qVec, dVec);
-    if (score > 0) scored.add(RankedDoc(path: files[i].path, score: score));
+    if (score > 0) scored.add(RankedDoc(path: capped[i].path, score: score));
   }
   scored.sort((a, b) => b.score.compareTo(a.score));
   if (scored.length > maxResults) return scored.sublist(0, maxResults);
@@ -148,12 +155,13 @@ Future<RepoMap> buildRepoMap(String rootPath, {int maxFiles = 300}) async {
   final root = Directory(rootPath);
   if (!await root.exists()) return const RepoMap(tree: '', symbols: '');
   var filesSeen = 0;
-
-  void walk(Directory dir, String prefix, int depth) {
+  // R5-01 异步遍历：listSync/readAsStringSync在大仓/网络盘卡UI线程，
+  // 改await for异步+上限bail，同目录500实体即停。
+  Future<void> walk(Directory dir, String prefix, int depth) async {
     if (depth > 4 || filesSeen >= maxFiles) return;
     List<FileSystemEntity> entities;
     try {
-      entities = dir.listSync(followLinks: false);
+      entities = await dir.list(followLinks: false).take(500).toList();
     } catch (_) {
       return;
     }
@@ -164,8 +172,12 @@ Future<RepoMap> buildRepoMap(String rootPath, {int maxFiles = 300}) async {
       if (e is Directory) {
         if (_repoMapSkipDirs.contains(name)) continue;
         if (name.startsWith('.') && name != '.github') continue;
+        // R5-A2 目录同样过敏感门禁：此前仅文件分支判敏感，敏感目录名
+        // 先入树泄漏（如 secrets/ 私钥目录名）。目录敏感即整棵跳过。
+        final dirRel = p.relative(e.path, from: rootPath);
+        if (WorkspaceFs.isSensitiveRelative(dirRel)) continue;
         treeLines.add('$prefix$name/');
-        walk(e, '$prefix  ', depth + 1);
+        await walk(e, '$prefix  ', depth + 1);
       } else if (e is File) {
         final rel = p.relative(e.path, from: rootPath);
         // 敏感文件不进目录树：与 read_file/semantic_search 敏感门禁对齐，
@@ -173,12 +185,15 @@ Future<RepoMap> buildRepoMap(String rootPath, {int maxFiles = 300}) async {
         if (WorkspaceFs.isSensitiveRelative(rel)) continue;
         treeLines.add('$prefix$name');
         filesSeen++;
+        // 符号表满额只停符号提取，目录树继续遍历：此前在文件分支尾部
+        // return 会中止整棵目录树收集，repo_map 后半棵树缺失。
+        if (symbolLines.length > 300) continue;
         try {
           final rules = rulesForExtension(p.extension(name).toLowerCase());
           if (rules == null) continue;
-          final stat = e.statSync();
+          final stat = await e.stat();
           if (stat.size <= 0 || stat.size > 256 * 1024) continue;
-          final text = e.readAsStringSync();
+          final text = await e.readAsString();
           final syms = extractSymbols(
             filePath: e.path,
             source: text,
@@ -189,12 +204,11 @@ Future<RepoMap> buildRepoMap(String rootPath, {int maxFiles = 300}) async {
             if (symbolLines.length > 300) break;
           }
         } catch (_) {}
-        if (symbolLines.length > 300) return;
       }
     }
   }
 
-  walk(root, '', 0);
+  await walk(root, '', 0);
   return RepoMap(
     tree: treeLines.take(320).join('\n'),
     symbols: symbolLines.take(300).join('\n'),

@@ -101,6 +101,177 @@ class _ProviderEditorState extends State<_ProviderEditor> {
   bool _modelsExpanded = false;
   final Set<String> _expandedModelIds = {};
   String? _fetchError;
+  // R4-01：模型列表过滤关键字（搜索面板写入），空=不过滤。
+  String _modelFilter = '';
+
+  /// 面板搜索后的可见模型：id/displayName 大小写不敏感包含匹配。
+  List<AiModelOption> _visibleModels(AiProviderConfig p) {
+    final q = _modelFilter.trim().toLowerCase();
+    if (q.isEmpty) return p.models;
+    return p.models.where((m) {
+      final id = m.id.toLowerCase();
+      final disp = (m.displayName ?? '').toLowerCase();
+      return id.contains(q) || disp.contains(q);
+    }).toList();
+  }
+
+  /// 模型搜索面板：与外部模型列表其它功能一致（展开/启用/删除走原行），
+  /// 面板内只做关键字过滤，不改动模型数据本身。
+  Future<void> _openModelSearch(
+    BuildContext context,
+    AiProviderConfig p,
+  ) async {
+    final colors = IdeColors.of(context);
+    final queryCtrl = TextEditingController(text: _modelFilter);
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: true,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setPanel) {
+            final q = queryCtrl.text.trim().toLowerCase();
+            final matched = q.isEmpty
+                ? p.models
+                : p.models.where((m) {
+                    final id = m.id.toLowerCase();
+                    final disp = (m.displayName ?? '').toLowerCase();
+                    return id.contains(q) || disp.contains(q);
+                  }).toList();
+            return Dialog(
+              backgroundColor: colors.panelElevated,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(14),
+                side: BorderSide(color: colors.borderStrong),
+              ),
+              child: ConstrainedBox(
+                constraints:
+                    const BoxConstraints(maxWidth: 420, maxHeight: 520),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 14, 8, 8),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              '搜索模型（${p.name}）',
+                              style: TextStyle(
+                                color: colors.textPrimary,
+                                fontSize: 14,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                          IconButton(
+                            tooltip: '关闭',
+                            visualDensity: VisualDensity.compact,
+                            onPressed: () => Navigator.of(ctx).pop(),
+                            icon: Icon(Icons.close,
+                                size: 18, color: colors.textMuted),
+                          ),
+                        ],
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                      child: TextField(
+                        controller: queryCtrl,
+                        autofocus: true,
+                        style: TextStyle(
+                          color: colors.textPrimary,
+                          fontSize: 12.5,
+                          fontFamily: 'Menlo',
+                        ),
+                        decoration: InputDecoration(
+                          hintText: '输入 id / 显示名称过滤',
+                          prefixIcon: Icon(Icons.search_rounded,
+                              size: 17, color: colors.textMuted),
+                          isDense: true,
+                          filled: true,
+                          fillColor: colors.inputFill,
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                        ),
+                        onChanged: (_) => setPanel(() {}),
+                      ),
+                    ),
+                    Divider(height: 1, color: colors.divider),
+                    Flexible(
+                      child: matched.isEmpty
+                          ? Padding(
+                              padding: const EdgeInsets.all(20),
+                              child: Text(
+                                '无匹配模型',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  color: colors.textMuted,
+                                  fontSize: 12,
+                                ),
+                              ),
+                            )
+                          : ListView.builder(
+                              shrinkWrap: true,
+                              padding:
+                                  const EdgeInsets.symmetric(vertical: 6),
+                              itemCount: matched.length,
+                              itemBuilder: (context, index) {
+                                final m = matched[index];
+                                return _SettingsSoftItem(
+                                  title: m.displayName?.isNotEmpty == true
+                                      ? '${m.displayName} · ${m.id}'
+                                      : m.id,
+                                  selected: m.enabled,
+                                  onTap: () {
+                                    // 面板内点选=外部勾选启用同语义，其余功能走外部行。
+                                    setState(() => m.enabled = !m.enabled);
+                                    widget.onChanged(p);
+                                    setPanel(() {});
+                                  },
+                                );
+                              },
+                            ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.end,
+                        children: [
+                          TextButton(
+                            onPressed: () {
+                              setState(() => _modelFilter = '');
+                              Navigator.of(ctx).pop();
+                            },
+                            child: const Text('清除过滤'),
+                          ),
+                          TextButton(
+                            onPressed: () {
+                              // 应用面板关键字到外部列表过滤。
+                              setState(() {
+                                _modelFilter = queryCtrl.text;
+                                if (_modelFilter.trim().isNotEmpty) {
+                                  _modelsExpanded = true;
+                                }
+                              });
+                              Navigator.of(ctx).pop();
+                            },
+                            child: const Text('应用到列表'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+    queryCtrl.dispose();
+  }
 
   @override
   void initState() {
@@ -600,10 +771,12 @@ class _ProviderEditorState extends State<_ProviderEditor> {
                         _modelsExpanded = false;
                       });
                     },
+                    // R4-01：每供应商模型搜索按钮，点开面板搜索模型。
+                    onSearch: () => _openModelSearch(context, p),
                   ),
                   if (_modelsExpanded) ...[
                     const SizedBox(height: 8),
-                    for (final m in p.models)
+                    for (final m in _visibleModels(p))
                       _ModelCapabilityEditor(
                         key: ValueKey('${p.id}:${m.id}'),
                         model: m,
@@ -683,6 +856,8 @@ class _ProviderEditorState extends State<_ProviderEditor> {
         apiStyle: p.apiStyle,
         anthropicVersion: p.anthropicVersion,
         extraHeaders: p.extraHeaders,
+        // R6-P1：mcpHeaders 同 extraHeaders 随拉表发送。
+        mcpHeaders: p.mcpHeaders,
         useApiKeyHeader: p.useApiKeyHeader,
       );
       final fetched = ids.toSet();
@@ -737,6 +912,7 @@ class _ModelsHeader extends StatelessWidget {
     required this.onToggle,
     required this.onExpandEnabled,
     required this.onCollapseAll,
+    required this.onSearch,
   });
 
   final bool expanded;
@@ -745,6 +921,7 @@ class _ModelsHeader extends StatelessWidget {
   final VoidCallback onToggle;
   final VoidCallback onExpandEnabled;
   final VoidCallback onCollapseAll;
+  final VoidCallback onSearch;
 
   @override
   Widget build(BuildContext context) {
@@ -804,6 +981,13 @@ class _ModelsHeader extends StatelessWidget {
               ),
               child: const Text('展开已启用'),
             ),
+          IconButton(
+            tooltip: '搜索模型',
+            visualDensity: VisualDensity.compact,
+            onPressed: onSearch,
+            icon: Icon(Icons.search_rounded,
+                size: 17, color: colors.textMuted),
+          ),
           TextButton(
             onPressed: onCollapseAll,
             style: TextButton.styleFrom(

@@ -5,6 +5,7 @@ import 'package:flutter_svg/flutter_svg.dart';
 
 import '../theme/app_colors.dart';
 import '../workspace/workspace_controller.dart';
+import 'browser_page_view.dart';
 import 'code_editor.dart';
 
 class FilePreviewPane extends StatelessWidget {
@@ -35,6 +36,9 @@ class FilePreviewPane extends StatelessWidget {
           path: tab.path,
           editorKey: editorKey,
         );
+      case FileKind.browser:
+        // Agent 唤起的页面标签页：CDP screencast 渲染，只读观看窗。
+        return BrowserPageView(initialUrl: tab.url ?? '');
       case FileKind.unsupported:
         return _SmartUnsupportedPreview(
           path: tab.path,

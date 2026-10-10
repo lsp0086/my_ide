@@ -57,11 +57,6 @@ class AppStrings {
   String get confirmClearProjectMemory => isZh
       ? '将删除全部对话、版本记录与项目记忆，此操作不可撤销。'
       : 'Delete all chats, versions, and project memory. This cannot be undone.';
-
-  @Deprecated('Use cleanProject / clearProjectMemory')
-  String get clearMemory => clearProjectMemory;
-  @Deprecated('Use confirmDeleteChat')
-  String get confirmDelete => confirmDeleteChat;
 }
 
 class _StringsScope extends InheritedWidget {

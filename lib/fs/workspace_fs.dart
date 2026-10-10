@@ -36,20 +36,49 @@ class WorkspaceFs {
   static String realpathOf(String abs) => _realpathOr(abs);
 
   /// 终点/父链链接检查（写侧用）：任一段为链接即真，读侧允许跟随不受影响。
+  /// R2-02：fail-closed + root 基准 realpath。此前任意异常 return false
+  /// （EPERM/ENOENT 默认放行），且 root 用 normalize（root 本身为链接时
+  /// isWithin 误判）。现：终点探测异常按"可疑"返回 true；root 先 realpath，
+  /// 失败回退 normalize（root 不存在时仍可判定，不直接放行全树）。
   static bool isWriteLink(String abs, String root) {
+    // 悬空/不存在终点同样要判父链：`root/sub->outside` 外链上建
+    // `sub/evil.txt` 时，终点 evil.txt 不存在、父段 sub 是链接，
+    // 必须沿父链逐段查到 root，不能因终点缺失提前返回 false。
+    final absNorm = p.normalize(abs);
+    var sawError = false;
     try {
-      if (FileSystemEntity.typeSync(abs, followLinks: false) ==
+      if (FileSystemEntity.typeSync(absNorm, followLinks: false) ==
           FileSystemEntityType.link) {
         return true;
       }
-      var dir = p.dirname(abs);
-      final rootNorm = p.normalize(root);
+    } catch (_) {
+      sawError = true;
+    }
+    try {
+      // 父链逐段查：dir 从终点父目录起，首段即可能是外链本身；
+      // root 基准用 normalize 词法比对，避免 realpath 把 root 下的
+      // 外链段提前展开导致循环提前退出漏检。
+      var dir = p.dirname(absNorm);
+      final rootLex = p.normalize(root);
+      var rootReal = rootLex;
+      try {
+        rootReal = _realpathOr(rootLex);
+      } catch (_) {
+        rootReal = rootLex;
+      }
       for (var i = 0; i < 32; i++) {
-        if (dir == rootNorm ||
-            !(dir == rootNorm ||
-                p.isWithin(rootNorm, dir) ||
-                p.isWithin(dir, rootNorm))) {
+        if (dir == rootLex ||
+            dir == rootReal ||
+            !(dir == rootLex ||
+                p.isWithin(rootLex, dir) ||
+                p.isWithin(dir, rootLex))) {
           break;
+        }
+        if (i == 31) {
+          // 超深嵌套 fail-closed：循环上限耗尽仍未走到 root，路径异常深，
+          // 按可疑返回 true（多一次拒绝，不丢数据）。
+          // 来源 SymJack 审批所见非所得 fail-closed 口径。
+          return true;
         }
         try {
           if (FileSystemEntity.typeSync(dir, followLinks: false) ==
@@ -57,16 +86,20 @@ class WorkspaceFs {
             return true;
           }
         } catch (_) {
+          sawError = true;
           break;
         }
         final parent = p.dirname(dir);
         if (parent == dir) break;
         dir = parent;
       }
-      return false;
     } catch (_) {
-      return false;
+      sawError = true;
     }
+    // 探测异常 fail-closed：此前 return false 默认放行，EPERM/悬空链
+    // 可绕过写侧链接门禁。调用方均为"返回 true 即拒绝写入"，误报只多一次
+    // 拒绝，不丢数据（与 SymJack 审批所见非所得口径对齐）。
+    return sawError;
   }
 
   static String _realpathOr(String abs) {
@@ -86,11 +119,17 @@ class WorkspaceFs {
       var dir = Directory(p.dirname(abs));
       final rest = <String>[];
       rest.add(p.basename(abs));
+      var deepUnresolved = false;
       for (var i = 0; i < 32; i++) {
         if (dir.existsSync()) break;
         rest.add(p.basename(dir.path));
         dir = Directory(p.dirname(dir.path));
+        if (i == 31) deepUnresolved = true;
       }
+      // 第7轮收敛：深路径 fail-closed——此前32层仍未找到存在父目录时静默
+      // 回退词法路径，区外深链可绕过 realpath 区外判。现深未解析即按原词法
+      // 返回但由调用方 zoneOf/写侧复检按可疑处理（isWriteLink 超限已拒）。
+      if (deepUnresolved && !dir.existsSync()) return abs;
       if (dir.existsSync()) {
         final realDir = dir.resolveSymbolicLinksSync();
         var out = realDir;
@@ -125,7 +164,22 @@ class WorkspaceFs {
 
   Future<String> readText(String rawPath) async {
     final abs = resolveInside(rawPath);
-    return File(abs).readAsString();
+    // R10-A5 直读有界：此前直调readAsString无大小门禁，大文件即OOM。
+    // 与AgentTools 1MB门禁同口径，超限抛FsDenied由调用方显错。
+    // R11-4-A 读后复检：length与readAsString间隙文件可被外部追加涨大，
+    // 先测长后读仍可OOM。现读后按字节复检，超限即丢弃抛错。
+    try {
+      if (await File(abs).length() > 1024 * 1024) {
+        throw FsDeniedException(rawPath, FsZone.sensitive);
+      }
+    } catch (e) {
+      if (e is FsDeniedException) rethrow;
+    }
+    final text = await File(abs).readAsString();
+    if (text.length > 1024 * 1024) {
+      throw FsDeniedException(rawPath, FsZone.sensitive);
+    }
+    return text;
   }
 
   Future<void> writeText(String rawPath, String content) async {
@@ -144,19 +198,91 @@ class WorkspaceFs {
       throw FsDeniedException(rawPath, FsZone.outside);
     }
     final file = File(abs);
+    // 写前预检再建目录：与 AgentTools._write 同口径，先复检再 create，
+    // 否则跟随被替换父链在区外建目录（TOCTOU 双检）。
+    final realBefore = _realpathOr(abs);
+    if (realBefore != root && !p.isWithin(root, realBefore)) {
+      throw FsDeniedException(rawPath, FsZone.outside);
+    }
+    if (WorkspaceFs.isWriteLink(
+      p.normalize(p.isAbsolute(rawPath) ? rawPath : p.join(rootPath, rawPath)),
+      rootPath,
+    )) {
+      throw FsDeniedException(rawPath, FsZone.sensitive);
+    }
     await file.parent.create(recursive: true);
+    // 第4轮R4-1：新建目录归属复检——create 跟随被换父链在区外建目录时，
+    // 不能只靠后续中止rename了事，已建区外目录/tmp 即残留垃圾。现复检父目录
+    // real归属，区外即尝试删刚建目录后中止。
+    final realParent = _realpathOr(file.parent.path);
+    if (realParent != root && !p.isWithin(root, realParent)) {
+      // R16R1：区外建目录只中止不删除——此前尝试删区外目录，非空抛错被吞、
+      // 为空误删区外空目录。写区隔离只保证不写穿，不清理区外。
+      throw FsDeniedException(rawPath, FsZone.outside);
+    }
+    // 落盘前二次复检：create(recursive:true) 会跟随检查后被替换的父目录外链，
+    // 此前一次前检后直接落盘有 TOCTOU 窗口（与 AgentTools._recheckWriteTarget 同口径）。
+    final realAfter = _realpathOr(abs);
+    if (realAfter != root && !p.isWithin(root, realAfter)) {
+      throw FsDeniedException(rawPath, FsZone.outside);
+    }
+    if (WorkspaceFs.isWriteLink(
+      p.normalize(p.isAbsolute(rawPath) ? rawPath : p.join(rootPath, rawPath)),
+      rootPath,
+    )) {
+      throw FsDeniedException(rawPath, FsZone.sensitive);
+    }
     // 原子写：唯一 tmp+flush+rename，与编辑器/checkpoint 同口径，不留半写文件。
     // 固定 `.tmp` 名此前并发两写同一文件会互盖侧车。
     // nonce 用 Random.secure：micros+hashCode&0xffff 仅 16bit 且非稳定，
     // 并发同微秒可同名互盖。
+    // TOCTOU 收口：tmp 建在目标父目录内，rename 同目录原子；
+    // rename 前再做一次 realpath+链接双检，父链在写 tmp 期间被换即中止。
     final nonce =
         '${DateTime.now().microsecondsSinceEpoch}-${_random.nextInt(1 << 32).toRadixString(36)}';
     final tmp = File('${file.path}.$nonce.tmp');
     try {
       await tmp.writeAsString(content, flush: true);
+      // 第4轮R4-1：tmp归属复检——写tmp期间父链被换时tmp已落在区外，
+      // finally只删tmp相对路径（跟随新链可能删错位置）。现复检tmp父目录
+      // real归属，区外即按tmp绝对路径删除后中止。
+      final realTmpParent = _realpathOr(tmp.parent.path);
+      if (realTmpParent != root && !p.isWithin(root, realTmpParent)) {
+        try {
+          await tmp.delete();
+        } catch (_) {}
+        throw FsDeniedException(rawPath, FsZone.outside);
+      }
+      final realRename = _realpathOr(abs);
+      if (realRename != root && !p.isWithin(root, realRename)) {
+        throw FsDeniedException(rawPath, FsZone.outside);
+      }
+      if (WorkspaceFs.isWriteLink(
+        p.normalize(
+          p.isAbsolute(rawPath) ? rawPath : p.join(rootPath, rawPath),
+        ),
+        rootPath,
+      )) {
+        throw FsDeniedException(rawPath, FsZone.sensitive);
+      }
       try {
         await tmp.rename(file.path);
       } catch (_) {
+        // R15R4：回退前重复检——rename 失败窗口父链可被替换，
+        // 此前直接 writeAsString 写旧 file.path 即写穿。回退前重做
+        // realpath+链接双检，不通过即中止。
+        final realFallback = _realpathOr(abs);
+        if (realFallback != root && !p.isWithin(root, realFallback)) {
+          throw FsDeniedException(rawPath, FsZone.outside);
+        }
+        if (WorkspaceFs.isWriteLink(
+          p.normalize(
+            p.isAbsolute(rawPath) ? rawPath : p.join(rootPath, rawPath),
+          ),
+          rootPath,
+        )) {
+          throw FsDeniedException(rawPath, FsZone.sensitive);
+        }
         await file.writeAsString(content, flush: true);
       }
     } finally {
@@ -230,14 +356,17 @@ class WorkspaceFs {
         lower == '.git/index' ||
         lower == '.git/orig_head' ||
         lower == '.git/fetch_head' ||
+        // R15R2：submodule 劫持——.gitmodules 的 url 可指向恶意仓库，
+        // Agent 写出即劫持依赖。任意层级同样敏感。
+        lower == '.gitmodules' ||
+        lower.endsWith('/.gitmodules') ||
         lower == '.gitattributes' ||
         lower == '.gitignore') {
       return true;
     }
     // git hooks / vscode tasks 等可执行配置：区内写出要审批。
     // 任意层级嵌套仓库同样敏感：sub/.git/hooks 与顶层同口径。
-    if (lower.startsWith('.git/hooks/') ||
-        lower.contains('/.git/hooks/')) {
+    if (lower.startsWith('.git/hooks/') || lower.contains('/.git/hooks/')) {
       return true;
     }
     // 嵌套 .git 元文件同样敏感：此前仅判顶层，sub/.git/config 可直写。
@@ -289,6 +418,8 @@ class WorkspaceFs {
 
   /// 回收站条目名剥离 `<stamp>_<pid-rand>[_<n>]_<原名>` 后复检敏感：
   /// trash 包裹不能成为敏感绕过通道。调用方在 trashRestore 时使用。
+  /// 新格式恒为 4 段前缀（stamp/pid/rand/n 或 stamp/pid-rand/n）：`parts[1]`
+  /// 含 '-' 即新格式；旧格式 `<stamp>_<n>_<原名>`/`<stamp>_<原名>` 无 pid 段。
   static bool isSensitiveTrashEntry(String entryName) {
     final lower = entryName.replaceAll('\\', '/').toLowerCase();
     final parts = lower.split('_');
@@ -395,6 +526,20 @@ class CommandPolicy {
     final tokens = _tokenize(normalized);
     if (tokens.isEmpty) return CommandVerdict.deny;
     if (_isDangerousTokens(tokens)) return CommandVerdict.deny;
+    // A7 重定向落点分区判定（按原文解析，_normalize 小写化会破坏路径）：
+    // 敏感落点直接拒绝（与文件写 B1 敏感永拒同口径）；含 $/通配/波浪号的
+    // 落点真实写入位置无法静态判定，维持审批；区外落点交由下方
+    // safeInvocation null → approve 走审批档位，不留静默直放通道。
+    if (rootPath != null) {
+      final split = _splitRedirects(command);
+      if (split.targets.isNotEmpty) {
+        final fs = WorkspaceFs(rootPath: rootPath);
+        for (final t in split.targets) {
+          if (!_isPlainRedirectTarget(t)) return CommandVerdict.approve;
+          if (fs.zoneOf(t) == FsZone.sensitive) return CommandVerdict.deny;
+        }
+      }
+    }
     if (rootPath != null &&
         safeInvocation(command, rootPath: rootPath) != null) {
       return CommandVerdict.allow;
@@ -402,8 +547,215 @@ class CommandPolicy {
     return CommandVerdict.approve;
   }
 
-  /// 仅返回无需 Shell 即可执行的只读命令。任何展开、复合语句、重定向、
-  /// 未闭合引号或工作区外路径都会返回 null，调用方必须转入逐次审批。
+  /// A7 解析命令字符串中输出重定向落点（`>` `>>` `2>` `1>` `&>` `<>`）。
+  /// 引号内/反斜杠转义的 `>` 不算（`echo "a > b"` 不误报）；`2>&1` 这类
+  /// fd 复制无文件落点；`<<`/`<<<` 的定界符不是文件；数字前缀仅在全数字
+  /// 词紧贴 `>` 时视为 fd 描述符（`2>f` 是流重定向，`-2`、`2 > f` 是普通
+  /// 参数）。返回落点原文（去引号去转义，保留 `$VAR`/通配等展开痕迹）。
+  static List<String> parseRedirectTargets(String command) =>
+      _splitRedirects(command).targets;
+
+  /// 重定向落点是否"干净"（可静态判区）：含 $ 展开/反引号/通配/波浪号或
+  /// 为空即不可判，一律维持审批，不做区内直放。
+  static bool _isPlainRedirectTarget(String target) {
+    if (target.isEmpty) return false;
+    return !RegExp(r'[$`*?\[\]~]').hasMatch(target);
+  }
+
+  /// A7 拆解命令中的输出重定向：返回落点列表、剥离重定向后的剩余命令、
+  /// 是否出现过重定向运算符（`2>&1` 无落点但 hasRedirect 为真）。
+  /// 纯 `<` 输入重定向不属输出落点，保留在剩余命令中，由元字符检查
+  /// 转入审批；`;`/`|`/裸 `&` 等元字符同样原样保留，不会因拆解被洗掉。
+  static ({List<String> targets, String remainder, bool hasRedirect})
+  _splitRedirects(String command) {
+    final targets = <String>[];
+    final rest = <String>[];
+    var sawRedirect = false;
+    var wordStart = 0; // rest 中当前词起点（fd 数字前缀剥离用）
+    var inWord = false;
+    var wordDigitsOnly = true;
+    String? quote;
+    var i = 0;
+
+    void endWord() {
+      inWord = false;
+      wordDigitsOnly = true;
+    }
+
+    // 当前词全为数字且紧贴重定向符 → fd 描述符（`2>f`），从剩余命令剥离。
+    void stripFdPrefix() {
+      if (inWord && wordDigitsOnly) {
+        rest.length = wordStart;
+      }
+    }
+
+    // 读取一个（可含引号/转义的）词，返回去引号去转义内容；游标停在词后。
+    String readWord() {
+      final buf = StringBuffer();
+      String? q;
+      while (i < command.length) {
+        final c = command[i];
+        if (q != null) {
+          if (c == '\\' && q == '"' && i + 1 < command.length) {
+            final n = command[i + 1];
+            if (n == '"' || n == r'$' || n == '`' || n == '\\') {
+              buf.write(n);
+            } else {
+              buf.write(c);
+              buf.write(n);
+            }
+            i += 2;
+            continue;
+          }
+          if (c == q) {
+            q = null;
+            i++;
+            continue;
+          }
+          buf.write(c);
+          i++;
+          continue;
+        }
+        if (c == '"' || c == "'") {
+          q = c;
+          i++;
+          continue;
+        }
+        if (c == '\\' && i + 1 < command.length) {
+          buf.write(command[i + 1]);
+          i += 2;
+          continue;
+        }
+        if (c.trim().isEmpty ||
+            c == ';' ||
+            c == '|' ||
+            c == '&' ||
+            c == '>' ||
+            c == '<') {
+          break;
+        }
+        buf.write(c);
+        i++;
+      }
+      return buf.toString();
+    }
+
+    while (i < command.length) {
+      final c = command[i];
+      if (quote != null) {
+        // 引号内原样保留到剩余命令：引号内 > 不是重定向。
+        if (c == '\\' && quote == '"' && i + 1 < command.length) {
+          rest.add(c);
+          rest.add(command[i + 1]);
+          i += 2;
+          continue;
+        }
+        if (c == quote) {
+          quote = null;
+          rest.add(c);
+          i++;
+          continue;
+        }
+        rest.add(c);
+        i++;
+        continue;
+      }
+      if (c == '"' || c == "'") {
+        quote = c;
+        rest.add(c);
+        inWord = true;
+        wordDigitsOnly = false;
+        i++;
+        continue;
+      }
+      if (c == '\\' && i + 1 < command.length) {
+        // 引号外转义：下一字符按字面（`\>` 不是重定向）。
+        rest.add(c);
+        rest.add(command[i + 1]);
+        inWord = true;
+        wordDigitsOnly = false;
+        i += 2;
+        continue;
+      }
+      final ampRedirect =
+          c == '&' && i + 1 < command.length && command[i + 1] == '>';
+      final inputOutput =
+          c == '<' && i + 1 < command.length && command[i + 1] == '>';
+      final heredoc =
+          c == '<' && i + 1 < command.length && command[i + 1] == '<';
+      if (c == '>' || ampRedirect || inputOutput || heredoc) {
+        sawRedirect = true;
+        stripFdPrefix();
+        if (heredoc) {
+          // << / <<<：定界符/herestring 词不是文件落点，随运算符剥离。
+          i += (i + 2 < command.length && command[i + 2] == '<') ? 3 : 2;
+          while (i < command.length && command[i].trim().isEmpty) {
+            i++;
+          }
+          if (i < command.length && command[i] == '-') i++; // <<- 忽略连字符
+          readWord(); // 丢弃定界符
+          endWord();
+          rest.add(' ');
+          continue;
+        }
+        if (ampRedirect) {
+          i += 2; // &>
+          if (i < command.length && command[i] == '>') i++; // &>>
+        } else if (inputOutput) {
+          i += 2; // <>
+        } else {
+          i++; // > 或 >>
+          if (i < command.length && command[i] == '>') i++;
+          if (i < command.length && command[i] == '&') {
+            // >&N：fd 复制无文件落点；>& 后非数字按文件落点解析。
+            final fdStart = i + 1;
+            var j = fdStart;
+            while (j < command.length && RegExp(r'^\d$').hasMatch(command[j])) {
+              j++;
+            }
+            if (j > fdStart) {
+              endWord();
+              rest.add(' ');
+              i = j;
+              continue;
+            }
+            i++; // 消费 &，落入下方落点词解析（>&file 两写口径）
+          }
+        }
+        while (i < command.length && command[i].trim().isEmpty) {
+          i++;
+        }
+        final target = readWord();
+        if (target.isNotEmpty) targets.add(target);
+        endWord();
+        rest.add(' ');
+        continue;
+      }
+      if (c.trim().isEmpty) {
+        rest.add(c);
+        endWord();
+        i++;
+        continue;
+      }
+      if (!inWord) {
+        wordStart = rest.length;
+        inWord = true;
+        wordDigitsOnly = RegExp(r'^\d$').hasMatch(c);
+      } else if (wordDigitsOnly && !RegExp(r'^\d$').hasMatch(c)) {
+        wordDigitsOnly = false;
+      }
+      rest.add(c);
+      i++;
+    }
+    return (targets: targets, remainder: rest.join(), hasRedirect: sawRedirect);
+  }
+
+  /// 仅返回无需人工审批的命令。任何展开、复合语句、未闭合引号或工作区外
+  /// 路径都会返回 null，调用方必须转入逐次审批。
+  /// A7：区内重定向例外——落点全部为干净区内路径时放行（与文件写区内
+  /// 档位同口径），但返回的 invocation 带 redirectCommand，执行方必须
+  /// 经 shell 以原文执行（argv 直跑会丢重定向语义）。区外/敏感/含展开的
+  /// 落点仍返回 null 走审批或拒绝。
   static SafeCommandInvocation? safeInvocation(
     String command, {
     required String rootPath,
@@ -411,6 +763,31 @@ class CommandPolicy {
     // 多行命令一律不直放：_normalize 会把换行压缩成空格，
     // `echo ok\ntouch x` 会被洗成干净 argv 误放行。
     if (command.contains('\n') || command.contains('\r')) return null;
+    final split = _splitRedirects(command);
+    if (split.hasRedirect) {
+      final fs = WorkspaceFs(rootPath: rootPath);
+      for (final t in split.targets) {
+        if (!_isPlainRedirectTarget(t)) return null;
+        if (fs.zoneOf(t) != FsZone.inside) return null;
+      }
+    }
+    final core = _safeInvocationCore(
+      split.hasRedirect ? split.remainder : command,
+      rootPath: rootPath,
+    );
+    if (core == null) return null;
+    if (!split.hasRedirect) return core;
+    return SafeCommandInvocation(
+      core.executable,
+      core.arguments,
+      redirectCommand: command,
+    );
+  }
+
+  static SafeCommandInvocation? _safeInvocationCore(
+    String command, {
+    required String rootPath,
+  }) {
     final argv = _parsePlainArgv(command);
     if (argv == null || argv.isEmpty) return null;
     final executable = argv.first.toLowerCase();
@@ -533,19 +910,19 @@ class CommandPolicy {
       if (args.isEmpty) return false;
       return _hasOnlyWorkspacePaths('cat', args, rootPath);
     }
-    // git 只读动词：show/blame/fetch/reflog/rev-list/ls-tree 等纯读；
+    // git 只读动词：show/blame/reflog/rev-list/ls-tree 等纯读；
     // branch/tag/remote/stash 需动词级二次判定（创建/删除是写操作）。
+    // 第9轮收敛：fetch/ls-remote 移出直放——二者恒发远端网络（默认不做远端），
+    // 此前直放即免审联网。对齐“git 仓库需远程默认不做”：走审批由用户确认。
     if (executable == 'git') {
       if (args.isEmpty) return false;
       const safeVerbs = {
         'show',
         'blame',
-        'fetch',
         'reflog',
         'rev-list',
         'rev-parse',
         'ls-tree',
-        'ls-remote',
         'check-ignore',
         'ls-files',
         'symbolic-ref',
@@ -558,8 +935,7 @@ class CommandPolicy {
       }
       const guardedVerbs = {'branch', 'tag', 'remote', 'stash'};
       if (guardedVerbs.contains(args.first)) {
-        if (!_isReadOnlyBranchTagRemote(
-            args.first, args.skip(1).toList())) {
+        if (!_isReadOnlyBranchTagRemote(args.first, args.skip(1).toList())) {
           return false;
         }
         return _isSafeGitArgs(args, rootPath);
@@ -569,7 +945,15 @@ class CommandPolicy {
     // gh 只读动词：issue/pr/repo/run/release view 系 + search helps。
     if (executable == 'gh') {
       if (args.length < 2) return false;
-      const groups = {'issue', 'pr', 'repo', 'run', 'release', 'search', 'help'};
+      const groups = {
+        'issue',
+        'pr',
+        'repo',
+        'run',
+        'release',
+        'search',
+        'help',
+      };
       const readVerbs = {
         'view',
         'list',
@@ -621,6 +1005,23 @@ class CommandPolicy {
       return false;
     }
     if (executable == 'npx' && args.isNotEmpty && args.first == 'eslint') {
+      // R2-F2：npx eslint同样判写开关+区内路径——此前直接放行，
+      // `npx eslint --fix`免审改盘。与eslint主分支同口径。
+      const writeFlags = {
+        '--write',
+        '--fix',
+        '--fix-dry-run',
+        '--write-dry-run',
+        '-w',
+      };
+      final rest = args.sublist(1);
+      for (final arg in rest) {
+        if (writeFlags.contains(arg.split('=').first)) return false;
+        if (arg.startsWith('-')) continue;
+        if (WorkspaceFs(rootPath: rootPath).zoneOf(arg) != FsZone.inside) {
+          return false;
+        }
+      }
       return true;
     }
     // docker compose 只看不改：ps/logs（up/down/restart/build/push 走审批）。
@@ -710,8 +1111,9 @@ class CommandPolicy {
   static bool _isSafeGitArgs(List<String> args, String rootPath) {
     if (args.isEmpty) return false;
     // 只读动词白名单：社区 allowlist 交集（status/diff/log + show/blame/
-    // branch/remote/tag/fetch/reflog/rev-list/ls-tree/ls-remote/…）。
+    // branch/remote/tag/reflog/rev-list/ls-tree/…）。
     // push/commit/merge/rebase/reset/checkout/add 等写操作一律不在此列。
+    // 第9轮收敛：fetch/ls-remote 移出直放（恒发远端，走审批）。
     if (!const {
       'status',
       'diff',
@@ -721,12 +1123,10 @@ class CommandPolicy {
       'branch',
       'remote',
       'tag',
-      'fetch',
       'reflog',
       'rev-list',
       'rev-parse',
       'ls-tree',
-      'ls-remote',
       'check-ignore',
       'ls-files',
       'symbolic-ref',
@@ -1008,6 +1408,15 @@ class CommandPolicy {
     // 链式命令逐段判定：此前只看首命令，`echo ok; rm -rf ~` 首段无害
     // 即整体放过，恶意段藏在 `;`/`&&`/`||`/`|` 后静默执行。
     // 按段切分后任一段危险即整体拒绝。
+    // R2-F1：切段前先整串判管道进shell——此前按`|`切段后段内永不含
+    // 管道符，`curl X | sh`拆成[curl,X]/[sh]两段均放过。现整串先判。
+    final whole = tokens.join(' ');
+    if (RegExp(
+      r'\b(curl|wget)\b[^;`]*\|\s*(sh|bash|zsh|dash|fish|pwsh|powershell|nu|elvish)\b',
+    ).hasMatch(whole)) {
+      return true;
+    }
+    if (RegExp(r'\|\s*sh\s+-c\b').hasMatch(whole)) return true;
     final segments = <List<String>>[[]];
     for (final t in tokens) {
       if (t == ';' || t == '&' || t == '|' || t == '`') {
@@ -1077,16 +1486,44 @@ class CommandPolicy {
             joined.contains(' rd '))) {
       return true;
     }
+    // shell 内建污染上下文：export/typeset/declare/readonly/local 赋值
+    // 会污染本 shell 后续命令环境（CVE-2026-22708 类：allowlist 命令
+    // 携带 `export LD_PRELOAD=...` 执行）。赋值段直接判危险走审批，
+    // 不在 _tokenize 里静默跳过。
+    if (first == 'export' ||
+        first == 'typeset' ||
+        first == 'declare' ||
+        first == 'readonly' ||
+        first == 'local' ||
+        first == 'set' ||
+        first == 'unset' ||
+        first == 'env') {
+      return true;
+    }
     // chown 递归系统路径：flag 归一化大小写，`chown -R /` 同样拒绝。
     final lowerTokens = tokens.map((t) => t.toLowerCase()).toList();
     bool hasLower(String flag) => lowerTokens.any((t) => t == flag);
     if (first == 'chown' && hasLower('-r') && hasPrefix('/')) return true;
     // curl/wget 管道进 shell：不再一刀切拒绝正常下载，仅拒 `| sh/bash`。
-    if ((first == 'curl' || first == 'wget') &&
-        (joined.contains('| sh') ||
-            joined.contains('| bash') ||
-            joined.contains('| zsh'))) {
-      return true;
+    // 段内同样拒 fish/pwsh 等可执行 shell（整串正则已覆盖，此处纵深兜底）。
+    if (first == 'curl' || first == 'wget') {
+      const shells = {
+        'sh',
+        'bash',
+        'zsh',
+        'dash',
+        'fish',
+        'pwsh',
+        'powershell',
+        'nu',
+        'elvish',
+      };
+      if (tokens.length > 1 && shells.contains(tokens.last)) return true;
+      if (joined.contains('| sh') ||
+          joined.contains('| bash') ||
+          joined.contains('| zsh')) {
+        return true;
+      }
     }
     // 重定向覆盖设备/系统路径
     if (RegExp(
@@ -1101,6 +1538,32 @@ class CommandPolicy {
   /// prefs agentSandboxMode == 'docker' 时 run_command 走 docker 包裹执行。
   static bool sandboxMode(String? raw) =>
       (raw ?? '').trim().toLowerCase() == 'docker';
+
+  /// E6 网络外联类命令恒提级清单（Claude Code 安全口径
+  /// https://code.claude.com/docs/en/security）：
+  /// 命中即"审批档位 auto 仍 ask"——外联可静默下载数据/回传 secrets，
+  /// 不依赖 safeInvocation 白名单的偶然缺口（当前 curl 恰好不在白名单），
+  /// 在档位层显式降级，白名单/规则/信任路径后续变动也不产生静默直放通道。
+  static const _networkEscalateCommands = {
+    'curl',
+    'wget',
+    'nc',
+    'telnet',
+    'ssh',
+    'scp',
+    'ftp',
+    // R11-5-A 外联清单补gh：gh CLI恒走GitHub API（建公仓外发PixelLeak口径），
+    // 无本地语义不误伤。docker/python/node/npm/pip双用（本地构建/测试为主），
+    // 一律提级会逼每次npm test弹窗，不收敛——保持不加，由沙箱--network none兜底。
+    'gh',
+  };
+
+  /// 命令（含链式/管道段、sudo/env 前缀）任一位置命中网络外联命令即提级：
+  /// `npm test; curl ...` 藏段同样命中（分词口径与 _isDangerousTokens 对齐）。
+  static bool networkEscalate(String command) {
+    final tokens = _tokenize(_normalize(command));
+    return tokens.any(_networkEscalateCommands.contains);
+  }
 
   /// docker 包裹：在只读 ubuntu 容器内执行 [command]，工作区挂到 /work。
   /// 高危命令不包裹——调用方必须先走 judge 拒绝。
@@ -1125,7 +1588,13 @@ class CommandPolicy {
     return null;
   }
 
-  static List<String> dockerWrap(String command, String root, {int? uid, int? gid}) {
+  static List<String> dockerWrap(
+    String command,
+    String root, {
+    int? uid,
+    int? gid,
+    String? image,
+  }) {
     final mountRoot = p.normalize(p.absolute(root));
     if (mountRoot.contains('\u0000') ||
         mountRoot.contains(',') ||
@@ -1135,8 +1604,15 @@ class CommandPolicy {
     }
     const fallbackUid = '1000';
     const fallbackGid = '1000';
-    final resolvedUid = '${uid ?? int.tryParse(Platform.environment['DOCKER_UID'] ?? '') ?? _processUid() ?? fallbackUid}';
-    final resolvedGid = '${gid ?? int.tryParse(Platform.environment['DOCKER_GID'] ?? '') ?? _processGid() ?? fallbackGid}';
+    final resolvedUid =
+        '${uid ?? int.tryParse(Platform.environment['DOCKER_UID'] ?? '') ?? _processUid() ?? fallbackUid}';
+    final resolvedGid =
+        '${gid ?? int.tryParse(Platform.environment['DOCKER_GID'] ?? '') ?? _processGid() ?? fallbackGid}';
+    // 第11轮R3-1：镜像可配——此前硬编码ubuntu，无cache主机即整单失败。
+    // 优先 DOCKER_IMAGE 环境变量，非法值回退 ubuntu，不抛错阻断调用方。
+    final resolvedImage = _sanitizeDockerImage(
+      image ?? Platform.environment['DOCKER_IMAGE'],
+    );
     return [
       'docker',
       'run',
@@ -1162,11 +1638,68 @@ class CommandPolicy {
       'type=bind,source=$mountRoot,target=/work,readonly=false',
       '-w',
       '/work',
-      'ubuntu',
+      resolvedImage,
       'bash',
       '-c',
       command,
     ];
+  }
+
+  /// Docker镜像名消毒：仅允许 [a-z0-9._:/@-] 且非空，防 `--privileged`
+  /// 等参数注入；非法/缺失回退 ubuntu。
+  static String _sanitizeDockerImage(String? raw) {
+    final v = (raw ?? '').trim();
+    if (v.isEmpty || v.length > 256) return 'ubuntu';
+    if (!RegExp(r'^[a-zA-Z0-9][a-zA-Z0-9._:/@-]*$').hasMatch(v)) {
+      return 'ubuntu';
+    }
+    if (v.contains(' ') || v.contains('\u0000')) return 'ubuntu';
+    return v;
+  }
+
+  /// shell 通道命中 IDE 自身状态库即拒绝：与文件工具 sensitive 永拒对齐，
+  /// 封 run_command/terminal_write 经重定向/rm 删除 .my_ide 版本库的旁路
+  /// （此前只给命令摘要弹窗，需用户肉眼发现，长命令中段易漏）。
+  /// 判定走裸文本子串（.my_ide/ 或 .my_ide 结尾/引号包裹），宁可误拦走人工改名，
+  /// 不放过 `rm -rf .my_ide` / `> .my_ide/versions/manifest.json`。
+  /// R2-SEC1：shell展开/通配按可疑拒绝——`$(...)`/反引号/`${IFS}`/
+  /// 通配`*?[]`/变量`$x`可绕过静态子串（如.rm -rf .my_${IFS}ide运行时展开）。
+  static bool hitsIdeStateDir(String command) {
+    // R2-SEC1：展开/通配可疑即拒——`$(`/反引号/`${}`/`$VAR`/`*?[]`
+    // 与.my_ide同现时运行时可展开命中（如.rm -rf .my_${IFS}ide）。
+    // 静态无法证明展开后不命中，宁可误拦走审批/改名。
+    final lower = command.toLowerCase();
+    final hasStateRef =
+        lower.contains('.my_ide') || lower.contains('my_ide');
+    if (hasStateRef) {
+      if (lower.contains(r'$(') ||
+          lower.contains('`') ||
+          lower.contains(r'${') ||
+          RegExp(r'\$[a-zA-Z_]').hasMatch(command) ||
+          lower.contains('*') ||
+          lower.contains('?') ||
+          lower.contains('[')) {
+        return true;
+      }
+    }
+    // 先解一层引号包裹：`".my_ide"`/`'.my_ide'` 去引号后同样命中，
+    // 此前仅裸文本匹配，引号包裹+后缀可绕过。
+    final s = command
+        .replaceAll('\\', '/')
+        .toLowerCase()
+        .replaceAll('"', '')
+        .replaceAll("'", '');
+    // 分段匹配：`rm -rf .my_ide && echo ok` 中段同样命中，
+    // 此前仅匹配 `.my_ide/`/结尾/引号，中段+后缀命令可绕过。
+    if (RegExp(
+      r'(^|[\s\/;|&()\[\]{}=:,])\.my_ide($|[\s\/;|&()\[\]{}"\x27:,])',
+    ).hasMatch(s)) {
+      return true;
+    }
+    return s.contains('.my_ide/') ||
+        s.contains('.my_ide"') ||
+        s.contains(".my_ide'") ||
+        RegExp(r'\.my_ide\s*$').hasMatch(s);
   }
 
   /// 归一化：去首尾空格、转小写、压缩空白、剥掉 sudo / sh -c 包装，
@@ -1197,8 +1730,16 @@ class CommandPolicy {
 enum CommandVerdict { allow, approve, deny }
 
 class SafeCommandInvocation {
-  const SafeCommandInvocation(this.executable, this.arguments);
+  const SafeCommandInvocation(
+    this.executable,
+    this.arguments, {
+    this.redirectCommand,
+  });
 
   final String executable;
   final List<String> arguments;
+
+  /// A7：非空时命令含区内重定向，必须以 shell 执行该原文
+  /// （executable/arguments 是剥离重定向后的核心 argv，直跑会丢重定向）。
+  final String? redirectCommand;
 }

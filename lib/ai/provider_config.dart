@@ -107,6 +107,7 @@ class AiProviderConfig {
     this.anthropicVersion = '2023-06-01',
     List<AiModelOption>? models,
     Map<String, String>? extraHeaders,
+    Map<String, String>? mcpHeaders,
     this.useApiKeyHeader = false,
     this.responsesBackground = false,
     this.responsesPreviousResponse = false,
@@ -114,7 +115,8 @@ class AiProviderConfig {
     this.responsesCodeInterpreter = false,
     this.responsesToolChoice = 'auto',
   })  : models = models ?? [],
-        extraHeaders = extraHeaders ?? {};
+        extraHeaders = extraHeaders ?? {},
+        mcpHeaders = mcpHeaders ?? {};
 
   final String id;
   String name;
@@ -129,6 +131,9 @@ class AiProviderConfig {
   List<AiModelOption> models;
   /// 自定义附加请求头：OpenRouter 的 HTTP-Referer/X-Title、自建网关鉴权、代理标记等。
   Map<String, String> extraHeaders;
+  /// R6-P1：MCP 网关请求头——settings_store/WebDAV/备份早已按 mcpHeaders 加解密，
+  /// 但本类无字段致 fromJson 内存即丢、请求永不发送。现补齐透传。
+  Map<String, String> mcpHeaders;
   /// Azure 风格：用 `api-key: <key>` 代替 `Authorization: Bearer`。
   bool useApiKeyHeader;
   /// Responses 完整参数（仅 openaiResponses 协议用）：后台运行、多轮 previous_response_id
@@ -248,6 +253,8 @@ class AiProviderConfig {
         'anthropicVersion': anthropicVersion,
         'models': models.map((e) => e.toJson()).toList(),
         if (extraHeaders.isNotEmpty) 'extraHeaders': extraHeaders,
+        // R6-P1：mcpHeaders 回写——此前 toJson 漏写，编辑他字段后落盘即丢。
+        if (mcpHeaders.isNotEmpty) 'mcpHeaders': mcpHeaders,
         if (useApiKeyHeader) 'useApiKeyHeader': true,
         if (responsesBackground) 'responsesBackground': true,
         if (responsesPreviousResponse) 'responsesPreviousResponse': true,
@@ -283,6 +290,9 @@ class AiProviderConfig {
             .map((e) => AiModelOption.fromJson(Map<String, dynamic>.from(e)))
             .toList(),
         extraHeaders: ((j['extraHeaders'] as Map?) ?? {})
+            .map((k, v) => MapEntry('$k', '$v')),
+        // R6-P1：mcpHeaders 读入——此前 fromJson 漏读，providersRaw 解密值内存即丢。
+        mcpHeaders: ((j['mcpHeaders'] as Map?) ?? {})
             .map((k, v) => MapEntry('$k', '$v')),
         useApiKeyHeader: j['useApiKeyHeader'] == true,
         responsesBackground: j['responsesBackground'] == true,
@@ -327,6 +337,7 @@ class AiProviderConfig {
 
   /// 对话/拉表统一鉴权头：Anthropic 走 x-api-key；Azure 走 api-key；
   /// 其余走 Authorization: Bearer；最后叠加 extraHeaders（不覆盖鉴权头）。
+  /// R6-P1：mcpHeaders 同 extraHeaders 口径叠加（MCP 网关头随请求发送）。
   Map<String, String> authHeaders({String? anthropicVersionOverride}) {
     final headers = <String, String>{};
     final key = normalizeApiKey(token);
@@ -343,7 +354,7 @@ class AiProviderConfig {
         headers['Authorization'] = 'Bearer $key';
       }
     }
-    for (final entry in extraHeaders.entries) {
+    for (final entry in [...extraHeaders.entries, ...mcpHeaders.entries]) {
       final k = entry.key.trim();
       if (k.isEmpty) continue;
       final lower = k.toLowerCase();
@@ -367,6 +378,7 @@ class AiProviderConfig {
     AiApiStyle apiStyle = AiApiStyle.openaiCompatible,
     String anthropicVersion = '2023-06-01',
     Map<String, String> extraHeaders = const {},
+    Map<String, String> mcpHeaders = const {},
     bool useApiKeyHeader = false,
   }) async {
     if (apiStyle == AiApiStyle.anthropic) {
@@ -391,7 +403,7 @@ class AiProviderConfig {
         headers['Authorization'] = 'Bearer $key';
       }
     }
-    for (final entry in extraHeaders.entries) {
+    for (final entry in {...extraHeaders, ...mcpHeaders}.entries) {
       final k = entry.key.trim();
       if (k.isEmpty) continue;
       final lower = k.toLowerCase();
