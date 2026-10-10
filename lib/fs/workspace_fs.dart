@@ -2,6 +2,7 @@ import 'dart:io';
 import 'dart:math';
 
 import 'package:path/path.dart' as p;
+import 'package:shared_preferences/shared_preferences.dart';
 
 /// 统一文件门禁：基准 = 当前工作区根目录。
 /// - 区内：可读可写，直放
@@ -1574,6 +1575,49 @@ class CommandPolicy {
   static bool networkEscalate(String command) {
     final tokens = _tokenize(_normalize(command));
     return tokens.any(_networkEscalateCommands.contains);
+  }
+
+  /// 高危二次复核开关：默认关闭（fail-closed，无值/异常即 false）。
+  static Future<bool> prefsSecondReview() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getBool('securitySecondReview') == true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// 高危二次复核判定：judge 为 approve，或命中网络提级，或含高危子串
+  /// （git push / reset --hard / clean -fd / docker run|build / rm -rf /
+  /// chmod -R / mkfs / dd / shutdown）任一即 true；纯白名单 allow 且不含
+  /// 上述即 false。
+  static bool needsSecondReview(String command) {
+    try {
+      if (judge(command) == CommandVerdict.approve) return true;
+    } catch (_) {
+      // judge 异常按可疑处理，交由调用方提级（fail-closed）。
+      return true;
+    }
+    try {
+      if (networkEscalate(command)) return true;
+    } catch (_) {}
+    final lower = command.toLowerCase();
+    if (lower.contains('git push') ||
+        lower.contains('reset --hard') ||
+        lower.contains('clean -fd') ||
+        lower.contains('clean -df') ||
+        lower.contains('docker run') ||
+        lower.contains('docker build') ||
+        lower.contains('rm -rf') ||
+        lower.contains('rm -fr') ||
+        lower.contains('chmod -r') ||
+        lower.contains('mkfs') ||
+        lower.contains('shutdown')) {
+      return true;
+    }
+    // dd 单独按词边界判定：裸子串 'dd' 误伤过高（如 'add'）。
+    if (RegExp(r'(^|[\s;|&`"\x27])dd([\s;|&]|$)').hasMatch(lower)) return true;
+    return false;
   }
 
   /// docker 包裹：在只读 ubuntu 容器内执行 [command]，工作区挂到 /work。

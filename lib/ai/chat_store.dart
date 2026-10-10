@@ -287,6 +287,16 @@ class ChatMessage {
     return (promptTokens ?? 0) + (completionTokens ?? 0);
   }
 
+  /// 中断态：stopReason 含中断/取消/cancel/interrupt 之一即视为中断轮。
+  bool get isInterrupted {
+    final reason = (stopReason ?? '').toLowerCase();
+    if (reason.isEmpty) return false;
+    return reason.contains('中断') ||
+        reason.contains('取消') ||
+        reason.contains('cancel') ||
+        reason.contains('interrupt');
+  }
+
   double? get contextRatio {
     if (contextUsed == null || contextLimit == null || contextLimit! <= 0) {
       return null;
@@ -1353,6 +1363,8 @@ class ChatStore extends ChangeNotifier {
     String? primaryVersionId;
     for (var i = cutFrom; i < cutTo; i++) {
       final m = session.messages[i];
+      // 中断态过滤：中断轮版本节点保留在链中，仅版本面板可恢复，不随回退删除。
+      if (m.isInterrupted) continue;
       // 新模型：一轮一个 afterVersionId；兼容旧 before/after
       if (m.afterVersionId != null) {
         versionIdsToDrop.add(m.afterVersionId!);

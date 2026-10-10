@@ -2367,6 +2367,12 @@ class _AgentSettingsCardState extends State<_AgentSettingsCard> {
   late String _browser;
   late String _fetch;
   late String _readOutside;
+  bool _secondReview = false;
+  bool _telemetry = false;
+  bool _gitAutoCommit = false;
+  bool _gitPushBeforeRisky = false;
+  bool _worktreeIsolate = false;
+  double _worktreeThreshold = 10;
 
   static const _actions = <(String, String)>[
     ('auto', '自动审核'),
@@ -2411,6 +2417,14 @@ class _AgentSettingsCardState extends State<_AgentSettingsCard> {
     _browser = settings.getString('approveBrowser') ?? 'auto';
     _fetch = settings.getString('approveFetch') ?? 'auto';
     _readOutside = settings.getString('approveReadOutside') ?? 'auto';
+    _secondReview = settings.getBool('securitySecondReview') == true;
+    _telemetry = settings.getBool('telemetryEnabled') == true;
+    _gitAutoCommit = settings.getBool('gitAnchorAutoCommit') == true;
+    _gitPushBeforeRisky = settings.getBool('gitPushBeforeRisky') == true;
+    _worktreeIsolate = settings.getBool('agentWorktreeAutoIsolate') == true;
+    _worktreeThreshold = ((settings.getInt('agentWorktreeFileThreshold') ?? 10)
+            .clamp(1, 100))
+        .toDouble();
   }
 
   Future<void> _setAction(String key, String value) async {
@@ -2669,8 +2683,130 @@ class _AgentSettingsCardState extends State<_AgentSettingsCard> {
           const SizedBox(height: 12),
           const _AutoApprovalRulesEditor(),
           const SizedBox(height: 12),
+          _SwitchToggles(
+            colors: colors,
+            secondReview: _secondReview,
+            telemetry: _telemetry,
+            gitAutoCommit: _gitAutoCommit,
+            gitPushBeforeRisky: _gitPushBeforeRisky,
+            worktreeIsolate: _worktreeIsolate,
+            worktreeThreshold: _worktreeThreshold,
+            onChanged: (key, value) async {
+              switch (key) {
+                case 'securitySecondReview':
+                  await SettingsStore.instance.setBool(key, value);
+                  if (mounted) setState(() => _secondReview = value);
+                  break;
+                case 'telemetryEnabled':
+                  await SettingsStore.instance.setBool(key, value);
+                  if (mounted) setState(() => _telemetry = value);
+                  break;
+                case 'gitAnchorAutoCommit':
+                  await SettingsStore.instance.setBool(key, value);
+                  if (mounted) setState(() => _gitAutoCommit = value);
+                  break;
+                case 'gitPushBeforeRisky':
+                  await SettingsStore.instance.setBool(key, value);
+                  if (mounted) {
+                    setState(() => _gitPushBeforeRisky = value);
+                  }
+                  break;
+                case 'agentWorktreeAutoIsolate':
+                  await SettingsStore.instance.setBool(key, value);
+                  if (mounted) setState(() => _worktreeIsolate = value);
+                  break;
+              }
+            },
+            onThresholdChanged: (v) {
+              setState(() => _worktreeThreshold = v);
+              SettingsStore.instance.setInt(
+                'agentWorktreeFileThreshold',
+                v.round(),
+              );
+            },
+          ),
         ],
       ),
+    );
+  }
+}
+
+/// 新增开关组：高危二次复核 / 本地遥测 / git 锚点 / worktree 隔离。
+/// 全部默认关闭（影子仓默认开启、无开关），失败不阻断主流程。
+class _SwitchToggles extends StatelessWidget {
+  const _SwitchToggles({
+    required this.colors,
+    required this.secondReview,
+    required this.telemetry,
+    required this.gitAutoCommit,
+    required this.gitPushBeforeRisky,
+    required this.worktreeIsolate,
+    required this.worktreeThreshold,
+    required this.onChanged,
+    required this.onThresholdChanged,
+  });
+
+  final IdeColors colors;
+  final bool secondReview;
+  final bool telemetry;
+  final bool gitAutoCommit;
+  final bool gitPushBeforeRisky;
+  final bool worktreeIsolate;
+  final double worktreeThreshold;
+  final Future<void> Function(String key, bool value) onChanged;
+  final ValueChanged<double> onThresholdChanged;
+
+  Widget _row(String title, String desc, bool value, String key) {
+    return SwitchListTile(
+      contentPadding: EdgeInsets.zero,
+      dense: true,
+      title: Text(title, style: const TextStyle(fontSize: 12.5)),
+      subtitle: Text(
+        desc,
+        style: TextStyle(color: colors.textMuted, fontSize: 11.5),
+      ),
+      value: value,
+      onChanged: (v) => onChanged(key, v),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const SizedBox(height: 16),
+        Divider(height: 1, color: colors.divider),
+        const SizedBox(height: 12),
+        Text(
+          '安全与备份',
+          style: TextStyle(
+            color: colors.textPrimary,
+            fontSize: 13,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        _row('高危二次复核', '高危命令强制弹窗确认（默认关闭）', secondReview,
+            'securitySecondReview'),
+        _row('本地遥测', '仅本地落盘 .my_ide/logs/telemetry.log，不做远端上报（默认关闭）',
+            telemetry, 'telemetryEnabled'),
+        _row('git 锚点自动 commit', '版本落盘后顺手 git commit（默认关闭）',
+            gitAutoCommit, 'gitAnchorAutoCommit'),
+        _row('高风险前 push', '回退/恢复前先 git push（默认关闭）',
+            gitPushBeforeRisky, 'gitPushBeforeRisky'),
+        _row(
+            'worktree 自动隔离', '大改动前建 backup 分支（默认关闭）',
+            worktreeIsolate, 'agentWorktreeAutoIsolate'),
+        _AgentSlider(
+          colors: colors,
+          title: '隔离触发文件数',
+          desc: '单轮改动文件数达阈值且开启隔离时建备份分支（1~100）',
+          value: worktreeThreshold,
+          min: 1,
+          max: 100,
+          onChanged: onThresholdChanged,
+        ),
+      ],
     );
   }
 }
@@ -6076,7 +6212,9 @@ class _AiPanelState extends State<_AiPanel> {
                                   canRevertHunk:
                                       isAssistant &&
                                       !runner.isSessionRunning(current.id) &&
-                                      m.afterVersionId != null,
+                                      m.afterVersionId != null &&
+                                      // 中断轮不随对话回退：仅版本面板可恢复。
+                                      !m.isInterrupted,
                                   isLastFileInTurn:
                                       isAssistant &&
                                       m.files
@@ -6095,7 +6233,11 @@ class _AiPanelState extends State<_AiPanel> {
                                   showFooterMeta: isAssistant,
                                   onRevert:
                                       isAssistant &&
-                                          !runner.isSessionRunning(current.id)
+                                          !runner.isSessionRunning(
+                                            current.id,
+                                          ) &&
+                                          // 中断轮不随对话回退：仅版本面板可恢复。
+                                          !m.isInterrupted
                                       ? () =>
                                             _revertChatMessage(current.id, m.id)
                                       : null,
@@ -6104,7 +6246,9 @@ class _AiPanelState extends State<_AiPanel> {
                                           !runner.isSessionRunning(
                                             current.id,
                                           ) &&
-                                          m.afterVersionId != null
+                                          m.afterVersionId != null &&
+                                          // 中断轮不随对话回退：仅版本面板可恢复。
+                                          !m.isInterrupted
                                       ? (path) => _revertSingleFileInMessage(
                                           sessionId: current.id,
                                           messageId: m.id,
@@ -6559,8 +6703,8 @@ class _AiPanelState extends State<_AiPanel> {
       await workspace.saveAllDirtyTabs();
       if (!mounted) return;
       if (workspace.dirtyPaths().isNotEmpty) {
-        // 仍有未挂载编辑器的脏 tab：缓冲不在内存，无法落盘，
-        // 只记版本快照磁盘态，不静默丢弃本地缓冲。
+        // 未挂载缓冲已落侧车不丢：先把无 handler 的内存稿落盘再记快照。
+        await workspace.flushUnmountedDrafts();
       }
       await CheckpointScope.of(
         context,
@@ -6772,6 +6916,24 @@ class _AiPanelState extends State<_AiPanel> {
         mode: mode,
       );
       if (plan == null) return;
+      // 中断态过滤：区间内版本全被中断过滤时仍删对话、仅版本保留，提示走中断文案。
+      var interruptedOnly = false;
+      if (plan.versionIdsToDrop.isEmpty) {
+        final session = chats.sessionById(sessionId);
+        if (session != null) {
+          for (
+            var i = plan.cutFromIndex;
+            i < plan.cutToIndexExclusive && i < session.messages.length;
+            i++
+          ) {
+            final msg = session.messages[i];
+            if (msg.afterVersionId != null && msg.isInterrupted) {
+              interruptedOnly = true;
+              break;
+            }
+          }
+        }
+      }
       var dropIds = {...plan.versionIdsToDrop};
       if (mode == ChatRevertMode.toTurn && dropIds.isNotEmpty) {
         dropIds = checkpoints.expandDropForToTurn(
@@ -6806,7 +6968,9 @@ class _AiPanelState extends State<_AiPanel> {
       messenger.showSnackBar(
         SnackBar(
           content: Text(
-            plan.willDeleteSession
+            interruptedOnly
+                ? '该轮已中断，仅版本面板可恢复，不随对话删除'
+                : plan.willDeleteSession
                 ? '已回退并清除空对话'
                 : (hasVersions ? '已回退该轮对话' : '已撤销该轮对话（无文件改动）'),
           ),

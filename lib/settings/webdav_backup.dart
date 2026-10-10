@@ -373,6 +373,8 @@ class WebDavBackup {
         'approveBrowser': store.getString('approveBrowser'),
         'approveFetch': store.getString('approveFetch'),
         'approveReadOutside': store.getString('approveReadOutside'),
+        // 高危二次复核开关：布尔开关，随审批档位一并备份。
+        'securitySecondReview': store.getBool('securitySecondReview'),
       },
       'agent': {
         'agentMaxSteps': store.getInt('agentMaxSteps'),
@@ -383,6 +385,14 @@ class WebDavBackup {
         'agentTurnTokenBudget': store.getInt('agentTurnTokenBudget'),
         // R9-01：日费用上限同口径备份（字符串存double，缺失即0不限）。
         'agentDayCostLimit': store.getString('agentDayCostLimit'),
+        // 遥测开关与 git/worktree 相关开关：布尔/阈值一并备份。
+        'telemetryEnabled': store.getBool('telemetryEnabled'),
+        'gitAnchorAutoCommit': store.getBool('gitAnchorAutoCommit'),
+        'gitPushBeforeRisky': store.getBool('gitPushBeforeRisky'),
+        'agentWorktreeAutoIsolate': store.getBool('agentWorktreeAutoIsolate'),
+        'agentWorktreeFileThreshold': store.getInt(
+          'agentWorktreeFileThreshold',
+        ),
       },
       'customLanguageServers': store.customLanguageServers,
       'webdav': {
@@ -690,6 +700,11 @@ class WebDavBackup {
           await store.setString(key, v);
         }
       }
+      // 高危二次复核开关：布尔值，直接恢复（非档位字符串，不走放宽确认）。
+      final secondReview = approve['securitySecondReview'];
+      if (secondReview is bool) {
+        await store.setBool('securitySecondReview', secondReview);
+      }
     }
     final agent = payload['agent'];
     if (agent is Map) {
@@ -722,6 +737,23 @@ class WebDavBackup {
       final normalized = normalizeDayCostLimitForTest(agent['agentDayCostLimit']);
       if (normalized != null) {
         await store.setString('agentDayCostLimit', normalized);
+      }
+      // 遥测与 git/worktree 开关恢复：布尔直写；文件阈值按运行态钳制 1~100。
+      for (final key in [
+        'telemetryEnabled',
+        'gitAnchorAutoCommit',
+        'gitPushBeforeRisky',
+        'agentWorktreeAutoIsolate',
+      ]) {
+        final v = agent[key];
+        if (v is bool) await store.setBool(key, v);
+      }
+      final threshold = agent['agentWorktreeFileThreshold'];
+      if (threshold is num) {
+        await store.setInt(
+          'agentWorktreeFileThreshold',
+          threshold.toInt().clamp(1, 100),
+        );
       }
     }
     final custom = payload['customLanguageServers'];

@@ -26,6 +26,7 @@ import 'subagent_runtime.dart';
 import 'tool_registry.dart';
 import 'usage_ledger.dart';
 import 'cron_scheduler.dart';
+import '../diagnostics/telemetry.dart';
 import '../lsp/symbol_index.dart';
 
 /// Chat：纯对话不调工具；Agent：可读写文件与执行命令；Plan：只读调研出方案，不落盘。
@@ -2379,6 +2380,13 @@ class AgentRunner extends ChangeNotifier {
       // save→clear窗口崩溃不再双assistant。此处保持先落消息后清不断点。
       // 本轮已完整落盘，清掉崩溃断点日志。
       await _chats.clearTurnJournal(runSessionId);
+      // 遥测：每轮落盘后记一条（仅原因与文件数）。
+      try {
+        await Telemetry.record('agent.turn', {
+          'stopReason': stopReason,
+          'files': fileList.length,
+        });
+      } catch (_) {}
       // 用量账本：按日聚合本轮 token + 费用估算，失败不阻断主流程。
       try {
         final price = await UsageLedger.loadPricePer1K();

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
@@ -8,7 +9,11 @@ import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../diagnostics/app_logger.dart';
+import '../diagnostics/telemetry.dart';
 import '../fs/workspace_fs.dart';
+import 'git_anchor.dart';
+import 'git_worktree.dart';
+import 'shadow_store.dart';
 
 /// 自研版本底层：工作区是唯一完整文本；版本库只记差量。
 ///
@@ -511,6 +516,8 @@ class CheckpointStore extends ChangeNotifier {
       _checkpoints = [];
       // 无文件即空库：GC可正常清理孤儿（无磁盘tree/diff需保护）。
       _manifestLoaded = true;
+      // manifest 缺失时用影子仓补骨架（新库无影子即保持空）。
+      await _rebuildCheckpointsFromShadows(versions);
       return;
     }
     // 主文件失败时读备份；都失败则保留内存历史，不静默清空。
@@ -540,6 +547,31 @@ class CheckpointStore extends ChangeNotifier {
       }
     }
     // 主备都坏：保留内存历史，等待下次成功保存覆盖，不清空。
+    // 影子恢复：主备解析都失败时，用影子仓重建骨架保证版本链不丢。
+    await _rebuildCheckpointsFromShadows(versions);
+  }
+
+  /// 影子恢复：manifest 缺失或主备解析失败时，用影子仓重建骨架。
+  /// 只在当前 _checkpoints 为空时补（不覆盖主备已读出的节点），
+  /// 骨架 message='影子恢复'、kind='auto-backup'，files 取影子 tree 的 key。
+  Future<void> _rebuildCheckpointsFromShadows(Directory versions) async {
+    try {
+      if (_checkpoints.isNotEmpty) return;
+      final shadows = await ShadowStore.loadAllShadows(versions.path);
+      if (shadows.isEmpty) return;
+      final ids = shadows.keys.where(_isSafeVersionId).toList()..sort();
+      _checkpoints = [
+        for (final id in ids.reversed)
+          CheckpointInfo(
+            id: id,
+            message: '影子恢复',
+            createdAt: DateTime.now(),
+            kind: 'auto-backup',
+            files: (shadows[id]!.keys.toList()..sort()),
+          ),
+      ];
+      _manifestLoaded = true;
+    } catch (_) {}
   }
 
   /// 原子保存：tmp 写盘 + flush + rename，旧 manifest 留 .bak。
@@ -720,6 +752,8 @@ class CheckpointStore extends ChangeNotifier {
     await _writeFileAtomic(file, jsonEncode({'id': id, 'files': sorted}));
     _treeCache[id] = Map<String, String>.from(sorted);
     _boundVersionCaches();
+    // 影子仓：落 tree 成功后顺手写本地第二副本，失败吞错不阻塞。
+    unawaited(ShadowStore.writeShadow(versions.path, id, sorted));
   }
 
   /// 记录一次 checkpoint：内容寻址写 blob，tree 只记 path→hash。
@@ -821,10 +855,31 @@ class CheckpointStore extends ChangeNotifier {
       if (!_checkpoints.any((e) => e.id == id)) _checkpoints.insert(0, info);
       await _saveManifest();
       await _clearCommitJournal();
+      // git 锚点：成功落盘后 fire-and-forget 记命名 commit，不阻塞返回。
+      try {
+        unawaited(GitAnchor.maybeAnchorCommit(root, info.message));
+      } catch (_) {}
+      // worktree 隔离：变化文件数达阈值且开启时，fire-and-forget 建备份分支。
+      unawaited(() async {
+        try {
+          final threshold = await GitWorktree.prefsThreshold();
+          if (changes.length >= threshold &&
+              await GitWorktree.prefsAutoIsolate()) {
+            await GitWorktree.ensureBackupBranch(root, 'pre-checkpoint');
+          }
+        } catch (_) {}
+      }());
       // 4.4 版本上限：只保留最近 100 个节点，超量删最旧的 ai 单步节点，
       // manual/auto-backup 保留。无上限曾导致每 tool 一节点无限膨胀。
       await _enforceVersionCap();
       notifyListeners();
+      // 遥测：checkpoint 成功后记一条（仅数量，不记路径原文）。
+      try {
+        await Telemetry.record('checkpoint', {
+          'kind': kind,
+          'files': info.files.length,
+        });
+      } catch (_) {}
       return info;
     } finally {
       _busy = false;
@@ -2119,6 +2174,15 @@ class CheckpointStore extends ChangeNotifier {
     _bumpRestoreGen();
     final myGen = _restoreGenLocal;
     notifyListeners();
+    // 高风险前 push：开启时先推远端，失败只记日志不抛错。
+    try {
+      if (await GitAnchor.prefsPushBeforeRisky()) {
+        final pushed = await GitAnchor.maybePushBeforeRisky(root);
+        if (!pushed) {
+          AppLogger.instance.warn('checkpoint', '恢复前 push 失败，继续本地恢复');
+        }
+      }
+    } catch (_) {}
     try {
       // restore 起点快照钉住：_captureWorkspace → 建 redo 保险 → 应用树
       // 三段之间 Agent/外部写入会让保险与落盘基线分叉（丢写/回滚错位）。
@@ -2213,6 +2277,12 @@ class CheckpointStore extends ChangeNotifier {
         currentSnapshot: current,
       );
       notifyListeners();
+      // 遥测：恢复成功后记一条（仅数量）。
+      try {
+        await Telemetry.record('restore', {
+          'count': effectiveDesired.length,
+        });
+      } catch (_) {}
       return refused;
     } finally {
       _busy = false;
@@ -2670,6 +2740,16 @@ class CheckpointStore extends ChangeNotifier {
     _busy = true;
     _bumpRestoreGen();
     notifyListeners();
+    // 高风险前 push：开启时先推远端，失败只记日志不抛错。
+    try {
+      final r = _rootPath;
+      if (r != null && await GitAnchor.prefsPushBeforeRisky()) {
+        final pushed = await GitAnchor.maybePushBeforeRisky(r);
+        if (!pushed) {
+          AppLogger.instance.warn('checkpoint', '回退前 push 失败，继续本地回退');
+        }
+      }
+    } catch (_) {}
     // 借位记安全节点：外层占位不释放，内层 checkpoint 临时借位执行。
     final safetyId = await _safetyCheckpointIfDrifted(allowBusyOwner: true);
     try {
@@ -2686,6 +2766,10 @@ class CheckpointStore extends ChangeNotifier {
       } finally {
         _dropReentrancy--;
       }
+      // 遥测：回撤成功后记一条（仅数量）。
+      try {
+        await Telemetry.record('revert', {'count': safeIds.length});
+      } catch (_) {}
     } finally {
       _busy = false;
       _bumpRestoreGen();
@@ -2713,6 +2797,15 @@ class CheckpointStore extends ChangeNotifier {
     // R6-01：单文件/单块回退同样推进 restore 世代，写盘侧排队可见。
     _bumpRestoreGen();
     notifyListeners();
+    // 高风险前 push：开启时先推远端，失败只记日志不抛错。
+    try {
+      if (await GitAnchor.prefsPushBeforeRisky()) {
+        final pushed = await GitAnchor.maybePushBeforeRisky(root);
+        if (!pushed) {
+          AppLogger.instance.warn('checkpoint', '单文件回退前 push 失败，继续本地回退');
+        }
+      }
+    } catch (_) {}
     final safetyId = await _safetyCheckpointIfDrifted(allowBusyOwner: true);
     try {
       final changesBefore = await changesOf(versionId);

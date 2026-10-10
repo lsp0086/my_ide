@@ -692,6 +692,17 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
 
   @override
   void dispose() {
+    // 未挂载脏取回：卸载时若脏则暂存内存稿并落侧车，关闭 tab 后仍可取回。
+    if (_dirty) {
+      try {
+        _workspace?.stashDraft(widget.path, _controller.text);
+      } catch (_) {}
+      try {
+        unawaited(
+          _workspace?.persistDraftSidecar(widget.path, _controller.text),
+        );
+      } catch (_) {}
+    }
     _signatureDebounce?.cancel();
     _localCheckTimer?.cancel();
     _diagnostics?.clearFile(widget.path);
@@ -1059,18 +1070,36 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
         content = await _readText(widget.path);
       }
       if (!mounted) return;
+      // 未挂载脏取回：内存稿优先，其次磁盘侧车，最后才用磁盘内容；大文件窗口化逻辑不动。
+      var effective = content;
+      var restoredDraft = false;
+      final draftWorkspace = WorkspaceScope.maybeOf(context);
+      final memDraft = draftWorkspace?.takeDraft(widget.path);
+      if (memDraft != null) {
+        effective = memDraft;
+        restoredDraft = true;
+      } else {
+        try {
+          final sidecar = await draftWorkspace?.readDraftSidecar(widget.path);
+          if (sidecar != null) {
+            effective = sidecar;
+            restoredDraft = true;
+          }
+        } catch (_) {}
+      }
+      if (!mounted) return;
       _savedContent = content;
-      _controller.text = content;
+      _controller.text = effective;
       setState(() {
         _loading = false;
-        _dirty = false;
+        _dirty = restoredDraft;
         _isLargeFile = stat.size > _largeFileBytes;
       });
       if (isLarge && !_largeFileExpanded && mounted) {
         setState(() => _gotoHint = '大文件窗口化：仅加载前 $_largeFileWindowLines 行，保存前请先加载全部或确认局部编辑。');
       }
       final workspace = WorkspaceScope.maybeOf(context);
-      workspace?.setDirty(widget.path, false);
+      workspace?.setDirty(widget.path, restoredDraft);
       workspace?.rememberDiskStamp(widget.path);
       workspace?.clearOverwriteConfirm(widget.path);
       _scheduleLocalIntegrityCheck(immediate: true);
@@ -1175,6 +1204,14 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
       final workspace = WorkspaceScope.maybeOf(context);
       workspace?.setDirty(widget.path, false);
       workspace?.rememberDiskStamp(widget.path);
+      // 保存成功清侧车：内存稿与磁盘稿都不再需要。
+      try {
+        workspace?.takeDraft(widget.path);
+      } catch (_) {}
+      try {
+        // ignore: discarded_futures
+        workspace?.clearDraftSidecar(widget.path);
+      } catch (_) {}
       // 保存后增量更新符号索引
       SymbolIndex.instance.reindexFile(widget.path, content: _controller.text);
       await widget.onSaved?.call(widget.path);

@@ -4,6 +4,7 @@ import 'dart:io' show Platform;
 import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 
+import '../diagnostics/app_logger.dart';
 import '../fs/workspace_fs.dart';
 import '../mcp/mcp_client.dart';
 import '../mcp/mcp_config.dart';
@@ -1908,14 +1909,27 @@ class ToolRegistry {
           sessionId: sessionId,
         );
         final useDocker = CommandPolicy.sandboxMode(sandboxMode);
+        // 高危二次复核（默认关闭、fail-closed）：开关开启且命中高危时强制提级为 ask，
+        // 覆盖 auto 规则与信任路径；deny/取消语义保持不变。
+        var secondReview = false;
+        try {
+          secondReview =
+              await CommandPolicy.prefsSecondReview() &&
+              CommandPolicy.needsSecondReview(command);
+        } catch (_) {
+          secondReview = false;
+        }
+        final effectiveAction = secondReview
+            ? ApprovalAction.ask
+            : action;
         // E6 网络类命令恒提级：curl/wget/nc/telnet/ssh/scp/ftp 任一命中
         // （含链式藏段），审批档位 auto 仍 ask——外联命令不得被 auto 规则/
         // 信任路径静默放行。来源 https://code.claude.com/docs/en/security
         final networkAsk =
-            action == ApprovalAction.auto &&
+            effectiveAction == ApprovalAction.auto &&
             CommandPolicy.networkEscalate(command);
         final cmdApproved = await _gate.shouldProceed(
-          networkAsk ? ApprovalAction.ask : action,
+          networkAsk ? ApprovalAction.ask : effectiveAction,
           PendingApproval(
             kind: 'command',
             title: useDocker ? '执行命令（Docker 沙箱）' : '执行命令',
@@ -1924,7 +1938,7 @@ class ToolRegistry {
             // 超长摘要取首尾两段：仅截前 200 字符时，攻击者可把恶意段藏在
             // 200 字符后诱导批准；尾段可见才能发现 `前段无害+后段 rm -rf`。
             detail:
-                '工作区：$rootPath${useDocker ? '\n沙箱：docker run --rm -v $rootPath:/work -w /work ubuntu' : ''}\n命令摘要：${_shortJson({'command': _summarizeCommand(command)})}',
+                '工作区：$rootPath${useDocker ? '\n沙箱：docker run --rm -v $rootPath:/work -w /work ubuntu' : ''}\n命令摘要：${_shortJson({'command': _summarizeCommand(command)})}${secondReview ? '\n二次复核：高危命令已提级（securitySecondReview）' : ''}',
             trustKey: trustKey,
           ),
           sessionId: sessionId,
@@ -1943,6 +1957,17 @@ class ToolRegistry {
           );
         } finally {
           statusEnd(stCmd, sessionId: sessionId);
+        }
+        // 二次复核审计：仅记已脱敏摘要前 120 字，不记原文。
+        if (secondReview) {
+          try {
+            final summary = command.length <= 120
+                ? command
+                : command.substring(0, 120);
+            AppLogger.instance.audit('security.second-review', {
+              'command': AppLogger.redactSensitiveText(summary),
+            });
+          } catch (_) {}
         }
         // 命令无论成功失败都按变更探测刷新：失败也可能已改盘。
         // 输出恒标 untrusted：命令含 curl 外部数据，同轮 run→write 必须提级，

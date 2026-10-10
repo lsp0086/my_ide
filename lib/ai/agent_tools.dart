@@ -9,6 +9,7 @@ import 'package:path/path.dart' as p;
 import '../diagnostics/app_logger.dart';
 import '../fs/workspace_fs.dart';
 import '../lsp/language_servers.dart';
+import '../version/git_anchor.dart';
 import '../workspace/semantic_index.dart';
 import '../workspace/workspace_search.dart';
 import 'command_process_manager.dart';
@@ -3302,6 +3303,67 @@ class AgentTools {
       }
       final changed = diffFiles.length;
       final message = _suggestCommitMessage(diffFiles, additions, deletions);
+      // 该工具本身走审批，走到此处即用户已批准：开关开启且无敏感文件时
+      // 才执行本地 commit；push 同样看开关。全程 try/catch，失败只填 failed。
+      var commitAction = 'not_executed';
+      var pushAction = 'not_executed';
+      try {
+        final autoCommit = await GitAnchor.prefsAutoCommit();
+        if (autoCommit && sensitive.isEmpty && changed > 0) {
+          try {
+            final addRes = await Process.run('git', [
+              ..._safeGitPrefix(),
+              'add',
+              '-A',
+            ], workingDirectory: rootPath).timeout(const Duration(seconds: 10));
+            if (addRes.exitCode != 0) {
+              commitAction = 'failed:${'${addRes.stderr}'.trim()}';
+            } else {
+              final commitRes = await Process.run('git', [
+                ..._safeGitPrefix(),
+                'commit',
+                '-m',
+                message,
+              ], workingDirectory: rootPath).timeout(const Duration(seconds: 10));
+              if (commitRes.exitCode == 0) {
+                String sha = '';
+                try {
+                  final shaRes = await Process.run('git', [
+                    ..._safeGitPrefix(),
+                    'rev-parse',
+                    'HEAD',
+                  ], workingDirectory: rootPath).timeout(
+                    const Duration(seconds: 10),
+                  );
+                  if (shaRes.exitCode == 0) sha = '${shaRes.stdout}'.trim();
+                } catch (_) {}
+                commitAction = sha.isEmpty ? 'executed' : 'executed:$sha';
+              } else {
+                final reason = '${commitRes.stderr}'.trim().isEmpty
+                    ? '${commitRes.stdout}'.trim()
+                    : '${commitRes.stderr}'.trim();
+                commitAction = 'failed:$reason';
+              }
+            }
+          } catch (e) {
+            commitAction = 'failed:$e';
+          }
+        }
+        final pushBefore = await GitAnchor.prefsPushBeforeRisky();
+        if (pushBefore) {
+          try {
+            final pushRes = await Process.run('git', [
+              ..._safeGitPrefix(),
+              'push',
+            ], workingDirectory: rootPath).timeout(const Duration(seconds: 15));
+            pushAction = pushRes.exitCode == 0
+                ? 'executed'
+                : 'failed:${'${pushRes.stderr}'.trim()}';
+          } catch (e) {
+            pushAction = 'failed:$e';
+          }
+        }
+      } catch (_) {}
       return AgentToolResult(
         ok: true,
         output: jsonEncode({
@@ -3316,7 +3378,7 @@ class AgentTools {
           'sensitiveFiles': sensitive,
           'risks': risks,
           'commitMessageSuggestion': message,
-          'actions': const {'commit': 'not_executed', 'push': 'not_executed'},
+          'actions': {'commit': commitAction, 'push': pushAction},
         }),
       );
     } catch (e) {

@@ -3,11 +3,13 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:crypto/crypto.dart' as crypto;
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 
+import '../diagnostics/telemetry.dart';
 import '../fs/workspace_fs.dart';
 import '../settings/settings_store.dart';
 
@@ -146,6 +148,8 @@ class WorkspaceController extends ChangeNotifier {
       _overwriteConfirmPending.add(path);
     } else {
       _dirtyPaths.remove(path);
+      _draftBuffers.remove(path);
+      unawaited(clearDraftSidecar(path));
       final index = _tabs.indexWhere((tab) => tab.path == path);
       if (index >= 0) {
         _tabs[index] = _tabs[index].copyWith(isDirty: false);
@@ -162,6 +166,8 @@ class WorkspaceController extends ChangeNotifier {
   Future<void> forceReload(String path) async {
     _conflictPaths.remove(path);
     _dirtyPaths.remove(path);
+    _draftBuffers.remove(path);
+    unawaited(clearDraftSidecar(path));
     final index = _tabs.indexWhere((tab) => tab.path == path);
     if (index >= 0) {
       _tabs[index] = _tabs[index].copyWith(isDirty: false);
@@ -233,6 +239,74 @@ class WorkspaceController extends ChangeNotifier {
 
   String? takeDraft(String path) => _draftBuffers.remove(path);
 
+  /// 未挂载脏缓冲侧车目录：`<root>/.my_ide/drafts/`，文件名用 path 的 sha1 hex。
+  File? _draftSidecarFileFor(String path) {
+    final root = _rootPath;
+    if (root == null || path.isEmpty) return null;
+    try {
+      final hex = crypto.sha1.convert(utf8.encode(path)).toString();
+      return File(p.join(root, '.my_ide', 'drafts', '$hex.draft'));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 同步判断是否有侧车关联（供 setDirty 同步路径用，不抛错）。
+  bool _hasDraftAssociation(String path) {
+    if (_draftBuffers.containsKey(path)) return true;
+    try {
+      return _draftSidecarFileFor(path)?.existsSync() == true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// 未挂载缓冲落侧车：IO 全吞错不抛。
+  Future<void> persistDraftSidecar(String path, String text) async {
+    final file = _draftSidecarFileFor(path);
+    if (file == null) return;
+    try {
+      await file.parent.create(recursive: true);
+      await file.writeAsString(text, flush: true);
+    } catch (_) {}
+  }
+
+  /// 读回侧车缓冲：不存在/失败返回 null，不抛错。
+  Future<String?> readDraftSidecar(String path) async {
+    final file = _draftSidecarFileFor(path);
+    if (file == null) return null;
+    try {
+      if (!await file.exists()) return null;
+      return await file.readAsString();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// 保存成功后清侧车：IO 吞错不抛。
+  Future<void> clearDraftSidecar(String path) async {
+    final file = _draftSidecarFileFor(path);
+    if (file == null) return;
+    try {
+      if (await file.exists()) await file.delete();
+    } catch (_) {}
+  }
+
+  /// 把未挂载（无 saveHandler）的脏缓冲落侧车，返回落盘数；脏态保留供取回。
+  Future<int> flushUnmountedDrafts() async {
+    var count = 0;
+    try {
+      for (final path in List.of(_dirtyPaths)) {
+        if (_saveHandlers.containsKey(path)) continue;
+        final text = _draftBuffers[path];
+        if (text == null) continue;
+        await persistDraftSidecar(path, text);
+        count++;
+      }
+    } catch (_) {}
+    return count;
+  }
+
   void registerSaveHandler(String path, Future<bool> Function() save) {
     _saveHandlers[path] = save;
   }
@@ -258,6 +332,10 @@ class WorkspaceController extends ChangeNotifier {
           if (ok) saved.add(entry.key);
         } catch (_) {}
       }
+      // 未挂载缓冲落侧车：无 handler 的脏条目内存稿落盘，不丢。
+      try {
+        await flushUnmountedDrafts();
+      } catch (_) {}
       return saved;
     } finally {
       _savingAll = false;
@@ -485,6 +563,8 @@ class WorkspaceController extends ChangeNotifier {
     _rootPath = normalized;
     _tabs.clear();
     _dirtyPaths.clear();
+    _draftBuffers.clear();
+    // 仅清内存稿：磁盘侧车保留，供下次打开取回。
     _conflictPaths.clear();
     _pathContentEpoch.clear();
     _diskMtimeMs.clear();
@@ -498,6 +578,10 @@ class WorkspaceController extends ChangeNotifier {
     _startWatch();
     _startAutosave();
     await _restoreSessionTabs();
+    // 遥测绑定当前项目：落盘目录随项目切换。
+    try {
+      Telemetry.bindProject(normalized);
+    } catch (_) {}
     return null;
   }
 
@@ -520,6 +604,7 @@ class WorkspaceController extends ChangeNotifier {
     // 旧项目闭包与全文缓冲必须清：否则 saveAll/autosave 会误调旧项目。
     _saveHandlers.clear();
     _draftBuffers.clear();
+    // 仅清内存稿：磁盘侧车保留，供下次打开取回。
     _overwriteConfirmPending.clear();
     _pathContentEpoch.clear();
     _diskMtimeMs.clear();
@@ -529,6 +614,10 @@ class WorkspaceController extends ChangeNotifier {
     _treeError = null;
     _loadingTree = false;
     _openGeneration++;
+    // 遥测解绑：无项目时只记内存不落盘。
+    try {
+      Telemetry.bindProject(null);
+    } catch (_) {}
     notifyListeners();
   }
 
@@ -1068,6 +1157,22 @@ class WorkspaceController extends ChangeNotifier {
     }
   }
 
+  /// 重命名时侧车跟随新路径：读旧稿写新稿后删旧稿，IO 吞错不抛。
+  Future<void> _moveDraftSidecar(String oldPath, String newPath) async {
+    try {
+      String hexOf(String s) => crypto.sha1.convert(utf8.encode(s)).toString();
+      final root = _rootPath;
+      if (root == null) return;
+      final oldFile = File(p.join(root, '.my_ide', 'drafts', '${hexOf(oldPath)}.draft'));
+      if (!await oldFile.exists()) return;
+      final text = await oldFile.readAsString();
+      final newFile = File(p.join(root, '.my_ide', 'drafts', '${hexOf(newPath)}.draft'));
+      await newFile.parent.create(recursive: true);
+      await newFile.writeAsString(text, flush: true);
+      await oldFile.delete();
+    } catch (_) {}
+  }
+
   void _retargetTabs(String oldAbs, String newAbs) {
     final isDirRename = _tabs.any((t) => p.isWithin(oldAbs, t.path));
     for (var i = 0; i < _tabs.length; i++) {
@@ -1086,6 +1191,10 @@ class WorkspaceController extends ChangeNotifier {
         isDirty: tab.isDirty,
       );
       if (_dirtyPaths.remove(tab.path)) _dirtyPaths.add(next);
+      // 重命名时内存稿随路径迁移；旧侧车异步清掉，避免旧名残留误恢复。
+      final draft = _draftBuffers.remove(tab.path);
+      if (draft != null) _draftBuffers[next] = draft;
+      unawaited(_moveDraftSidecar(tab.path, next));
       if (_conflictPaths.remove(tab.path)) _conflictPaths.add(next);
       final stamp = _diskMtimeMs.remove(tab.path);
       if (stamp != null) _diskMtimeMs[next] = stamp;
@@ -1093,6 +1202,19 @@ class WorkspaceController extends ChangeNotifier {
       if (epoch != null) _pathContentEpoch[next] = epoch;
       if (_activePath == tab.path) _activePath = next;
       if (_selectedPath == tab.path) _selectedPath = next;
+    }
+    // 目录重命名：未挂载脏稿（无 tab 但 dirty 保留）随目录迁移，避免残留旧路径。
+    for (final path in List.of(_dirtyPaths)) {
+      if (path == oldAbs || p.isWithin(oldAbs, path)) {
+        final next = path == oldAbs
+            ? newAbs
+            : p.join(newAbs, p.relative(path, from: oldAbs));
+        _dirtyPaths.remove(path);
+        _dirtyPaths.add(next);
+        final draft = _draftBuffers.remove(path);
+        if (draft != null) _draftBuffers[next] = draft;
+        unawaited(_moveDraftSidecar(path, next));
+      }
     }
     if (isDirRename) notifyListeners();
   }
@@ -1199,6 +1321,19 @@ class WorkspaceController extends ChangeNotifier {
             .toList();
         for (final path in toClose) {
           closeTab(path);
+          // 删除文件时脏态与草稿一并清：closeTab 为取回保留脏态，但文件已进回收站，
+          // 残留 dirty/侧车会在下次打开时误恢复已删内容。
+          _dirtyPaths.remove(path);
+          _draftBuffers.remove(path);
+          unawaited(clearDraftSidecar(path));
+        }
+        // 目录删除：未挂载脏稿（tab 已关但 dirty 保留）同样清理，避免已删内容残留。
+        for (final path in List.of(_dirtyPaths)) {
+          if (path == abs || p.isWithin(abs, path)) {
+            _dirtyPaths.remove(path);
+            _draftBuffers.remove(path);
+            unawaited(clearDraftSidecar(path));
+          }
         }
         _diskMtimeMs.remove(abs);
         _dirtyPaths.remove(abs);
@@ -1379,7 +1514,7 @@ class WorkspaceController extends ChangeNotifier {
 
     final wasActive = _activePath == path;
     _tabs.removeAt(index);
-    _dirtyPaths.remove(path);
+    // 未挂载脏取回：tab 行可删，但脏态保留供侧车取回，不在这里清 _dirtyPaths。
 
     if (_tabs.isEmpty) {
       _activePath = null;
@@ -1438,7 +1573,15 @@ class WorkspaceController extends ChangeNotifier {
 
   void setDirty(String path, bool dirty) {
     final index = _tabs.indexWhere((tab) => tab.path == path);
-    if (index < 0) return;
+    if (index < 0) {
+      // 未挂载脏态可见：tab 不存在但有内存稿/侧车关联时仍记录 dirty，供取回。
+      if (dirty && _hasDraftAssociation(path)) {
+        if (_dirtyPaths.add(path)) notifyListeners();
+      } else if (!dirty) {
+        if (_dirtyPaths.remove(path)) notifyListeners();
+      }
+      return;
+    }
 
     final changed = dirty ? _dirtyPaths.add(path) : _dirtyPaths.remove(path);
     final tab = _tabs[index];

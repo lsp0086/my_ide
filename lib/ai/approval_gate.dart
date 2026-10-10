@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../diagnostics/telemetry.dart';
 import 'agent_runner.dart' show AgentQuestion, ApprovalAction, PendingApproval;
 
 /// 审批门禁：把 Completer / pending 状态从 AgentRunner 里抽出来，
@@ -589,21 +590,34 @@ class ApprovalGate extends ChangeNotifier {
     // 避免后排超时误拒队首导致队列错位。
     // 第5轮R5-2：超时打标记——此前超时与用户拒绝/取消同口径返回false，
     // 下游无法区分审计与重试语义。现超时置位，调用方凭 wasApprovalTimeout 区分。
-    return completer.future.timeout(
-      approvalTimeoutForTest,
-      onTimeout: () {
-        if (completer.isCompleted) return false;
-        _timedOutSessions.add(sessionId);
-        if (_approvalCompleter == completer) {
-          resolveApproval(false);
-        } else {
-          _approvalQueue.remove(entry);
-          completer.complete(false);
-          notifyListeners();
-        }
-        return false;
-      },
-    );
+    final kind = approval.kind;
+    return completer.future
+        .timeout(
+          approvalTimeoutForTest,
+          onTimeout: () {
+            if (completer.isCompleted) return false;
+            _timedOutSessions.add(sessionId);
+            if (_approvalCompleter == completer) {
+              resolveApproval(false);
+            } else {
+              _approvalQueue.remove(entry);
+              completer.complete(false);
+              notifyListeners();
+            }
+            return false;
+          },
+        )
+        .then((approved) {
+          // 遥测：审批决议后记一条（仅种类与通过/拒绝）。
+          try {
+            // ignore: unawaited_futures
+            Telemetry.record('approval', {
+              'kind': kind,
+              'decision': approved ? 'approved' : 'denied',
+            });
+          } catch (_) {}
+          return approved;
+        });
   }
 
   Future<String?> askUser(AgentQuestion question, {String sessionId = ''}) {
