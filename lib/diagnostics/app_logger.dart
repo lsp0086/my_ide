@@ -155,18 +155,29 @@ class AppLogger {
 
   /// 退出前刷盘：供关闭链路调用，此前退出无 flush，崩溃中间丢日志。
   Future<void> flush() async {
-    var guard = 0;
     // R1-T3：等在途_flush释放后再刷——此前_flush因_writing早退即返回，
     // 致flush后pending仍有条目，单测读文件缺marker。
-    while (guard++ < 20) {
+    // Windows CI 磁盘慢：固定 20×10ms 上限约 200ms，单次落盘超限即
+    // 提前返回致 flush 后读不到 marker。改按 10s deadline 排空。
+    bool flushable() {
+      final current = _rootPath;
+      if (current != null && current.isNotEmpty) return true;
+      return _pending.any((e) => e.root != null && e.root!.isNotEmpty);
+    }
+
+    if (_pending.isEmpty || !flushable()) return;
+    final deadline = DateTime.now().add(const Duration(seconds: 10));
+    while (DateTime.now().isBefore(deadline)) {
       if (_pending.isEmpty && !_writing) return;
+      // 无绑定且剩余全是无归属条目：再等也刷不出去，直接返回（语义与旧版一致）。
+      if (!flushable() && !_writing) return;
       if (!_writing) {
         await _flush();
       } else {
         await Future<void>.delayed(const Duration(milliseconds: 10));
       }
     }
-    if (_pending.isNotEmpty) await _flush();
+    if (!_writing && _pending.isNotEmpty && flushable()) await _flush();
   }
 
   static String redactSensitiveText(String value) {
