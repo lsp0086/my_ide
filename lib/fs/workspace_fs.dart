@@ -20,7 +20,13 @@ class WorkspaceFs {
       p.isAbsolute(rawPath) ? rawPath : p.join(rootPath, rawPath),
     );
     // 解析 symlink：文件/父目录存在时用 realpath，否则回退归一化路径。
-    abs = _realpathOr(abs);
+    // R-深路径 fail-closed：32 层内找不到存在父目录（或探测异常）时词法
+    // 回退不可信——真实根（symlink/短路径解析后）可能不在词法前缀下，
+    // 此前 Linux CI（/tmp 无链接）暴露 abs 恰落 realpath root 内被判
+    // inside。现未完整解析即按区外处理（与 isWriteLink 超限拒绝同口径）。
+    final checked = _realpathOrChecked(abs);
+    if (!checked.$2) return FsZone.outside;
+    abs = checked.$1;
     final root = _realpathOr(p.normalize(rootPath));
     if (abs == root || p.isWithin(root, abs)) {
       final rel = p.relative(abs, from: root);
@@ -102,16 +108,21 @@ class WorkspaceFs {
     return sawError;
   }
 
-  static String _realpathOr(String abs) {
+  static String _realpathOr(String abs) => _realpathOrChecked(abs).$1;
+
+  /// 同 [_realpathOr]，但额外返回是否完整解析（找到存在父目录并 realpath，
+  /// 或终点本身存在可解析）。词法回退/探测异常即 resolved=false，调用方
+  /// （zoneOf）按可疑 fail-closed 处理。
+  static (String, bool) _realpathOrChecked(String abs) {
     try {
       final type = FileSystemEntity.typeSync(abs, followLinks: false);
       if (type != FileSystemEntityType.notFound) {
         // 文件/目录/链接本身存在：直接解析。
         try {
-          return File(abs).resolveSymbolicLinksSync();
+          return (File(abs).resolveSymbolicLinksSync(), true);
         } catch (_) {
           try {
-            return Directory(abs).resolveSymbolicLinksSync();
+            return (Directory(abs).resolveSymbolicLinksSync(), true);
           } catch (_) {}
         }
       }
@@ -129,17 +140,17 @@ class WorkspaceFs {
       // 第7轮收敛：深路径 fail-closed——此前32层仍未找到存在父目录时静默
       // 回退词法路径，区外深链可绕过 realpath 区外判。现深未解析即按原词法
       // 返回但由调用方 zoneOf/写侧复检按可疑处理（isWriteLink 超限已拒）。
-      if (deepUnresolved && !dir.existsSync()) return abs;
+      if (deepUnresolved && !dir.existsSync()) return (abs, false);
       if (dir.existsSync()) {
         final realDir = dir.resolveSymbolicLinksSync();
         var out = realDir;
         for (var i = rest.length - 1; i >= 0; i--) {
           out = p.join(out, rest[i]);
         }
-        return p.normalize(out);
+        return (p.normalize(out), true);
       }
     } catch (_) {}
-    return abs;
+    return (abs, false);
   }
 
   String resolveApprovedRead(String rawPath) {

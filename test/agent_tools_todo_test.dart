@@ -23,6 +23,7 @@ import 'package:my_ide/lsp/lsp_client.dart';
 import 'package:my_ide/lsp/symbol_index.dart';
 import 'package:my_ide/mcp/mcp_config.dart';
 import 'package:my_ide/mcp/mcp_manager.dart';
+import 'package:my_ide/settings/secret_vault.dart';
 import 'package:my_ide/settings/settings_store.dart';
 import 'package:my_ide/settings/webdav_backup.dart';
 import 'package:my_ide/skills/skill_manager.dart';
@@ -719,7 +720,13 @@ void main() {
       currentPath: '${root.path}/a00.dart',
     );
     expect(zebraDef, isNotNull);
-    expect(zebraDef!.filePath, '${root.path}/z_last.dart');
+    // Windows listSync 返回反斜杠路径：与 '${root.path}/z_last.dart'
+    // 直接字符串比较恒不等。p.equals 按平台上下文归一后比较。
+    expect(
+      p.equals(zebraDef!.filePath, '${root.path}/z_last.dart'),
+      isTrue,
+      reason: 'zebraDef.filePath=${zebraDef.filePath}',
+    );
     final zebraRefs = SymbolIndex.instance.findReferences(
       name: 'Zebra',
       currentPath: '${root.path}/z_last.dart',
@@ -1444,6 +1451,20 @@ void main() {
     });
 
     test('坏key保留条目：改他条不丢坏条密文', () async {
+      // 强制设备密钥文件路径：macOS 走钥匙串、Linux CI 缺 secret-tool /
+      // Windows 凭据后端失败均回退 _deviceKeyFile → getApplicationSupport
+      // Directory（测试环境无插件通道抛 MissingPluginException）。与其余
+      // SettingsStore 用例同口径：临时支持目录 + 关闭钥匙串，全平台确定。
+      final vaultDir = await Directory.systemTemp.createTemp('vault-todo-');
+      SecretVault.setTestSupportDir(vaultDir.path);
+      SecretVault.setTestKeychain(available: false);
+      addTearDown(() async {
+        SecretVault.setTestSupportDir(null);
+        SecretVault.setTestKeychain(available: null);
+        try {
+          if (await vaultDir.exists()) await vaultDir.delete(recursive: true);
+        } catch (_) {}
+      });
       SharedPreferences.setMockInitialValues({
         'aiProviders': '[{"id":"p1","name":"P1","baseUrl":"https://x","fullUrl":false,"token":"enc:v5:bad:bad:bad"},{"id":"p2","name":"P2","baseUrl":"https://y","fullUrl":false,"token":"plain2"}]',
       });

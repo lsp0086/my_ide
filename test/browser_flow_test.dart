@@ -527,9 +527,16 @@ void main() {
     test('源码口径：switchTarget失败分支回滚缓冲+URL', () async {
       // ignore: avoid_slow_async_io
       final src = await File('lib/browser/browser_service.dart').readAsString();
-      final fn = src.indexOf('Future<SwitchTargetOutcome> switchTarget(');
+      // Windows CI 检出为 CRLF：先归一，避免窗口截断与行尾差异。
+      final norm = src.replaceAll('\r\n', '\n');
+      final fn = norm.indexOf('Future<SwitchTargetOutcome> switchTarget(');
       assert(fn >= 0);
-      final body = src.substring(fn, fn + 3000);
+      // 函数体按闭括号（2 空格缩进 `}`）取整：固定 3000 字符窗口在
+      // CRLF 检出下会截掉尾部回滚分支（LF 偏移 2936 + 每行 1 字符）。
+      final end = norm.indexOf('\n  }\n', fn);
+      final body = end == -1
+          ? norm.substring(fn, fn + 8000)
+          : norm.substring(fn, end);
       expect(body.contains('_restorePageBuffers(prevBuffers)'), isTrue);
       expect(body.contains("catch (e)"), isTrue);
     });

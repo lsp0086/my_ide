@@ -113,11 +113,10 @@ class WindowLauncher {
             ...extra,
           ];
           debugPrint('[WindowLauncher] open ${args.join(' ')}');
-          final proc = await Process.start(
-            'open',
-            args,
-            mode: ProcessStartMode.detached,
-          );
+          // normal 模式：detached 的 exitCode getter 抛 StateError
+          // （dart:io 明确文档），此前 open -n 窗口实际已起却因读退出码
+          // 抛错被 catch 判失败。open 自身瞬时退出，normal 模式无副作用。
+          final proc = await Process.start('open', args);
           unawaited(proc.exitCode.then((c) {
             if (c != 0) {
               lastError = 'open -n 退出码 $c';

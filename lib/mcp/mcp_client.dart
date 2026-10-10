@@ -352,7 +352,30 @@ class McpSession {
     if (factory != null) {
       _process = await factory(command, config.args);
     } else {
-      _process = await Process.start(
+      // stdio 生命周期结算（stdin.close / exitCode 崩溃监听 / 组杀等待退出）
+      // 全部依赖 exitCode——detached/detachedWithStdio 的 exitCode getter
+      // 会抛 StateError（dart:io 明确文档），此前 detachedWithStdio 使生产
+      // 路径一连接即炸（测试走 processFactoryForTest 假进程未暴露）。
+      // 现 POSIX 有 /usr/bin/setsid 时经其新起会话（normal 模式：非组长
+      // 不 fork，stdio/exitCode 全可用，子进程自成一_session，disconnect
+      // 的 pgid 校验组杀照常生效）；缺失/Windows 回退普通启动。
+      if (!Platform.isWindows) {
+        try {
+          _process = await Process.start(
+            '/usr/bin/setsid',
+            [command, ...config.args],
+            workingDirectory:
+                (config.cwd != null && config.cwd!.trim().isNotEmpty)
+                    ? config.cwd
+                    : null,
+            environment: env,
+            includeParentEnvironment: false,
+          );
+        } catch (_) {
+          _process = null;
+        }
+      }
+      _process ??= await Process.start(
         command,
         config.args,
         workingDirectory:
@@ -360,10 +383,7 @@ class McpSession {
                 ? config.cwd
                 : null,
         environment: env,
-        // 独立进程组：disconnect 组杀只杀 server 侧，不误伤 IDE 本体。
-        // 此前默认与 IDE 同组，disconnect 跳过组杀只杀主进程，孙进程泄漏。
         includeParentEnvironment: false,
-        mode: ProcessStartMode.detachedWithStdio,
       );
     }
     _stdoutSub = _process!.stdout.listen(_onStdioBytes);

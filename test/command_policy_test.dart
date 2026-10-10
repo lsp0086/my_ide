@@ -277,6 +277,12 @@ void main() {
   });
 
   test('引号内元字符通过固定 executable 和 argv 作为普通文本执行', () async {
+    if (Platform.isWindows) {
+      // Windows 无 argv 语义的 echo 可执行文件（cmd 内建），安全白名单
+      // （ls/cat/grep…）同为 POSIX 工具：argv 直跑通道在 Windows 无等价
+      // 前提，走 cmd 又会重引 shell 解释。跳过（与进程管理用例同口径）。
+      return;
+    }
     final result = await AgentTools(
       rootPath: workspace.path,
     ).execute('run_command', {'command': 'echo "safe; literal"'});

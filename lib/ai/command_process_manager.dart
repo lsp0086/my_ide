@@ -30,10 +30,18 @@ class CommandProcessManager {
     String executable,
     List<String> arguments, {
     required String workingDirectory,
-    // 真独立进程会话（跨平台）：macOS/Linux 经 `/usr/bin/setsid` 新起会话，
-    // Windows 经 `CREATE_NEW_PROCESS_GROUP` 新起进程组，
-    // 超时/取消时整组终止不留孤儿（daemon 双 fork 仍可能逃逸，见 terminateWithReport）。
-    // 失败回退普通启动（沙箱无 setsid/Win32 异常），调用方靠 pgrep 精确路径兜底。
+    // 真独立进程会话（POSIX）：经 `/usr/bin/setsid` 新起会话，子进程
+    // pgid==pid，超时/取消时 `kill -- -pgid` 整组终止不留孤儿
+    // （daemon 双 fork 仍可能逃逸，见 terminateWithReport）。
+    // 关键：必须用 normal 模式——detached/detachedWithStdio 的 exitCode
+    // getter 会抛 StateError（dart:io 明确文档），而管理器生命周期结算
+    // （exitCode.whenComplete/terminate 等待退出）全部依赖 exitCode。
+    // normal 模式下 setsid 子进程不是组长，setsid(1) 不会 fork，
+    // stdio/exitCode 全可用且子进程自成一_session。
+    // 失败回退普通启动（macOS 无 setsid/沙箱拦截），调用方靠 pgrep
+    // 精确路径兜底。Windows：dart:io 无法 CREATE_NEW_PROCESS_GROUP 且
+    // detached 同样无 exitCode；taskkill /T 整树终止不依赖新组，直接
+    // 普通启动。
     bool startNewSession = false,
     String? sessionLabel,
     String sessionId = '',
@@ -43,18 +51,7 @@ class CommandProcessManager {
     if (startNewSession && !Platform.isWindows) {
       // macOS 沙箱可能无 setsid：缺失即回退普通启动，不抛错阻断命令。
       try {
-        trackedProcess = await _startDetachedPosix(
-          executable,
-          arguments,
-          workingDirectory: workingDirectory,
-        );
-      } catch (_) {
-        trackedProcess = null;
-      }
-    }
-    if (trackedProcess == null && startNewSession && Platform.isWindows) {
-      try {
-        trackedProcess = await _startDetachedWindows(
+        trackedProcess = await _startNewSessionPosix(
           executable,
           arguments,
           workingDirectory: workingDirectory,
@@ -99,8 +96,10 @@ class CommandProcessManager {
   }
 
   /// POSIX 独立会话启动：经 setsid 新起会话，子进程 getpgid/getsid 与父不同。
-  /// setsid 缺失/被沙箱拦截即抛，由 start() 回退普通启动。
-  Future<Process> _startDetachedPosix(
+  /// 必须 normal 模式：detachedWithStdio 无 exitCode（getter 抛 StateError），
+  /// 管理器靠 exitCode 结算生命周期；normal 下 setsid 子进程非组长不 fork，
+  /// stdio/exitCode 全可用。setsid 缺失/被沙箱拦截即抛，由 start() 回退普通启动。
+  Future<Process> _startNewSessionPosix(
     String executable,
     List<String> arguments, {
     required String workingDirectory,
@@ -110,24 +109,7 @@ class CommandProcessManager {
       [executable, ...arguments],
       workingDirectory: workingDirectory,
       runInShell: false,
-      // detachedWithStdio 经 setsid 新起会话且保留 stdio/exitCode 可用。
-      mode: ProcessStartMode.detachedWithStdio,
-    );
-  }
-
-  /// Windows 独立进程组启动：CREATE_NEW_PROCESS_GROUP 语义，
-  /// taskkill /T 整组终止时不连带 IDE 自身。
-  Future<Process> _startDetachedWindows(
-    String executable,
-    List<String> arguments, {
-    required String workingDirectory,
-  }) {
-    return Process.start(
-      executable,
-      arguments,
-      workingDirectory: workingDirectory,
-      runInShell: false,
-      mode: ProcessStartMode.detached,
+      mode: ProcessStartMode.normal,
     );
   }
 

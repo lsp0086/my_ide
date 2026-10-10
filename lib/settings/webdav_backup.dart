@@ -172,18 +172,29 @@ class WebDavBackup {
     if (normalized.isEmpty || normalized == '.' || !p.isAbsolute(normalized)) {
       return false;
     }
+    // Windows 归一：p.normalize 会把 '/' 换 '\'，home/support 若保持原样
+    // （USERPROFILE 反斜杠 + '/' 拼接、或测试传 POSIX 风格参数），前缀比对
+    // 永不命中。统一归一并把分隔符折算为 '/' 后比较，POSIX 行为不变。
+    String unify(String s) => p.normalize(s).replaceAll('\\', '/');
+    final target = unify(normalized);
     final home = (homeDir ?? _userHomeDir()).trim();
     // 第8轮R8-3：根目录不做home放行——此前home=='/'时startsWith('/')恒真，
     // 任意绝对路径全放行。根home下只认应用目录分支，不认home分支。
-    if (home.isNotEmpty && home != '/' &&
-        (normalized == home || normalized.startsWith('$home/'))) {
-      return true;
+    if (home.isNotEmpty && home != '/') {
+      final homeN = unify(home);
+      if (homeN.isNotEmpty &&
+          homeN != '/' &&
+          (target == homeN || target.startsWith('$homeN/'))) {
+        return true;
+      }
     }
     final support = (appSupportDir ?? '').trim();
-    if (support.isNotEmpty &&
-        (normalized == support ||
-            normalized.startsWith(support == '/' ? '/' : '$support/'))) {
-      return true;
+    if (support.isNotEmpty) {
+      final supportN = unify(support);
+      final ok = supportN == '/'
+          ? target.startsWith('/')
+          : (target == supportN || target.startsWith('$supportN/'));
+      if (ok) return true;
     }
     return false;
   }
