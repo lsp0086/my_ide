@@ -18,12 +18,17 @@ void main() {
       // 假 whisper：忽略 TERM 后 exec 变身 sleep 常驻，模拟转写卡死且
       // 阻塞 SIGTERM（trap '' TERM 对 SIGTERM 置 SIG_IGN，exec 后仍继承，
       // 仅发 TERM 收不掉——必须升 SIGKILL）。exec 后进程 cmdline 为
-      // `sleep 30`（不再含脚本路径），pgrep 按 sleep 30 匹配。
+      // `sleep 30`（不再含脚本路径）。pgrep 需唯一标识本用例进程：
+      // flutter test 并行跑多个测试文件，lsp 假 npm / command_process_
+      // manager 等文件同样产生 'sleep 30'，全局 pgrep 会跨文件误伤——
+      // 故复制 /bin/sleep 为本用例专属名字，按该名字匹配。
+      final probe = File('${dir.path}/voice-input-sleep-probe');
+      await File('/bin/sleep').copy(probe.path);
       final fakeExe = File('${dir.path}/fake-whisper');
       await fakeExe.writeAsString(
-        "#!/bin/sh\ntrap '' TERM\nexec sleep 30\n",
+        "#!/bin/sh\ntrap '' TERM\nexec '${probe.path}' 30\n",
       );
-      await Process.run('chmod', ['+x', fakeExe.path]);
+      await Process.run('chmod', ['+x', fakeExe.path, probe.path]);
 
       final (success, message) = await VoiceInput.tryLocalWhisper(
         wav.path,
@@ -37,7 +42,7 @@ void main() {
       expect(message, contains('转写超时'));
       // TERM → grace(2s) → KILL 收敛路径需要数秒；给足收尸时间再断言。
       await Future<void>.delayed(const Duration(seconds: 5));
-      final ps = await Process.run('pgrep', ['-f', 'sleep 30']);
+      final ps = await Process.run('pgrep', ['-f', 'voice-input-sleep-probe']);
       expect(
         '${ps.stdout}'.trim(),
         isEmpty,
