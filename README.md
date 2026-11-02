@@ -1,15 +1,24 @@
 # my_ide
 
-基于 Flutter 的轻量桌面 IDE：资源管理器、代码编辑、全文搜索、AI 助手（Chat / Agent）、自研版本管理，以及 WebDAV 配置备份。
+基于 Flutter 的轻量桌面 IDE：资源管理器、代码编辑、全文搜索、AI 助手（Chat / Agent / Plan 三模式）、自研版本管理，以及 WebDAV 配置备份。
 
 面向本地文件夹工作流，界面参考常见编辑器的多栏布局（活动栏 / 侧栏 / 编辑区 / AI 面板），可拖拽调宽。
 
 ## 版本更新
+### 1.0.6
+- **手机端外网远控（新渠道）**：手机浏览器 PWA 免安装远程接入，配对码换取会话 token，一键内网穿透实现外网访问；默认关闭，写操作仍走审批
+- **自研浏览器**：新增请求路由改写（`browser_route`）、登录态 Cookie 管理（`browser_cookies`）、运行时权限管理（`browser_permissions`）、设备预设/弱网模拟、只读探查与 webp 截图等；修复多项连接与页面稳定性问题
+- **远程控制与多端接入**：新增飞书 / 钉钉连接器、ACP agent 端（可被 Zed/JetBrains 等客户端驱动）、webhook 事件入站、cron 定时任务与 float_chat 悬浮窗
+- **computer-use**：新增双击/三击、组合键、wait、区域截图；修复坐标换算与 Retina 适配问题
+- **审批与文件、密钥安全**：高危命令强制人审、安全命令可"永久允许"；沙箱新增 macOS Seatbelt 档；@url 抓取 SSRF 校验、提及内容围栏加固；密钥与日志脱敏补全
+- **版本管理**：并行会话 git worktree 隔离；Redo 前复检漂移防覆盖；敏感名文件与分叉快照修复
+- **上下文与会话管理**：新增"立即压缩"入口、`/review` 内置命令、Plan 模式计划落盘、运行中转向 steer、Focus Chain 待办节奏与长期记忆、post-edit 检查门禁、文件化 subagent 模板；修复取消闩锁、预算裁剪等多处问题
+- **界面与交互**：主题语义色收敛、面板空态引导、超长标签截断；修复审批卡溢出、inline 补全泄漏、定时器整树重建等多处 UI 问题
 
 ### 1.0.5
 - **Agent 与审批**：只读并行 + 写串行调度、审批后复检；会话/排队/规则分桶与 glob 通配、追问轮末续轮；子 Agent 按步聚合与整批超时，超时按 spawnId 精确取消；token 增量入账防双计；审批超时/拒绝/取消三口径可区分（超时可重试）；untrusted 外联及网络命令恒提级；429 按 Retry-After、5xx 指数退避；命令重定向分区；MCP 敏感兜底、日志打码、导出去 token、毒配置持久化禁用；三档沙箱 + Docker 包装（镜像可配）；hook sha256 钉死并记审计行；cron 分桶与固定频率；用量 NaN/Infinity 钳制
 - **文件安全与版本**：拒链接/越界 + 乐观锁 + 提交期重读；同文件写串行；journal/manifest fail-closed、GC 不误删 live；恢复拒绝覆盖未记录改动，失败回滚按提交前字节；大文件直通 + 版本 diff 贪心防 OOM；对话图片限 5 种位图（魔数 + 8MB）；轨迹导出含子 Agent；补丁说明支持 Conventional Commits 校验；WebDAV 密码与设置写盘串行防撕裂
-- **自研浏览器**：30 工具 + SSRF 校验；click/fill 走 Input 域、select/fill 统一 base64；wait_for 显式等待防 SPA 空骨架；上传/下载工作区门禁防 TOCTOU；Chrome 退出同步关 CDP；弹窗按子会话路由；控制台脱敏与敏感 query 掩码；iframe 穿透查询、evaluate 超时终止；click/hover 遮挡检查；视口/UA 模拟；连接世代防串扰，资源释放有界
+- **自研浏览器**：36 工具 + SSRF 校验；click/fill 走 Input 域、select/fill 统一 base64；wait_for 显式等待防 SPA 空骨架；上传/下载工作区门禁防 TOCTOU；Chrome 退出同步关 CDP；弹窗按子会话路由；控制台脱敏与敏感 query 掩码；iframe/shadow DOM 穿透查询、evaluate 超时终止；click/hover 遮挡检查；视口/UA 模拟（含触屏）；连接世代防串扰，资源释放有界
 - **编辑器与诊断**：大文件窗口化；诊断 gutter 不在布局期 setState；快捷键落盘；粘贴图片先判大小；本地检查 + LSP 合并（JSON 偏移映射、行列钳制、非法 glob 回空）；终端 unset 全分隔符检出；密钥与日志脱敏补全（含审计行）
 
 ### 1.0.4
@@ -70,7 +79,7 @@
 - 供应商协议：默认 OpenAI 兼容；可切换 Anthropic Messages；新增 OpenAI Responses（`previous_response_id` 多轮复用、内置 `web_search` / `code_interpreter`）；兼容 Azure（`api-key` 头）与自定义请求头
 - 配置 Base URL / Token（Anthropic 为 x-api-key）、拉取模型、上下文长度、思考档位、模型自定义参数（表格每行一对 key/value，均非空才保存）
 - **Chat**：普通对话；**Agent**：可读写工作区文件、搜索、执行命令（高危操作需审批）；`spawn_subagent` 可派生独立只读子 Agent 执行调研任务
-- **自研浏览器（Agent 专属）**：无侧栏、无独立页面，只能由 Agent 经 `browser_*` 30 工具调用；`browser_open` 打开页面即在编辑器区唤起"页面标签页"（复用 headless Chrome 的 CDP `Page.startScreencast` 帧流渲染，零原生依赖），交互（点击/输入/eval/刷新/切页）全部由 Agent 执行（默认自动审核，输出标untrusted）
+- **自研浏览器（Agent 专属）**：无侧栏、无独立页面，只能由 Agent 经 `browser_*` 38 工具调用；`browser_open` 打开页面即在编辑器区唤起"页面标签页"（复用 headless Chrome 的 CDP `Page.startScreencast` 帧流渲染，零原生依赖），交互（点击/输入/eval/刷新/切页）全部由 Agent 执行（默认自动审核，输出标untrusted）
 - 操作审批：区内写/区外写/删除/命令/浏览器/抓取/区外读/MCP 八档全局（默认除删除文件外全部自动审核）+ 逐工具·路径自动审批规则（deny 优先），审批队列串行，取消级联子 Agent 与命令；高危二次复核开关（默认关闭，开启后高危命令强制弹窗）
 - 流式输出、思考内容展开、Markdown 渲染
 - 多会话切换；粘贴图片（支持 vision 的模型按多模态发送，气泡缩略展示）；每轮记录耗时与终止原因

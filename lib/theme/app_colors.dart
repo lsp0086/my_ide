@@ -24,6 +24,12 @@ class IdeColors extends ThemeExtension<IdeColors> {
     required this.shadow,
     required this.userBubbleBorder,
     required this.sendIcon,
+    required this.danger,
+    required this.dangerStrong,
+    required this.statusError,
+    required this.statusWarn,
+    required this.statusOk,
+    required this.statusInfo,
   });
 
   final Color canvas;
@@ -47,6 +53,21 @@ class IdeColors extends ThemeExtension<IdeColors> {
   final Color userBubbleBorder;
   final Color sendIcon;
 
+  /// 危险语义：danger 为实心危险底（白字按钮/红色回退气泡，亮暗两主题
+  /// 均保白字可读）；dangerStrong 为更深的容器底（错误横幅，配白字）。
+  final Color danger;
+  final Color dangerStrong;
+
+  /// E14：语义状态色（错误/警告/成功/信息）——此前散布 15+ 处裸 0xFF
+  /// 字面量，仅错误红就有 4 种取值且 info/warn 不随亮暗切换。取值对齐
+  /// GitHub Primer 语义色（亮暗两套各自保证可读对比度），回归断言要求
+  /// 亮暗取值不同。豁免点（不改）：_ThemePreview、stats_panel 双色阶、
+  /// diff_view 亮暗对。
+  final Color statusError;
+  final Color statusWarn;
+  final Color statusOk;
+  final Color statusInfo;
+
   static const dark = IdeColors(
     canvas: Color(0xFF0E0E10),
     panel: Color(0xFF161618),
@@ -68,6 +89,12 @@ class IdeColors extends ThemeExtension<IdeColors> {
     shadow: Color(0x33000000),
     userBubbleBorder: Color(0x336C8CFF),
     sendIcon: Color(0xFFFFFFFF),
+    danger: Color(0xFFE03131),
+    dangerStrong: Color(0xFF5C2B2B),
+    statusError: Color(0xFFF85149),
+    statusWarn: Color(0xFFE3B341),
+    statusOk: Color(0xFF3FB950),
+    statusInfo: Color(0xFF539BF5),
   );
 
   /// Trae-like light palette from the reference screenshot.
@@ -92,10 +119,28 @@ class IdeColors extends ThemeExtension<IdeColors> {
     shadow: Color(0x14000000),
     userBubbleBorder: Color(0x335B7CFF),
     sendIcon: Color(0xFFFFFFFF),
+    danger: Color(0xFFD03A3A),
+    dangerStrong: Color(0xFF8A1F1F),
+    statusError: Color(0xFFCF222E),
+    statusWarn: Color(0xFF9A6700),
+    statusOk: Color(0xFF1A7F37),
+    statusInfo: Color(0xFF0969DA),
   );
 
   static IdeColors of(BuildContext context) {
-    return Theme.of(context).extension<IdeColors>() ?? dark;
+    final colors = Theme.of(context).extension<IdeColors>();
+    // F4：缺主题扩展属接线错误（ThemeData 必须经 buildIdeTheme 构建）。
+    // 此前静默回落 dark 掩盖了裸 MaterialApp 宿主的漏配；测试/调试期
+    // 直接断言暴露。生产（assert 关闭）仍回落 dark 保证不崩。
+    assert(() {
+      if (colors != null) return true;
+      throw FlutterError(
+        'IdeColors.of 找不到 IdeColors 主题扩展：请用 '
+        'buildIdeTheme(brightness) 构建 ThemeData（或给测试宿主的 '
+        'MaterialApp 传 theme: buildIdeTheme(...)）。',
+      );
+    }());
+    return colors ?? dark;
   }
 
   @override
@@ -120,6 +165,12 @@ class IdeColors extends ThemeExtension<IdeColors> {
     Color? shadow,
     Color? userBubbleBorder,
     Color? sendIcon,
+    Color? danger,
+    Color? dangerStrong,
+    Color? statusError,
+    Color? statusWarn,
+    Color? statusOk,
+    Color? statusInfo,
   }) {
     return IdeColors(
       canvas: canvas ?? this.canvas,
@@ -142,6 +193,12 @@ class IdeColors extends ThemeExtension<IdeColors> {
       shadow: shadow ?? this.shadow,
       userBubbleBorder: userBubbleBorder ?? this.userBubbleBorder,
       sendIcon: sendIcon ?? this.sendIcon,
+      danger: danger ?? this.danger,
+      dangerStrong: dangerStrong ?? this.dangerStrong,
+      statusError: statusError ?? this.statusError,
+      statusWarn: statusWarn ?? this.statusWarn,
+      statusOk: statusOk ?? this.statusOk,
+      statusInfo: statusInfo ?? this.statusInfo,
     );
   }
 
@@ -169,6 +226,12 @@ class IdeColors extends ThemeExtension<IdeColors> {
       shadow: Color.lerp(shadow, other.shadow, t)!,
       userBubbleBorder: Color.lerp(userBubbleBorder, other.userBubbleBorder, t)!,
       sendIcon: Color.lerp(sendIcon, other.sendIcon, t)!,
+      danger: Color.lerp(danger, other.danger, t)!,
+      dangerStrong: Color.lerp(dangerStrong, other.dangerStrong, t)!,
+      statusError: Color.lerp(statusError, other.statusError, t)!,
+      statusWarn: Color.lerp(statusWarn, other.statusWarn, t)!,
+      statusOk: Color.lerp(statusOk, other.statusOk, t)!,
+      statusInfo: Color.lerp(statusInfo, other.statusInfo, t)!,
     );
   }
 }
@@ -179,6 +242,14 @@ ThemeData buildIdeTheme(Brightness brightness) {
       ? ThemeData.dark(useMaterial3: true)
       : ThemeData.light(useMaterial3: true);
 
+  // F4：组件级主题一次性补齐。此前 Card/Dialog/Chip/Divider/选区等默认
+  // 落到 Material 默认色（亮色灰卡、暗色刺眼空格/对话框），与 30+ 自绘
+  // 面板割裂；这里统一走 IdeColors（亮暗两套同源）。
+  final cardShape = RoundedRectangleBorder(
+    borderRadius: BorderRadius.circular(12),
+    side: BorderSide(color: colors.border),
+  );
+
   return base.copyWith(
     brightness: brightness,
     scaffoldBackgroundColor: colors.canvas,
@@ -188,5 +259,54 @@ ThemeData buildIdeTheme(Brightness brightness) {
       primary: colors.accent,
     ),
     extensions: <ThemeExtension<dynamic>>[colors],
+    cardTheme: CardThemeData(
+      color: colors.panelElevated,
+      surfaceTintColor: Colors.transparent,
+      elevation: 0,
+      shape: cardShape,
+    ),
+    dialogTheme: DialogThemeData(
+      backgroundColor: colors.panelElevated,
+      surfaceTintColor: Colors.transparent,
+      elevation: 8,
+      shadowColor: colors.shadow,
+      titleTextStyle: TextStyle(
+        color: colors.textPrimary,
+        fontSize: 15,
+        fontWeight: FontWeight.w600,
+      ),
+      contentTextStyle: TextStyle(
+        color: colors.textSecondary,
+        fontSize: 12.5,
+        height: 1.45,
+      ),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+    ),
+    chipTheme: base.chipTheme.copyWith(
+      backgroundColor: colors.panelHover,
+      selectedColor: colors.accentSoft,
+      checkmarkColor: colors.accent,
+      side: BorderSide(color: colors.border),
+      labelStyle: TextStyle(color: colors.textPrimary, fontSize: 12),
+      secondaryLabelStyle: TextStyle(color: colors.accent, fontSize: 12),
+      iconTheme: IconThemeData(color: colors.textSecondary, size: 16),
+    ),
+    dividerTheme: DividerThemeData(color: colors.divider),
+    sliderTheme: base.sliderTheme.copyWith(
+      activeTrackColor: colors.accent,
+      inactiveTrackColor: colors.panelHover,
+      thumbColor: colors.accent,
+      overlayColor: colors.accentSoft,
+      valueIndicatorColor: colors.panelElevated,
+      valueIndicatorTextStyle: TextStyle(
+        color: colors.textPrimary,
+        fontSize: 11,
+      ),
+    ),
+    textSelectionTheme: TextSelectionThemeData(
+      cursorColor: colors.accent,
+      selectionColor: colors.accentSoft,
+      selectionHandleColor: colors.accent,
+    ),
   );
 }

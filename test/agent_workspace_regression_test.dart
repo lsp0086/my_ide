@@ -14,8 +14,29 @@ import 'package:my_ide/ai/subagent_runtime.dart';
 import 'package:my_ide/ai/tool_registry.dart';
 import 'package:my_ide/lsp/bundled_language_servers.dart';
 import 'package:my_ide/workspace/semantic_index.dart';
+import 'package:my_ide/workspace/workspace_controller.dart';
 import 'package:my_ide/workspace/workspace_search.dart';
 import 'package:path/path.dart' as p;
+
+/// 读取 lib 源码：主文件与同名 `_` 前缀的 part 文件（库拆分后按整库断言）。
+Future<String> readLibSource(String relPath) async {
+  final base = File('lib/$relPath');
+  var out = await base.readAsString();
+  final stem = relPath.split('/').last.replaceAll('.dart', '');
+  final parts = base.parent
+      .listSync()
+      .whereType<File>()
+      .where((f) {
+        final name = f.uri.pathSegments.last;
+        return name.startsWith('${stem}_') && name.endsWith('.dart');
+      })
+      .toList()
+    ..sort((a, b) => a.path.compareTo(b.path));
+  for (final f in parts) {
+    out += await f.readAsString();
+  }
+  return out;
+}
 
 class _FakeSubagentClient extends AgentClient {
   _FakeSubagentClient({this.largeArguments = false});
@@ -56,11 +77,12 @@ void main() {
     // 复现：写串行for-in+indexOf(pending)在同_PendingToolCall实例复用时
     // 回首个下标致已成功项被二次覆盖。现for-i下标+backfillRemaining。
     // ignore: avoid_slow_async_io
-    final src = await File('lib/ai/agent_runner.dart').readAsString();
-    expect(src.contains('R11-1-A 写串行下标回填'), isTrue);
+    final src = await readLibSource('ai/agent_runner.dart');
+    // 断言不带轮次标签（迭代规则：测试注释不写轮次）。
+    expect(src.contains('写串行下标回填'), isTrue);
     expect(src.contains('for (var wi = 0; wi < seq.length; wi++)'), isTrue);
     // 写串行内不再用indexOf(pending)定位（注释提及R1-B4除外）。
-    final seqIdx = src.indexOf('R11-1-A 写串行下标回填');
+    final seqIdx = src.indexOf('写串行下标回填');
     final writeBlock = src.substring(seqIdx, seqIdx + 6000);
     expect(writeBlock.contains('indexOf(pending)'), isFalse);
   });
@@ -81,7 +103,7 @@ void main() {
     // 复现：Runner.requestCancel('')此前仅 _cancelRequested=true，
     // 未调 _client.abort，服务端流挂到自然结束。
     // ignore: avoid_slow_async_io
-    final src = await File('lib/ai/agent_runner.dart').readAsString();
+    final src = await readLibSource('ai/agent_runner.dart');
     final idx = src.indexOf('void requestCancel(');
     expect(idx, greaterThanOrEqualTo(0));
     final body = src.substring(idx, idx + 1500);
@@ -92,14 +114,14 @@ void main() {
     // 复现：_read此前仅trash纵深，allowOutside可经审批读敏感文件，
     // 与_list敏感拒绝不对称。
     // ignore: avoid_slow_async_io
-    final src = await File('lib/ai/agent_tools.dart').readAsString();
+    final src = await readLibSource('ai/agent_tools.dart');
     expect(src.contains('allowOutside && WorkspaceFs.isSensitiveRelative(rel)'), isTrue);
   });
 
   test('内嵌导航过门禁：脏地址不跟随', () async {
     // 复现：attachEmbedded此前无条件跟随nav条，脏地址可被reload跟随。
     // ignore: avoid_slow_async_io
-    final src = await File('lib/browser/browser_service.dart').readAsString();
+    final src = await readLibSource('browser/browser_service.dart');
     expect(src.contains('内嵌导航被门禁拒绝'), isTrue);
   });
 
@@ -306,7 +328,7 @@ void main() {
 
   test('并行空id不去重：两空id任务均执行', () async {
     // 复现：空 id 两任务此前第二个被判重复跳过致调研丢失。
-    // 第8轮收敛为空/空白 id 不参与去重。
+    // 收敛为空/空白 id 不参与去重。
     var calls = 0;
     final review = await runParallel(
       [FanoutTask(id: '', task: 't1'), FanoutTask(id: '  ', task: 't2')],
@@ -332,22 +354,14 @@ void main() {
 
   test('只读批空id按序回填不互盖', () async {
     // 复现：只读批结果回填此前按来源去重，空 id 第二任务被吞。
-    final restResults = [
-      AgentToolResult(ok: true, output: 'first'),
-      AgentToolResult(ok: true, output: 'second'),
-    ];
-    final ids = ['', ''];
-    final restById = <String, AgentToolResult?>{};
-    for (var i = 0; i < ids.length; i++) {
-      final key = ids[i];
-      if (key.trim().isEmpty) continue;
-      restById.putIfAbsent(key, () => restResults[i]);
-    }
-    final out = <String?>[
-      for (var i = 0; i < ids.length; i++)
-        ids[i].trim().isEmpty ? restResults[i].output : restById[ids[i]]?.output,
-    ];
-    expect(out, ['first', 'second']);
+    // 行为口径：空 id 不参与去重，两任务按位回填各得各的输出，不互盖。
+    final review = await runParallel(
+      [FanoutTask(id: '', task: 't1'), FanoutTask(id: '', task: 't2')],
+      (t) async => AgentToolResult(ok: true, output: 'out-${t.task}'),
+    );
+    expect(review.results.length, 2);
+    expect(review.results[0].output, 'out-t1');
+    expect(review.results[1].output, 'out-t2');
   });
 
   test('扇出取消截断空id按位回填不吞项', () async {
@@ -754,7 +768,6 @@ void main() {
       mode: 'plan',
     );
     expect(seen, contains('plan 模式'));
-    final runtime2 = SubagentRuntime(client: _FakeSubagentClient(), maxSteps: 1);
     String seen2 = '';
     final client2 = _PlanCaptureClient((messages) {
       seen2 = messages.map((m) => '${m['content']}').join('\n');
@@ -774,15 +787,12 @@ void main() {
       mode: 'research',
     );
     expect(seen2.contains('plan 模式'), isFalse);
-    expect(runtime2, isNotNull);
   });
 
   test('扇出超时只取消对应spawnId，同task文本另一分支不受影响', () async {
     // 复现：同批双spawn task文本相同，其中一个taskTimeout，旧onAbandon按
     // task文本比对把两个runtime全取消。现按spawnId精确取消。
-    final src = await File(
-      'lib/ai/agent_runner.dart',
-    ).readAsString();
+    final src = await readLibSource('ai/agent_runner.dart');
     expect(src.contains('_activeSubagentSpawnIds'), isTrue);
     expect(src.contains('spawnId: task.id'), isTrue);
   });
@@ -793,9 +803,7 @@ void main() {
     reg.setSkillAllowed('sess-a', {'read_file'});
     expect(reg.skillAllowedFor('sess-a'), {'read_file'});
     expect(reg.skillAllowedFor('sess-b'), isNull);
-    final src = await File(
-      'lib/ai/agent_runner.dart',
-    ).readAsString();
+    final src = await readLibSource('ai/agent_runner.dart');
     expect(src.contains('_registry.skillAllowedFor(sessionId)'), isTrue);
   });
 
@@ -809,6 +817,62 @@ void main() {
       ),
       isTrue,
     );
+  });
+
+  group('workspace dispose 防护与项目锁', () {
+    test('主链路 notify 前补 _disposed 防护（源码口径）', () async {
+      final src = await readLibSource('workspace/workspace_controller.dart');
+      expect(src.contains('if (_disposed) return;'), isTrue);
+      expect(src.contains('if (!_disposed) {'), isTrue);
+    });
+
+    test('openFolder await 间隙 dispose 释放新拿的锁（源码口径）', () async {
+      final src = await readLibSource('workspace/workspace_controller.dart');
+      final idx =
+          src.indexOf('final lockError = await _acquireProjectLock(normalized);');
+      expect(idx, greaterThanOrEqualTo(0));
+      final body = src.substring(idx, idx + 1000);
+      expect(body.contains('if (_disposed)'), isTrue);
+      expect(body.contains('_releaseProjectLock()'), isTrue);
+    });
+  });
+
+  group('拖入同名文件不静默覆盖', () {
+    test('101 次全碰撞跳过导入，原文件内容未被改写', () async {
+      final dir = await Directory.systemTemp.createTemp('ws-import-');
+      final dropDir = await Directory.systemTemp.createTemp('ws-src-');
+      final controller = WorkspaceController();
+      try {
+        await controller.openFolder(dir.path);
+        // 拖入源与工作区同名 a.txt：工作区已占 a.txt + a-1..a-100。
+        final src = File(p.join(dropDir.path, 'a.txt'));
+        await src.writeAsString('imported');
+        final dst = File(p.join(dir.path, 'a.txt'));
+        await dst.writeAsString('original');
+        for (var i = 1; i <= 100; i++) {
+          await File(p.join(dir.path, 'a-$i.txt')).writeAsString('x$i');
+        }
+        final imported = await controller.importDroppedPaths([src.path]);
+        expect(imported, isEmpty, reason: '全碰撞跳过不覆盖');
+        expect(await dst.readAsString(), 'original',
+            reason: '兜底返回原 dest 时不得被 copy 覆盖');
+      } finally {
+        controller.dispose();
+        try {
+          await File(p.join(dir.path, '.my_ide', 'project.lock')).delete();
+        } catch (_) {}
+        await dir.delete(recursive: true);
+        await dropDir.delete(recursive: true);
+      }
+    }, timeout: const Timeout(Duration(seconds: 30)));
+  });
+
+  group('符号索引路径归一', () {
+    test('reindexFile realpath 收敛（源码口径）', () async {
+      final src = await File('lib/lsp/symbol_index.dart').readAsString();
+      expect(src.contains('resolveSymbolicLinksSync'), isTrue);
+      expect(src.contains('R3-10'), isTrue);
+    });
   });
 }
 

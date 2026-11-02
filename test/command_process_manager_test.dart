@@ -29,7 +29,11 @@ void main() {
   });
 
   test('terminateAll 终止命令及其子进程', () async {
-    if (Platform.isWindows) return;
+    if (Platform.isWindows) {
+      // ignore: avoid_print
+      print('SKIP: terminateAll 终止命令及其子进程 Windows 无 /bin/sh 跳过');
+      return;
+    }
     final marker = File('${workspace.path}/child-finished');
     await manager.start(
       '/bin/sh',
@@ -52,7 +56,11 @@ void main() {
   });
 
   test('前台命令超时后停止进程树和后续文件写入', () async {
-    if (Platform.isWindows) return;
+    if (Platform.isWindows) {
+      // ignore: avoid_print
+      print('SKIP: 前台命令超时后停止进程树和后续文件写入 Windows 无 /bin/sh 跳过');
+      return;
+    }
     final marker = File('${workspace.path}/timeout-escaped');
     final tools = AgentTools(rootPath: workspace.path, processManager: manager);
 
@@ -72,8 +80,67 @@ void main() {
     expect(await marker.exists(), isFalse);
   });
 
+  test('超长前台输出落盘artifact：上下文含路径且文件全文可读', () async {
+    // 复现：环形缓冲只保留尾部 2000 行，被裁掉的头部永久丢失，
+    // 构建长日志无法回看。修复：全量缓冲超 24KB 落盘
+    // .my_ide/artifacts/，输出附路径供 read_file 按需检索。
+    if (Platform.isWindows) {
+      // ignore: avoid_print
+      print('SKIP: 超长前台输出落盘artifact Windows 无 /bin/sh 跳过');
+      return;
+    }
+    final tools = AgentTools(rootPath: workspace.path, processManager: manager);
+    final result = await tools.executeCommand(
+      {
+        'command':
+            'for i in \$(seq 1 3000); do echo artifact-line-\$i-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; done',
+        'timeout': 30,
+      },
+      sessionId: 'session-artifact',
+      allowShell: true,
+    );
+    expect(result.ok, isTrue);
+    // 小输出不落盘：本条 3000 行 ≈ 120KB，必触发。
+    expect(result.output, contains('完整输出已落盘'));
+    expect(result.output, contains('.my_ide/artifacts/'));
+    final m = RegExp(r'\.my_ide/artifacts/[\w.-]+\.log').firstMatch(
+      result.output,
+    );
+    expect(m, isNotNull);
+    final artifact = File(p.join(workspace.path, m!.group(0)!));
+    expect(await artifact.exists(), isTrue);
+    final full = await artifact.readAsString();
+    // 全文可读：含首行与尾行（环形缓冲只保留尾部 2000 行，头部行在
+    // 上下文里看不到，但 artifact 里必须有）。
+    expect(full, contains('artifact-line-1-'));
+    expect(full, contains('artifact-line-3000-'));
+    // 上下文视图仍受环形钳制：不包含最头部行（若包含则环形失效）。
+    expect(result.output.contains('artifact-line-1-'), isFalse);
+  });
+
+  test('短前台输出不落盘artifact', () async {
+    if (Platform.isWindows) {
+      // ignore: avoid_print
+      print('SKIP: 短前台输出不落盘artifact Windows 无 /bin/sh 跳过');
+      return;
+    }
+    final tools = AgentTools(rootPath: workspace.path, processManager: manager);
+    final result = await tools.executeCommand(
+      {'command': 'echo small-output', 'timeout': 10},
+      sessionId: 'session-small',
+      allowShell: true,
+    );
+    expect(result.ok, isTrue);
+    expect(result.output, contains('small-output'));
+    expect(result.output, isNot(contains('完整输出已落盘')));
+  });
+
   test('后台任务可跨调用增量轮询并隔离会话', () async {
-    if (Platform.isWindows) return;
+    if (Platform.isWindows) {
+      // ignore: avoid_print
+      print('SKIP: 后台任务可跨调用增量轮询并隔离会话 Windows 无 /bin/sh 跳过');
+      return;
+    }
     final tools = AgentTools(rootPath: workspace.path, processManager: manager);
     final started = await tools.executeCommand(
       {
@@ -107,7 +174,11 @@ void main() {
   });
 
   test('kill 后台任务后停止后续副作用', () async {
-    if (Platform.isWindows) return;
+    if (Platform.isWindows) {
+      // ignore: avoid_print
+      print('SKIP: kill 后台任务后停止后续副作用 Windows 无 /bin/sh 跳过');
+      return;
+    }
     final marker = File('${workspace.path}/background-escaped');
     final tools = AgentTools(rootPath: workspace.path, processManager: manager);
     final started = await tools.executeCommand(
@@ -133,7 +204,11 @@ void main() {
   });
 
   test('后台任务超时后停止进程树和后续文件写入', () async {
-    if (Platform.isWindows) return;
+    if (Platform.isWindows) {
+      // ignore: avoid_print
+      print('SKIP: 后台任务超时后停止进程树和后续文件写入 Windows 无 /bin/sh 跳过');
+      return;
+    }
     final marker = File('${workspace.path}/bg-timeout-escaped');
     final tools = AgentTools(rootPath: workspace.path, processManager: manager);
     final started = await tools.executeCommand(
@@ -157,7 +232,11 @@ void main() {
   });
 
   test('会话清理后后台任务不可再轮询且进程已停止', () async {
-    if (Platform.isWindows) return;
+    if (Platform.isWindows) {
+      // ignore: avoid_print
+      print('SKIP: 会话清理后后台任务不可再轮询且进程已停止 Windows 无 /bin/sh 跳过');
+      return;
+    }
     final marker = File('${workspace.path}/session-escaped');
     final tools = AgentTools(rootPath: workspace.path, processManager: manager);
     final started = await tools.executeCommand(
@@ -182,7 +261,11 @@ void main() {
   });
 
   test('terminate 先优雅终止再清理句柄', () async {
-    if (Platform.isWindows) return;
+    if (Platform.isWindows) {
+      // ignore: avoid_print
+      print('SKIP: terminate 先优雅终止再清理句柄 Windows 无 /bin/sh 跳过');
+      return;
+    }
     final process = await manager.start('/bin/sh', [
       '-c',
       'sleep 30',
@@ -197,7 +280,11 @@ void main() {
   });
 
   test('独立会话 startNewSession 与父进程组隔离', () async {
-    if (Platform.isWindows) return;
+    if (Platform.isWindows) {
+      // ignore: avoid_print
+      print('SKIP: 独立会话 startNewSession 与父进程组隔离 Windows 无 /bin/sh 跳过');
+      return;
+    }
     // setsid 缺失的沙箱回退普通启动：只断言命令可执行，不强求隔离。
     var hasSetsid = true;
     try {
@@ -234,7 +321,11 @@ void main() {
   });
 
   test('terminateWithReport 返回残留 PID 可观测', () async {
-    if (Platform.isWindows) return;
+    if (Platform.isWindows) {
+      // ignore: avoid_print
+      print('SKIP: terminateWithReport 返回残留 PID 可观测 Windows 无 /bin/sh 跳过');
+      return;
+    }
     final process = await manager.start(
       '/bin/sh',
       ['-c', 'sleep 30'],
@@ -264,7 +355,11 @@ void main() {
   test('进程自然退出后会话归属即清：terminateSession不扫残留', () async {
     // 复现：exitCode.whenComplete此前不清_sessionOf，自然退出后
     // terminateSession仍扫到残留key。现退出即清。
-    if (Platform.isWindows) return;
+    if (Platform.isWindows) {
+      // ignore: avoid_print
+      print('SKIP: 进程自然退出后会话归属即清 Windows 无 /bin/sh 跳过');
+      return;
+    }
     final proc = await manager.start(
       '/bin/echo',
       ['hi'],
@@ -283,7 +378,11 @@ void main() {
   });
 
   test('按会话取消只清本会话终端，他会话终端保留', () async {
-    if (Platform.isWindows) return;
+    if (Platform.isWindows) {
+      // ignore: avoid_print
+      print('SKIP: 按会话取消只清本会话终端 Windows 无 /bin/sh 跳过');
+      return;
+    }
     final tools = AgentTools(rootPath: workspace.path, processManager: manager);
     // 常驻终端走内部 create：直接经 AgentTools execute 建两个会话终端。
     Future<String> createTerm(String owner) async {
@@ -301,6 +400,83 @@ void main() {
     expect(tools.terminals.sessions.containsKey(idB), isTrue);
     await tools.disposeBackgroundTasks();
     expect(tools.terminals.sessions, isEmpty);
+  });
+
+  test('跨区同会话终端不误杀：dispose按rootPath归属校验', () async {
+    // 复现：disposeBackgroundTasks 杀终端缺 rootPath——同 sessionId 跨项目
+    // 复用时缺省校验会误杀他区同名会话终端（与 pollTask 跨区修复合口径）。
+    if (Platform.isWindows) {
+      // ignore: avoid_print
+      print('SKIP: 跨区同会话终端不误杀 Windows 无 /bin/sh 跳过');
+      return;
+    }
+    final other = await Directory.systemTemp.createTemp('other-ws-');
+    addTearDown(() async {
+      try {
+        await other.delete(recursive: true);
+      } catch (_) {}
+    });
+    final tools = AgentTools(rootPath: workspace.path, processManager: manager);
+    final own = (await tools.terminals.create(
+      rootPath: workspace.path,
+      ownerSessionId: 'session-cross',
+    )).id;
+    final foreign = (await tools.terminals.create(
+      rootPath: other.path,
+      ownerSessionId: 'session-cross',
+    )).id;
+    await tools.disposeBackgroundTasks(sessionId: 'session-cross');
+    expect(
+      tools.terminals.sessions.containsKey(own),
+      isFalse,
+      reason: '本区终端应被清',
+    );
+    expect(
+      tools.terminals.sessions.containsKey(foreign),
+      isTrue,
+      reason: '他区同会话终端不应被误杀',
+    );
+    await tools.disposeBackgroundTasks();
+    expect(tools.terminals.sessions, isEmpty);
+  });
+
+  test('disposeAll 杀掉带 owner 终端后回补全局名额', () async {
+    // T2：复现——disposeAll 早前按 ownerSessionId:'' 调用 kill，
+    // get() 的 `ownerSessionId != ''` 校验恒 false 杀不掉带 owner 终端；
+    // _globalLiveCount kill 失败不回补，8 名额被永久占满。
+    if (Platform.isWindows) {
+      // ignore: avoid_print
+      print('SKIP: disposeAll 回补名额 Windows 无 /bin/sh 跳过');
+      return;
+    }
+    final base = TerminalSessionStore.globalLiveCountForTest();
+    final tools = AgentTools(rootPath: workspace.path, processManager: manager);
+    final idA = (await tools.terminals.create(
+      rootPath: workspace.path,
+      ownerSessionId: 'owner-global',
+    )).id;
+    final idB = (await tools.terminals.create(
+      rootPath: workspace.path,
+      ownerSessionId: 'owner-other',
+    )).id;
+    expect(TerminalSessionStore.globalLiveCountForTest(), base + 2);
+
+    await tools.disposeBackgroundTasks(); // 无 sessionId → disposeAll
+    expect(tools.terminals.sessions.containsKey(idA), isFalse);
+    expect(tools.terminals.sessions.containsKey(idB), isFalse);
+    expect(
+      TerminalSessionStore.globalLiveCountForTest(),
+      base,
+      reason: '全额回补 global 计数，后续 create 不得被拒',
+    );
+
+    // 名额回补后可继续创建（上限未虚占）。
+    final idC = (await tools.terminals.create(
+      rootPath: workspace.path,
+      ownerSessionId: 'owner-global',
+    )).id;
+    expect(tools.terminals.sessions.containsKey(idC), isTrue);
+    await tools.disposeBackgroundTasks(sessionId: 'owner-global');
   });
 
   group('R8-03 cron id钳制64', () {
@@ -342,7 +518,7 @@ void main() {
     test('cd 回根后复位可调', () {
       final s = TerminalSession(
         id: 't',
-        process: _Round2FakeProcess(),
+        process: _FakeProcess(),
         rootPath: '/root',
         ownerSessionId: 's',
       );
@@ -356,7 +532,7 @@ void main() {
     test('R6: 回根只清目录脏，export 环境脏保留', () {
       final s = TerminalSession(
         id: 't',
-        process: _Round2FakeProcess(),
+        process: _FakeProcess(),
         rootPath: '/root',
         ownerSessionId: 's',
       );
@@ -371,7 +547,7 @@ void main() {
       // 纯 cd 脏：回根可清。
       final s2 = TerminalSession(
         id: 't2',
-        process: _Round2FakeProcess(),
+        process: _FakeProcess(),
         rootPath: '/root',
         ownerSessionId: 's',
       );
@@ -510,10 +686,102 @@ void main() {
     expect(fired, ['busy', 'fresh']);
     scheduler.dispose();
   });
+
+  group('cron 过载续期下限', () {
+    test('reschedule 支持 minDelay（源码口径）', () {
+      final src = File('lib/ai/cron_scheduler.dart').readAsStringSync();
+      expect(
+        src.contains('void _schedule(CronJob job, {Duration minDelay'),
+        isTrue,
+      );
+      expect(src.contains('reschedule(minDelay: pendingPoll)'), isTrue);
+      expect(src.contains('if (delay < minDelay) delay = minDelay;'), isTrue);
+    });
+  });
+
+  group('Windows 子进程环境隔离', () {
+    test('子进程注入 NoDefaultCurrentDirectoryInExePath（源码口径）', () {
+      final src =
+          File('lib/ai/command_process_manager.dart').readAsStringSync();
+      expect(src.contains('NoDefaultCurrentDirectoryInExePath'), isTrue);
+    });
+  });
+
+  group('终端会话全局上限', () {
+    test('全局上限8+本会话淘汰（源码口径）', () async {
+      final src = await File('lib/ai/terminal_session.dart').readAsString();
+      // D15：全局裸计数已改为"活会话集合+在途保留 id"对账（存活进程为
+      // 唯一事实源），上限判定看两者之和，配额行为由 terminal_session_quota
+      // 行为测试覆盖；此处断言先验判定与注释仍在（B10 顺带修正旧断言）。
+      expect(src.contains('_liveSessions'), isTrue);
+      expect(src.contains('_reservedTotal() >= 8'), isTrue);
+      expect(src.contains('全局上限8先验'), isTrue);
+      // 本会话淘汰：kill 用创建者 ownerSessionId，不再跨会话杀。
+      expect(src.contains('oldestSession.ownerSessionId'), isFalse);
+      // C12：全局上限8先验后单Store淘汰分支不可达已删——
+      // 既有"跨会话杀"断言保留，并补断言不可达淘汰代码（非注释）确已移除。
+      final codeOnly = src
+          .split('\n')
+          .where((l) => !l.trim().startsWith('//'))
+          .join('\n');
+      expect(codeOnly.contains('ownIds.length >'), isFalse);
+    });
+  });
+
+  group('子进程环境合并', () {
+    test('Windows 合并父环境并注入隔离键', () {
+      final merged = CommandProcessManager.childEnvironment(
+        {'PATH': '/x', 'NoDefaultCurrentDirectoryInExePath': '0'},
+        windowsOverrideForTest: true,
+      );
+      expect(merged['PATH'], '/x');
+      expect(merged['NoDefaultCurrentDirectoryInExePath'], '1');
+    });
+
+    test('非 Windows 原样透传父环境（传 null 继承语义不断）', () {
+      final parent = {'PATH': '/x'};
+      final out = CommandProcessManager.childEnvironment(
+        parent,
+        windowsOverrideForTest: false,
+      );
+      expect(identical(out, parent), isTrue);
+    });
+
+    test('Windows 分支调用处传合并表、非 Windows 传 null（源码口径）', () {
+      final src = File(
+        'lib/ai/command_process_manager.dart',
+      ).readAsStringSync();
+      expect(src.contains('childEnvironment(Platform.environment)'), isTrue);
+    });
+  });
+
+  group('前台输出环形缓冲', () {
+    test('run_command 前台输出超 2000 行只保留尾部', () {
+      final ring = ForegroundOutputRing();
+      for (var i = 1; i <= 2500; i++) {
+        ring.append('line$i\n');
+      }
+      expect(ring.isNotEmpty, isTrue);
+      final text = ring.toString();
+      expect(text, contains('仅保留尾部 2000 行'));
+      expect(text, contains('line2500'));
+      expect(text, contains('line501'));
+      // 头部 500 行已丢弃。
+      expect(text, isNot(contains('line500\n')));
+      expect(text, isNot(contains('\nline1\n')));
+
+      // 单行超 500 字截断保留尾部省略号。
+      final long = ForegroundOutputRing();
+      long.append('${'x' * 600}\n');
+      final longText = long.toString();
+      expect(longText.length, lessThan(600));
+      expect(longText.endsWith('…'), isTrue);
+    });
+  });
 }
 
 // 最小 Process 桩：TerminalSession 构造仅需 stdin/stdout/stderr/exitCode。
-class _Round2FakeProcess implements Process {
+class _FakeProcess implements Process {
   @override
   dynamic noSuchMethod(Invocation i) => super.noSuchMethod(i);
 
@@ -524,13 +792,13 @@ class _Round2FakeProcess implements Process {
   Stream<List<int>> get stderr => const Stream.empty();
 
   @override
-  IOSink get stdin => _Round2FakeStdin();
+  IOSink get stdin => _FakeStdin();
 
   @override
   Future<int> get exitCode async => 0;
 }
 
-class _Round2FakeStdin implements IOSink {
+class _FakeStdin implements IOSink {
   @override
   dynamic noSuchMethod(Invocation i) => super.noSuchMethod(i);
 }

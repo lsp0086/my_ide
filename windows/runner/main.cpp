@@ -26,7 +26,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
 
   FlutterWindow window(project);
   Win32Window::Point origin(10, 10);
-  // IDE 常见初始窗口：1280×800（与最小尺寸一致）
+  // IDE 常见初始窗口：1280×800（最小窗口 1000×600，见 win32_window.cpp）
   Win32Window::Size size(1280, 800);
   if (!window.Create(L"my_ide", origin, size)) {
     return EXIT_FAILURE;

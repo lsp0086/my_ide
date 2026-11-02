@@ -48,6 +48,32 @@ void main() {
     );
   });
 
+  test('B15 端口白名单：非 80/443 显式端口拒绝', () {
+    expect(
+      UrlFetchPolicy()
+          .rejectLiteral(Uri.parse('http://example.com:22/')),
+      contains('非标准端口'),
+    );
+    expect(
+      UrlFetchPolicy()
+          .rejectLiteral(Uri.parse('http://example.com:6379/')),
+      contains('非标准端口'),
+    );
+    // 隐式默认端口放行。
+    expect(
+      UrlFetchPolicy().rejectLiteral(Uri.parse('https://example.com/a')),
+      isNull,
+    );
+    expect(
+      UrlFetchPolicy().rejectLiteral(Uri.parse('http://example.com:80/')),
+      isNull,
+    );
+    expect(
+      UrlFetchPolicy().rejectLiteral(Uri.parse('https://example.com:443/')),
+      isNull,
+    );
+  });
+
   test('IPv4/IPv6 地址分类', () {
     String? why(String ip) =>
         UrlFetchPolicy().rejectAddress(InternetAddress(ip));
@@ -184,5 +210,70 @@ void main() {
       await policy.rejectResolved(Uri.parse('http://8.8.8.8/')),
       isNull,
     );
+  });
+
+  test('A1-8 IETF 特殊用途保留段全部拒绝（此前返回 null 被放行）', () {
+    // 复现 A1-8：rejectAddress 缺 IANA 特殊用途注册表保留段——
+    // 192.0.0.0/24、TEST-NET（192.0.2/24、198.51.100/24、203.0.113/24）、
+    // 198.18.0.0/15、255.255.255.255、IPv6 2002::/16 等此前放行。
+    // 来源 https://www.iana.org/assignments/iana-ipv4-special-registry/
+    // 与 RFC6890 / RFC3056(6to4) / RFC6052(NAT64)。
+    String? why(String ip) =>
+        UrlFetchPolicy().rejectAddress(InternetAddress(ip));
+    // IPv4 保留段。
+    for (final ip in const [
+      '192.0.0.1', // 192.0.0.0/24 IETF 协议分配
+      '192.0.0.9', // 同上段内知名服务地址
+      '192.0.2.1', // TEST-NET-1
+      '198.18.0.1', // 198.18.0.0/15 基准测试
+      '198.19.255.255', // 同上段末端
+      '198.51.100.7', // TEST-NET-2
+      '203.0.113.9', // TEST-NET-3
+      '255.255.255.255', // 有限广播
+      '192.88.99.1', // 废弃 6to4 中继任播
+      '192.31.196.1', // AS112 服务
+      '192.52.193.1', // AMT 任播
+      '192.175.48.1', // AS112 直接委派
+    ]) {
+      expect(why(ip), isNotNull, reason: '$ip 应被拒绝');
+    }
+    // IPv6 保留段。
+    expect(why('2002:7f00:1::'), isNotNull, reason: '6to4 封装回环');
+    expect(why('2002:0a00:0001::'), isNotNull, reason: '6to4 封装私网 10.0.0.1');
+    expect(
+      why('64:ff9b::7f00:1'),
+      isNotNull,
+      reason: 'NAT64 知名前缀封装回环',
+    );
+    expect(
+      why('64:ff9b::0a00:1'),
+      isNotNull,
+      reason: 'NAT64 知名前缀封装私网',
+    );
+    // 公网地址不受影响（不误杀）。
+    expect(why('8.8.8.8'), isNull);
+    expect(why('1.1.1.1'), isNull);
+    expect(why('2606:4700:4700::1111'), isNull);
+    // 字面量 URL 路径同口径（rejectLiteral 走同一 rejectAddress）。
+    for (final url in const [
+      'http://192.0.2.1/',
+      'http://203.0.113.9/',
+      'http://[2002:7f00:1::]/',
+      'http://[64:ff9b::7f00:1]/',
+    ]) {
+      expect(
+        UrlFetchPolicy().rejectLiteral(Uri.parse(url)),
+        isNotNull,
+        reason: url,
+      );
+    }
+    // IPv4-mapped IPv6 同样在 _asIpv4Mapped 归一后命中新规则。
+    final mappedTestNet = InternetAddress.fromRawAddress(
+      Uint8List.fromList(
+        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 1],
+      ),
+      type: InternetAddressType.IPv6,
+    );
+    expect(UrlFetchPolicy().rejectAddress(mappedTestNet), isNotNull);
   });
 }

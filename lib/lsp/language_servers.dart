@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import '../settings/settings_store.dart';
@@ -181,11 +182,20 @@ class DefinitionService {
 
   LanguageServerSpec? specForExtension(String ext) {
     final lower = ext.toLowerCase();
+    // R-SPEC-CACHE：跳转热路径此前每次调用重建 spec 列表（含读 SettingsStore）。
+    // 自定义 server 变更时由 invalidateAvailabilityCache 一并失效。
+    final cached = _specByExtCache[lower];
+    if (cached != null) return cached;
     for (final spec in allLanguageServerSpecs()) {
-      if (spec.extensions.contains(lower)) return spec;
+      if (spec.extensions.contains(lower)) {
+        _specByExtCache[lower] = spec;
+        return spec;
+      }
     }
     return null;
   }
+
+  final Map<String, LanguageServerSpec?> _specByExtCache = {};
 
   bool _usesBundled(LanguageServerSpec spec) =>
       spec.autoInstall && BundledLanguageServers.instance.canAutoInstall(spec.id);
@@ -258,6 +268,11 @@ class DefinitionService {
       final result = await Process.run(
         Platform.isWindows ? 'where' : 'which',
         [command],
+      ).timeout(
+        // R-AVAIL-TIMEOUT：PATH 异常环境（网络盘/NFS挂起）此前无超时，
+        // clientFor 链路可能卡住补全/跳转。
+        const Duration(seconds: 3),
+        onTimeout: () => ProcessResult(0, 127, '', 'timeout'),
       );
       final ok = result.exitCode == 0;
       _availabilityCache[cacheKey] = ok;
@@ -393,11 +408,24 @@ class DefinitionService {
       } catch (_) {}
       return null;
     }
+    // R-LSP-LEAK：替换同键旧实例前先 stop——此前直接覆盖 _clients[key]，
+    // 崩溃/已停的旧实例无人 stop（exitCode 回调已自摘 _allClients，
+    // 但 running 仍假 true 或进程未清的中间态会滞留缓冲与句柄）。
+    final staleClient = _clients[key];
     _clients[key] = client;
+    if (!identical(staleClient, client) && staleClient != null) {
+      try {
+        await staleClient.stop();
+      } catch (_) {}
+    }
     return client;
   }
 
-  void invalidateAvailabilityCache() => _availabilityCache.clear();
+  void invalidateAvailabilityCache() {
+    _availabilityCache.clear();
+    // R-SPEC-CACHE：自定义 server 变更时扩展名映射同步失效。
+    _specByExtCache.clear();
+  }
 
   /// 停掉指定 root 下的旧 server：切项目时调用，避免旧 rootUri 常驻多 server 并存。
   /// key 格式 `${spec.id}::$command::$rootPath`，按后缀匹配。
@@ -428,24 +456,5 @@ class DefinitionService {
     }
     _clients.clear();
     _lastUsed.clear();
-  }
-
-  /// 淘汰指定 client：外部不再使用某语言服务时调用，同步清掉其诊断源。
-  /// 返回被停掉的 spec id，调用方凭此清诊断；未找到返回 null。
-  Future<String?> evictClient(LspClient client) async {
-    String? found;
-    for (final entry in _clients.entries) {
-      if (identical(entry.value, client)) {
-        found = entry.key;
-        break;
-      }
-    }
-    if (found == null) return null;
-    _clients.remove(found);
-    _lastUsed.remove(found);
-    try {
-      await client.stop();
-    } catch (_) {}
-    return found.split('::').first;
   }
 }

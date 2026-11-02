@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:http/http.dart' as http;
+
 /// MCP 传输类型：本地进程 stdio，或远程 Streamable HTTP / SSE。
 enum McpTransportType { stdio, http }
 
@@ -162,6 +164,47 @@ class McpServerConfig {
   McpServerConfig copy() => McpServerConfig.fromJson(toJson());
 }
 
+/// 官方 MCP Registry 检索结果条目（只读发现层，B3-9）。
+/// 来源 https://registry.modelcontextprotocol.io/ （REST API /v0/servers）。
+class McpRegistryEntry {
+  McpRegistryEntry({
+    required this.name,
+    required this.description,
+    this.title,
+    this.command,
+    this.args = const [],
+    this.url,
+    this.envHints = const [],
+  });
+
+  /// 规范 server 名，如 `io.github.user/server`。
+  final String name;
+  final String description;
+  final String? title;
+  /// stdio 启动命令（npx/uvx/node/...）；http 条目为 null。
+  final String? command;
+  final List<String> args;
+  /// 远程 http(s) 端点；stdio 条目为 null。
+  final String? url;
+  /// 环境变量名提示（不含值——registry 只给名与是否必填）。
+  final List<String> envHints;
+
+  bool get isHttp => url != null && url!.isNotEmpty;
+
+  /// 生成待保存的草稿配置：一律 enabled=false（默认禁用，用户显式启用
+  /// 即明示同意，与 importRaw 门禁同口径）；毒配置 command 仍由
+  /// McpManager.upsert/isSafeStdioConfig 门禁拦下（见 B3-9 校验标准）。
+  McpServerConfig toDraftConfig() => McpServerConfig(
+        id: name,
+        name: title?.trim().isNotEmpty == true ? title! : name,
+        enabled: false,
+        transport: isHttp ? McpTransportType.http : McpTransportType.stdio,
+        command: command ?? '',
+        args: args,
+        url: url ?? '',
+      );
+}
+
 /// 解析用户导入的 MCP JSON（Claude Desktop / Cursor / 本应用导出）。
 class McpConfigImporter {
   /// 环境变量展开：支持 ${ENV:VAR} 与 ${VAR}，缺失变量置空字符串。
@@ -202,36 +245,6 @@ class McpConfigImporter {
     return out;
   }
 
-  /// 浏览器自动化预设（开源自托管 Playwright MCP）：
-  /// npx @playwright/mcp，无需额外依赖，开箱即用于页面浏览/操作。
-  /// MCP 设置面板 hint 可直接引用此模板引导用户一键填入。
-  static McpServerConfig playwrightPreset() => McpServerConfig(
-        id: 'playwright',
-        name: 'playwright',
-        enabled: true,
-        transport: McpTransportType.stdio,
-        command: 'npx',
-        args: const ['-y', '@playwright/mcp'],
-        toolLevel: McpToolLevel.network,
-        maxTools: 40,
-        version: '@playwright/mcp@latest',
-        dependencies: const {'npx': 'node'},
-      );
-
-  /// 本地安装治理：仅允许配置已声明、可解析的 stdio 命令；
-  /// 返回缺失项（空=可安装）。
-  static List<String> installReadiness(McpServerConfig cfg) {
-    final out = <String>[];
-    if (cfg.transport != McpTransportType.stdio) return out;
-    if (cfg.command.trim().isEmpty) out.add('缺少启动命令');
-    if (cfg.installDirectory != null &&
-        cfg.installDirectory!.trim().isNotEmpty &&
-        !Directory(cfg.installDirectory!.trim()).existsSync()) {
-      out.add('安装目录不存在：${cfg.installDirectory}');
-    }
-    return out;
-  }
-
   /// 返回解析出的服务器列表；失败抛出可读错误。
   static List<McpServerConfig> importJson(String raw) {
     final trimmed = raw.trim();
@@ -245,16 +258,25 @@ class McpConfigImporter {
     final map = Map<String, dynamic>.from(decoded);
 
     // 本应用导出：{ "servers": [ {...}, ... ] }
+    // R-IMPORTCAP：导入条目数上限 100——单条配置有界但条数无上限时
+    // 一万个 server 全量进内存并写爆 prefs。
     if (map['servers'] is List) {
-      return (map['servers'] as List)
+      final servers = (map['servers'] as List)
           .whereType<Map>()
           .map((e) => McpServerConfig.fromJson(Map<String, dynamic>.from(e)))
           .toList();
+      if (servers.length > 100) {
+        throw const FormatException('servers 条目超过上限 100，请拆分导入');
+      }
+      return servers;
     }
 
     // Claude Desktop / Cursor：{ "mcpServers": { "name": { command/args or url } } }
     final mcpServers = map['mcpServers'] ?? map['mcp'] ?? map['servers'];
     if (mcpServers is Map) {
+      if (mcpServers.length > 100) {
+        throw const FormatException('mcpServers 条目超过上限 100，请拆分导入');
+      }
       final out = <McpServerConfig>[];
       for (final entry in mcpServers.entries) {
         final key = '${entry.key}';
@@ -281,35 +303,31 @@ class McpConfigImporter {
     );
   }
 
-  static String exportJson(List<McpServerConfig> servers) {
-    return const JsonEncoder.withIndent('  ').convert({
-      'servers': servers.map((e) => e.toJson()).toList(),
-      // 同时给出 Claude Desktop 兼容块，方便互导
-      'mcpServers': {
-        for (final s in servers)
-          s.name: {
-            if (s.transport == McpTransportType.stdio) ...{
-              'command': s.command,
-              'args': s.args,
-              if (s.env.isNotEmpty) 'env': s.env,
-              if (s.cwd != null && s.cwd!.isNotEmpty) 'cwd': s.cwd,
-            } else ...{
-              'url': s.url,
-              if (s.headers.isNotEmpty) 'headers': s.headers,
-            },
-          },
-      },
-    });
-  }
-
   /// 脱敏导出：env/headers 的值全部打码，仅保留 key 与是否已配置，
   /// 避免复制分享时泄漏密钥。导入该脱敏 JSON 后需重新填写密钥。
   static String redactUrl(String raw) {
     final uri = Uri.tryParse(raw.trim());
-    if (uri == null || !uri.hasQuery) return raw;
-    const sensitive = {'token', 'api_key', 'access_token', 'key'};
+    if (uri == null) return raw;
+    // D2-L8：脱敏不完整补齐——旧实现无 query 即原样返回，URL 内嵌
+    // 凭据（user:pass@host）与 fragment（#token=…）整串导出泄漏。
+    // 统一重建 URI：userinfo 清空、fragment 剥除、敏感 query 键剔除；
+    // 无需变更时仍返回原文（不改变无敏感信息 URL 的输出形态）。
+    var changed = uri.userInfo.isNotEmpty || uri.hasFragment;
+    const sensitive = {
+      'token',
+      'api_key',
+      'api-key',
+      'apikey',
+      'x-api-key',
+      'access_token',
+      'auth',
+      'authorization',
+      'client_secret',
+      'secret',
+      'password',
+      'key',
+    };
     final kept = <String, String>{};
-    var changed = false;
     uri.queryParameters.forEach((k, v) {
       if (sensitive.contains(k.toLowerCase())) {
         changed = true;
@@ -318,7 +336,13 @@ class McpConfigImporter {
       kept[k] = v;
     });
     if (!changed) return raw;
-    return uri.replace(queryParameters: kept.isEmpty ? null : kept).toString();
+    return uri
+        .replace(
+          userInfo: '',
+          fragment: '',
+          queryParameters: kept.isEmpty ? null : kept,
+        )
+        .toString();
   }
 
   static String exportRedactedJson(List<McpServerConfig> servers) {
@@ -358,5 +382,129 @@ class McpConfigImporter {
           },
       },
     });
+  }
+
+  /// B3-9：官方 MCP Registry REST 基址（https://registry.modelcontextprotocol.io/，
+  /// API 文档 https://registry.modelcontextprotocol.io/docs）。
+  static const String registryBaseUrl =
+      'https://registry.modelcontextprotocol.io';
+
+  /// B3-9：解析 registry /v0/servers 响应为条目列表。纯函数（无网络），
+  /// 供测试与 fetch 后处理共用；形态异常的条目跳过不抛。
+  /// 优先级：stdio packages（npm/oci/pypi 带 runtimeHint）> remotes 反代
+  /// （streamable-http/sse 的 url 直填）。
+  static List<McpRegistryEntry> parseRegistryJson(Map<String, dynamic> json) {
+    final servers = json['servers'];
+    if (servers is! List) return const [];
+    final out = <McpRegistryEntry>[];
+    for (final item in servers.whereType<Map>()) {
+      final server = item['server'];
+      if (server is! Map) continue;
+      final s = Map<String, dynamic>.from(server);
+      final name = '${s['name'] ?? ''}'.trim();
+      if (name.isEmpty) continue;
+      final packages = s['packages'];
+      final remotes = s['remotes'];
+      String? command;
+      final args = <String>[];
+      String? url;
+      final envHints = <String>[];
+      if (packages is List) {
+        for (final p in packages.whereType<Map>()) {
+          final pkg = Map<String, dynamic>.from(p);
+          final transport = pkg['transport'];
+          final tType = transport is Map ? '${transport['type']}' : '';
+          if (tType == 'http' || tType == 'sse') {
+            final u = transport is Map ? '${transport['url'] ?? ''}' : '';
+            if (u.isNotEmpty) {
+              url = u;
+              break;
+            }
+            continue;
+          }
+          final hint = '${pkg['runtimeHint'] ?? ''}'.trim();
+          final identifier = '${pkg['identifier'] ?? ''}'.trim();
+          if (identifier.isEmpty) continue;
+          final runtimeArgs = pkg['runtimeArguments'];
+          for (final ra in runtimeArgs is List ? runtimeArgs : const []) {
+            if (ra is Map && '${ra['value'] ?? ''}'.isNotEmpty) {
+              args.add('${ra['value']}');
+            }
+          }
+          final version = '${pkg['version'] ?? ''}'.trim();
+          final pinned = version.isNotEmpty ? '$identifier@$version' : identifier;
+          command = switch (hint) {
+            'npx' => 'npx',
+            'uvx' => 'uvx',
+            'docker' => 'docker',
+            'dotnet' => 'dotnet',
+            _ => hint.isNotEmpty ? hint : 'npx',
+          };
+          // runtimeArguments 只含运行期参数（如 -y）；包标识紧随其后，
+          // 与常见 npx -y <pkg> 形态对齐。docker 例外：镜像直接是标识。
+          if (command == 'docker') {
+            args..clear()..add('run')..add('-i')..add(pinned);
+          } else {
+            args.add(pinned);
+          }
+          final envVars = pkg['environmentVariables'];
+          for (final ev in envVars is List ? envVars : const []) {
+            if (ev is Map) {
+              final n = '${ev['name'] ?? ''}'.trim();
+              if (n.isNotEmpty) envHints.add(n);
+            }
+          }
+          break;
+        }
+      }
+      if (command == null && url == null && remotes is List) {
+        for (final r in remotes.whereType<Map>()) {
+          final u = '${r['url'] ?? ''}'.trim();
+          if (u.isNotEmpty) {
+            url = u;
+            break;
+          }
+        }
+      }
+      if (command == null && (url == null || url.isEmpty)) continue;
+      out.add(McpRegistryEntry(
+        name: name,
+        description: '${s['description'] ?? ''}'.trim(),
+        title: '${s['title'] ?? ''}'.trim(),
+        command: command,
+        args: args,
+        url: url,
+        envHints: envHints,
+      ));
+    }
+    return out;
+  }
+
+  /// B3-9：检索官方 registry。空 query 返回最新一批。网络失败/超时抛出
+  /// 可读错误由 UI 提示；条目经 [parseRegistryJson] 解析。
+  static Future<List<McpRegistryEntry>> searchRegistry(
+    String query, {
+    int limit = 20,
+    http.Client? client,
+  }) async {
+    final q = Uri.encodeQueryComponent(query.trim());
+    final uri = Uri.parse(
+      '$registryBaseUrl/v0/servers?limit=${limit.clamp(1, 100)}'
+      '${q.isEmpty ? '' : '&search=$q'}',
+    );
+    final httpClient = client ?? http.Client();
+    try {
+      final resp = await httpClient
+          .get(uri, headers: const {'Accept': 'application/json'})
+          .timeout(const Duration(seconds: 10));
+      if (resp.statusCode != 200) {
+        throw http.ClientException('registry 返回 ${resp.statusCode}', uri);
+      }
+      final decoded = jsonDecode(utf8.decode(resp.bodyBytes));
+      if (decoded is! Map) return const [];
+      return parseRegistryJson(Map<String, dynamic>.from(decoded));
+    } finally {
+      if (client == null) httpClient.close();
+    }
   }
 }

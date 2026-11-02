@@ -2,7 +2,11 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:meta/meta.dart';
+
 import '../diagnostics/ide_diagnostic.dart';
+
+part 'lsp_client_methods.dart';
 
 /// 最小 LSP JSON-RPC over stdio 客户端：definition + diagnostics。
 class LspLocation {
@@ -70,28 +74,47 @@ class LspClient {
     _pending.clear();
   }
 
-  static int get oversizeDroppedForTest =>
-      _allClients.fold(0, (s, c) => s + c.oversizeDropped);
-  static set oversizeDroppedForTest(int v) {
-    for (final c in _allClients) {
-      c.oversizeDropped = 0;
-    }
-    if (_allClients.isNotEmpty) _allClients.first.oversizeDropped = v;
-  }
+  /// S5-6 测试钩子：直接喂原始字节走包解析（无需启动进程）。
+  @visibleForTesting
+  void debugFeedBytesForTest(List<int> chunk) => _onBytes(chunk);
 
-  static int get stringIdDroppedForTest =>
-      _allClients.fold(0, (s, c) => s + c.stringIdDropped);
-  static set stringIdDroppedForTest(int v) {
-    for (final c in _allClients) {
-      c.stringIdDropped = 0;
-    }
-    if (_allClients.isNotEmpty) _allClients.first.stringIdDropped = v;
-  }
+  /// S5-1 测试钩子：暴露当前子进程（kill 模拟崩溃/退出用）。
+  @visibleForTesting
+  Process? debugProcessForTest() => _process;
+
+  // E12：静态聚合存取器 oversizeDroppedForTest/stringIdDroppedForTest
+  // 零引用死代码已删——测试已改用实例字段（R4-A4 实例计数）。
 
   static final Set<LspClient> _allClients = {};
   final Map<int, Completer<dynamic>> _pending = {};
   // 按字节缓冲：Content-Length 是字节数，用 text.length 切包中文必坏包。
   final List<int> _byteBuf = [];
+  // A21：分包头续扫水位——未命中时记录扫描末位，下 chunk 从 max(0,末位-3)
+  // 续扫，大消息扫描 O(n)（此前每 chunk 从头重扫 O(n²)）。
+  int _headerScanPos = 0;
+  /// A21 校验钩子：累计扫描步数（单测断言有界用）。
+  @visibleForTesting
+  int headerScanSteps = 0;
+
+  /// A21 校验钩子：分包头扫描（纯函数便于步数断言）。
+  /// [startHint] 为上次扫描末位（水位），实际从 max(0, startHint-3) 续扫
+  /// 防 \r\n\r\n 跨 chunk。返回 (headerEnd, 本次扫描步数)。
+  @visibleForTesting
+  static (int, int) findHeaderEndForTest(List<int> buf, int startHint) {
+    var steps = 0;
+    final start = startHint > 3 ? startHint - 3 : 0;
+    for (var i = start; i + 3 < buf.length; i++) {
+      steps++;
+      if (buf[i] == 13 &&
+          buf[i + 1] == 10 &&
+          buf[i + 2] == 13 &&
+          buf[i + 3] == 10) {
+        return (i, steps);
+      }
+    }
+    return (-1, steps);
+  }
+
   StreamSubscription<List<int>>? _stdoutSub;
   bool _initialized = false;
   String? _rootUri;
@@ -129,6 +152,30 @@ class LspClient {
       includeParentEnvironment: true,
       workingDirectory: rootPath,
     );
+    // S5-1：监听子进程退出：崩溃/被杀即 running=false 并拒绝全部在途请求，
+    // 不再假活到各自 10s 超时。identical 守卫：stop/start 换代后旧进程
+    // 退出不得清掉新进程状态。
+    final proc = _process!;
+    proc.exitCode.then((_) {
+      if (!identical(_process, proc)) return;
+      _process = null;
+      for (final c in _pending.values) {
+        if (!c.isCompleted) c.completeError(StateError('LSP process exited'));
+      }
+      _pending.clear();
+      // R-LSP-LEAK：从静态表移除自身并释放全文缓冲——此前 exitCode 回调
+      // 只清 _pending/_process，实例永留 _allClients（仅 stop/disposeForTest
+      // 才移除），其 _lastSyncedText（打开文件全文）无法 GC；LS 反复崩溃
+      // 即持续累积。clientFor 新建实例覆盖同键时不 stop 旧实例，故此处
+      // 自摘是唯一回收点。
+      _allClients.remove(this);
+      _lastSyncedText.clear();
+      _byteBuf.clear();
+      try {
+        _stdoutSub?.cancel();
+      } catch (_) {}
+      _stdoutSub = null;
+    });
     _rootUri = Uri.file(rootPath).toString();
     // 快速 start->stop->start 会残留旧订阅回调进新 _byteBuf：先 await 取消再覆盖。
     final prevSub = _stdoutSub;
@@ -273,20 +320,24 @@ class LspClient {
   }
 
   Future<void> stop() async {
+    // A2：stop 后从静态注册表摘除，TTL淘汰/切项目/启动失败废弃的实例可被 GC。
+    _allClients.remove(this);
     try {
       await _stdoutSub?.cancel();
     } catch (_) {}
     _stdoutSub = null;
     _byteBuf.clear();
+    _headerScanPos = 0; // A21：缓冲清空后重置续扫水位
     final proc = _process;
     _process = null;
     if (proc != null) {
       try {
-        proc.kill(ProcessSignal.sigterm);
+        // R-STOP-ORDER：先关 stdin 再 kill——注释意图即"依赖 stdin EOF
+        // 优雅退出"，旧顺序 SIGTERM 先行使 EOF 路径失效。
+        await proc.stdin.close();
       } catch (_) {}
       try {
-        // 先关 stdin 再等退出：server 依赖 stdin EOF 优雅退出，避免子进程僵睡。
-        await proc.stdin.close();
+        proc.kill(ProcessSignal.sigterm);
       } catch (_) {}
       try {
         await proc.exitCode.timeout(const Duration(seconds: 3));
@@ -346,6 +397,11 @@ class LspClient {
       didOpen(filePath, languageId, text, version: version);
       return;
     }
+    // E9：全量路径入口清除该文件的增量 pending/Timer——此前全量下发后，
+    // 旧 pending 增量的节流 Timer 到期仍按旧基线 flush，同版本增量会
+    // 错位 diff 回退服务端已收到的全量文本。
+    _pendingDidChange.remove(filePath);
+    _didChangeTimers.remove(filePath)?.cancel();
     // 全量路径同样更新同步基线：否则后续增量 diff 基于过期文本。
     _lastSyncedText[filePath] = text;
     _lastSyncedVersion[filePath] = version;
@@ -373,570 +429,10 @@ class LspClient {
     });
   }
 
-  Future<List<LspLocation>> definition({
-    required String filePath,
-    required int line,
-    required int character,
-  }) async {
-    if (!_initialized) throw StateError('LSP not started');
-    final result = await _request('textDocument/definition', {
-      'textDocument': {'uri': Uri.file(filePath).toString()},
-      'position': {'line': line, 'character': character},
-    });
-    return _parseLocations(result);
-  }
-
-  /// hover：返回纯文本提示（类型/签名/文档注释），失败返回 null。
-  Future<String?> hover({
-    required String filePath,
-    required int line,
-    required int character,
-  }) async {
-    if (!_initialized) return null;
-    final result = await _request('textDocument/hover', {
-      'textDocument': {'uri': Uri.file(filePath).toString()},
-      'position': {'line': line, 'character': character},
-    });
-    if (result is! Map) return null;
-    final contents = result['contents'];
-    final out = StringBuffer();
-    void collect(dynamic v) {
-      if (v == null) return;
-      if (v is String) {
-        if (v.trim().isNotEmpty) out.writeln(v);
-        return;
-      }
-      if (v is Map) {
-        // MarkedString: {language, value}；MarkedContents: [{name?|language?|value?}]
-        if (v['value'] is String) {
-          final t = '${v['language'] ?? v['kind'] ?? ''}'.isEmpty
-              ? '${v['value']}'
-              : '```${v['language'] ?? ''}\n${v['value']}\n```';
-          if (t.trim().isNotEmpty) out.writeln(t);
-          return;
-        }
-        if (v['name'] is String && v['value'] is String) {
-          out.writeln('${v['name']}:\n${v['value']}');
-          return;
-        }
-        return;
-      }
-      if (v is List) {
-        for (final item in v) {
-          collect(item);
-        }
-      }
-    }
-    if (contents is Map && contents['kind'] != null) {
-      final kind = '${contents['kind']}';
-      final value = contents['value'];
-      if (value is String && value.trim().isNotEmpty) {
-        out.writeln(kind == 'markdown' ? value : value.trim());
-      }
-    } else {
-      collect(contents);
-    }
-    final text = out.toString().trim();
-    return text.isEmpty ? null : text;
-  }
-
-  /// references：返回引用位置列表，失败返回空（不抛错）。
-  Future<List<LspLocation>> references({
-    required String filePath,
-    required int line,
-    required int character,
-    bool includeDeclaration = true,
-  }) async {
-    if (!_initialized) return const [];
-    try {
-      final result = await _request('textDocument/references', {
-        'textDocument': {'uri': Uri.file(filePath).toString()},
-        'position': {'line': line, 'character': character},
-        'context': {'includeDeclaration': includeDeclaration},
-      });
-      return _parseLocations(result);
-    } catch (_) {
-      return const [];
-    }
-  }
-
-  /// signatureHelp：返回签名帮助原始 map，失败返回 null（不抛错）。
-  Future<Map<String, dynamic>?> signatureHelp({
-    required String filePath,
-    required int line,
-    required int character,
-  }) async {
-    if (!_initialized) return null;
-    try {
-      final result = await _request('textDocument/signatureHelp', {
-        'textDocument': {'uri': Uri.file(filePath).toString()},
-        'position': {'line': line, 'character': character},
-      });
-      if (result is Map) return Map<String, dynamic>.from(result);
-      return null;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  /// completion：返回补全条目原始 map 列表，失败返回空（不抛错）。
-  Future<List<Map<String, dynamic>>> completion({
-    required String filePath,
-    required int line,
-    required int character,
-  }) async {
-    if (!_initialized) return const [];
-    try {
-      final result = await _request('textDocument/completion', {
-        'textDocument': {'uri': Uri.file(filePath).toString()},
-        'position': {'line': line, 'character': character},
-      });
-      final items = result is List
-          ? result
-          : (result is Map ? result['items'] : null);
-      if (items is! List) return const [];
-      return items
-          .whereType<Map>()
-          .map((e) => Map<String, dynamic>.from(e))
-          .toList();
-    } catch (_) {
-      return const [];
-    }
-  }
-
-  /// rename：返回 WorkspaceEdit 原始 map，失败返回 null（不抛错）。
-  Future<Map<String, dynamic>?> rename({
-    required String filePath,
-    required int line,
-    required int character,
-    required String newName,
-  }) async {
-    if (!_initialized) return null;
-    try {
-      final result = await _request('textDocument/rename', {
-        'textDocument': {'uri': Uri.file(filePath).toString()},
-        'position': {'line': line, 'character': character},
-        'newName': newName,
-      });
-      if (result is Map) return Map<String, dynamic>.from(result);
-      return null;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  /// format：返回 TextEdit 原始 map 列表，失败返回空（不抛错）。
-  Future<List<Map<String, dynamic>>> format({
-    required String filePath,
-    int tabSize = 2,
-    bool insertSpaces = true,
-  }) async {
-    if (!_initialized) return const [];
-    try {
-      final result = await _request('textDocument/formatting', {
-        'textDocument': {'uri': Uri.file(filePath).toString()},
-        'options': {'tabSize': tabSize, 'insertSpaces': insertSpaces},
-      });
-      if (result is! List) return const [];
-      return result
-          .whereType<Map>()
-          .map((e) => Map<String, dynamic>.from(e))
-          .toList();
-    } catch (_) {
-      return const [];
-    }
-  }
-
-  /// codeAction：返回 CodeAction/Command 原始 map 列表，失败返回空（不抛错）。
-  Future<List<Map<String, dynamic>>> codeAction({
-    required String filePath,
-    required int startLine,
-    required int endLine,
-    int startChar = 0,
-    int endChar = 0,
-    List<Map<String, dynamic>> diagnostics = const [],
-  }) async {
-    if (!_initialized) return const [];
-    try {
-      final result = await _request('textDocument/codeAction', {
-        'textDocument': {'uri': Uri.file(filePath).toString()},
-        'range': {
-          'start': {'line': startLine, 'character': startChar},
-          'end': {'line': endLine, 'character': endChar},
-        },
-        'context': {'diagnostics': diagnostics},
-      });
-      if (result is! List) return const [];
-      return result
-          .whereType<Map>()
-          .map((e) => Map<String, dynamic>.from(e))
-          .toList();
-    } catch (_) {
-      return const [];
-    }
-  }
-
-  /// workspaceSymbol：返回 SymbolInformation 原始 map 列表，失败返回空（不抛错）。
-  Future<List<Map<String, dynamic>>> workspaceSymbol(String query) async {
-    if (!_initialized) return const [];
-    try {
-      final result = await _request('workspace/symbol', {'query': query});
-      if (result is! List) return const [];
-      return result
-          .whereType<Map>()
-          .map((e) => Map<String, dynamic>.from(e))
-          .toList();
-    } catch (_) {
-      return const [];
-    }
-  }
-
-  List<LspLocation> _parseLocations(dynamic result) {
-    final locations = <LspLocation>[];
-    final items = result is List ? result : (result == null ? [] : [result]);
-    for (final item in items) {
-      if (item is! Map) continue;
-      final uri = (item['uri'] ?? item['targetUri']) as String?;
-      final range = (item['range'] ?? item['targetSelectionRange']) as Map?;
-      if (uri == null || range == null) continue;
-      final start = range['start'] as Map?;
-      String filePath;
-      try {
-        final parsed = Uri.parse(uri);
-        filePath = parsed.isScheme('file')
-            ? parsed.toFilePath()
-            : parsed.path;
-      } catch (_) {
-        continue;
-      }
-      if (filePath.isEmpty) continue;
-      // R8-负坐标钳制：恶意/异常 server 下发 line/character 为负时，
-      // 上层编辑器跳转越界崩溃，此前直通。现统一钳制 >=0。
-      final rawLine = (start?['line'] as num?)?.toInt() ?? 0;
-      final rawChar = (start?['character'] as num?)?.toInt() ?? 0;
-      locations.add(LspLocation(
-        filePath: filePath,
-        line: rawLine < 0 ? 0 : rawLine,
-        character: rawChar < 0 ? 0 : rawChar,
-      ));
-    }
-    return locations;
-  }
-
-  Future<dynamic> _request(String method, Map<String, dynamic> params) {
-    // R3在途有界：_pending无上限，高频请求+慢server即无界堆积OOM。
-    // 现256上限可观测拒新（与CDP send同口径），不悬挂到各自10s超时。
-    if (_pending.length >= 256) {
-      throw StateError('LSP 在途调用过多（>=256），请稍后重试');
-    }
-    // R3 id回绕跳键：int回绕后复用在途id即晚到响应错配新请求（与CDP同口径）。
-    var id = _id + 1;
-    if (id <= 0) id = 1;
-    while (_pending.containsKey(id)) {
-      id++;
-      if (id <= 0) id = 1;
-      if (id > 0x7fffffff) {
-        throw StateError('LSP 在途调用过多，请稍后重试');
-      }
-    }
-    _id = id;
-    final completer = Completer<dynamic>();
-    _pending[id] = completer;
-    _send({'jsonrpc': '2.0', 'id': id, 'method': method, 'params': params});
-    return completer.future.timeout(const Duration(seconds: 10), onTimeout: () {
-      // 超时必须 complete 原 Completer：只 remove 不 complete 会永久挂起调用方。
-      _pending.remove(id);
-      if (!completer.isCompleted) {
-        completer.completeError(TimeoutException('LSP $method timeout'));
-      }
-      throw TimeoutException('LSP $method timeout');
-    });
-  }
-
-  void _sendNotification(String method, Map<String, dynamic> params) {
-    _send({'jsonrpc': '2.0', 'method': method, 'params': params});
-  }
-
-  void _send(Map<String, dynamic> message) {
-    final body = jsonEncode(message);
-    final bytes = utf8.encode(body);
-    final header = ascii.encode('Content-Length: ${bytes.length}\r\n\r\n');
-    _process?.stdin.add([...header, ...bytes]);
-  }
-
-  void _onBytes(List<int> chunk) {
-    _byteBuf.addAll(chunk);
-    // 无界缓冲兜底：异常 server 狂吐数据时丢弃旧缓冲，避免 OOM。
-    const maxBuf = 8 * 1024 * 1024;
-    if (_byteBuf.length > maxBuf) {
-      _byteBuf.removeRange(0, _byteBuf.length - maxBuf);
-    }
-    while (true) {
-      // 头部是 ASCII，在字节流里找 \r\n\r\n。
-      var headerEnd = -1;
-      for (var i = 0; i + 3 < _byteBuf.length; i++) {
-        if (_byteBuf[i] == 13 &&
-            _byteBuf[i + 1] == 10 &&
-            _byteBuf[i + 2] == 13 &&
-            _byteBuf[i + 3] == 10) {
-          headerEnd = i;
-          break;
-        }
-      }
-      if (headerEnd < 0) return;
-      final header =
-          ascii.decode(_byteBuf.sublist(0, headerEnd), allowInvalid: true);
-      final match = RegExp(r'Content-Length:\s*(\d+)', caseSensitive: false)
-          .firstMatch(header);
-      if (match == null) {
-        _byteBuf.clear();
-        return;
-      }
-      // R3-08：包头上限——恶意server发Content-Length:999999999无体，
-      // 此前无限等体致正常回包误解析+排队hang。现超16MB直接丢弃可观测。
-      final length = int.parse(match.group(1)!);
-      if (length > 16 * 1024 * 1024) {
-        oversizeDropped++;
-        _byteBuf.clear();
-        return;
-      }
-      final bodyStart = headerEnd + 4;
-      if (_byteBuf.length < bodyStart + length) return;
-      final bodyBytes = _byteBuf.sublist(bodyStart, bodyStart + length);
-      _byteBuf.removeRange(0, bodyStart + length);
-      String body;
-      try {
-        body = utf8.decode(bodyBytes);
-      } catch (_) {
-        continue;
-      }
-      try {
-        final msg = jsonDecode(body) as Map<String, dynamic>;
-        final id = msg['id'];
-        final method = msg['method'] as String?;
-        // 第3轮收敛：响应 id 类型收敛——_pending 键为 int，自增请求 id 恒 int，
-        // 服务端字符串 id 回包此前 `id is int` 判假后坠入 diagnostics 分支被吞，
-        // 调用方 _request 超时挂满10s。现非 int 响应 id 显式丢弃可观测。
-        // 对齐 Roo Code Bedrock toolUseId 64字符截断类“标识失配即显式处理”口径：
-        // https://roocodeinc.github.io/Roo-Code/update-notes/v3.44/
-        // R3-08：字符串id丢弃计数可观测。
-        // R4-A4：实例计数，静态读为聚合。
-        if (id != null && id is! int && method == null) {
-          stringIdDropped++;
-          continue;
-        }
-        // 带 method 的消息按规范是服务端发起的请求（反向请求）：
-        // 必须优先路由到 _handleServerRequest，即使 id 与在途客户端请求
-        // 撞号——否则在途请求被 null 提前完成、服务端请求无人应答。
-        if (id != null && method != null) {
-          _handleServerRequest(id, method, msg['params']);
-        } else if (id is int && _pending.containsKey(id)) {
-          final completer = _pending.remove(id)!;
-          if (msg.containsKey('error')) {
-            completer.completeError(StateError('${msg['error']}'));
-          } else {
-            completer.complete(msg['result']);
-          }
-        } else if (method == 'textDocument/publishDiagnostics') {
-          _handlePublishDiagnostics(msg['params']);
-        }
-      } catch (_) {}
-    }
-  }
-
-  void _handlePublishDiagnostics(dynamic params) {
-    final handler = _diagnosticsHandler;
-    if (handler == null || params is! Map) return;
-    final uri = params['uri'] as String?;
-    final list = params['diagnostics'];
-    if (uri == null || list is! List) return;
-    String filePath;
-    try {
-      final parsed = Uri.parse(uri);
-      filePath = parsed.isScheme('file') ? parsed.toFilePath() : parsed.path;
-    } catch (_) {
-      return;
-    }
-    if (filePath.isEmpty) return;
-    // 带 version 的陈旧推送丢弃：低于当前同步版本的诊断是旧文档残影，
-    // 直接吞掉避免覆盖新文档诊断（无 version 或无同步基线时不拒）。
-    final version = params['version'];
-    if (version is num) {
-      final synced = _lastSyncedVersion[filePath];
-      if (synced != null && version.toInt() < synced) return;
-    }
-    final out = <IdeDiagnostic>[];
-    for (final item in list) {
-      if (item is! Map) continue;
-      final range = item['range'];
-      if (range is! Map) continue;
-      final start = range['start'];
-      final end = range['end'];
-      if (start is! Map || end is! Map) continue;
-      final severityCode = (item['severity'] as num?)?.toInt() ?? 1;
-      out.add(IdeDiagnostic(
-        filePath: filePath,
-        startLine: clampDiagnosticRowForTest(start['line'] as num?),
-        startChar: clampDiagnosticRowForTest(start['character'] as num?),
-        endLine: clampDiagnosticRowForTest(end['line'] as num?),
-        endChar: clampDiagnosticRowForTest(end['character'] as num?),
-        severity: _severityFromLsp(severityCode),
-        message: '${item['message'] ?? ''}',
-        source: 'lsp',
-        code: item['code']?.toString(),
-      ));
-    }
-    handler(filePath, out);
-  }
-
-  DiagnosticSeverity _severityFromLsp(int code) {
-    switch (code) {
-      case 1:
-        return DiagnosticSeverity.error;
-      case 2:
-        return DiagnosticSeverity.warning;
-      case 3:
-        return DiagnosticSeverity.info;
-      default:
-        return DiagnosticSeverity.hint;
-    }
-  }
-
   /// 抽测文档最后同步版本，供增量 didChange（大到小的 row 暂不维护）。
   final Map<String, String> _lastSyncedText = {};
   final Map<String, int> _lastSyncedVersion = {};
 
-  /// 增量 didChange：大文件只发差异区间，小文件整文档下发，节流防击键轰炸。
-  /// throttle 生效：同文件高频调用合并为一次延迟下发，只推最新一版。
-  void didChangeIncremental(
-    String filePath,
-    String newText, {
-    required int version,
-    String languageId = 'plaintext',
-    Duration throttle = const Duration(milliseconds: 300),
-  }) {
-    if (!_initialized) return;
-    if (!_openedDocs.contains(filePath)) {
-      didOpen(filePath, languageId, newText, version: version);
-      return;
-    }
-    _pendingDidChange[filePath] = _PendingDoc(newText, version);
-    _didChangeTimers[filePath]?.cancel();
-    _didChangeTimers[filePath] = Timer(throttle, () {
-      _didChangeTimers.remove(filePath);
-      final pending = _pendingDidChange.remove(filePath);
-      if (pending == null || !_initialized) return;
-      if (!_openedDocs.contains(filePath)) {
-        didOpen(filePath, languageId, pending.text, version: pending.version);
-        return;
-      }
-      _flushDidChangeIncremental(
-        filePath,
-        pending.text,
-        version: pending.version,
-        languageId: languageId,
-      );
-    });
-  }
-
-  void _flushDidChangeIncremental(
-    String filePath,
-    String newText, {
-    required int version,
-    String languageId = 'plaintext',
-  }) {
-    if (!_initialized) return;
-    if (!_openedDocs.contains(filePath)) {
-      didOpen(filePath, languageId, newText, version: version);
-      return;
-    }
-    final prevText = _lastSyncedText[filePath];
-    final prevVer = _lastSyncedVersion[filePath];
-    if (prevText == null || prevVer == null) {
-      _lastSyncedText[filePath] = newText;
-      _lastSyncedVersion[filePath] = version;
-      didChange(filePath, newText,
-          version: version, languageId: languageId);
-      return;
-    }
-    // R3版本单调：节流Timer按文件单键后到覆盖先到，乱序flush可发旧版盖新版。
-    // 旧版直接丢弃，不发didChange，不更新基线。
-    if (version < prevVer) return;
-    final shared = _commonPrefix(prevText, newText);
-    final suffix = _commonSuffix(prevText, newText, shared);
-    final oldMid = prevText.substring(shared, prevText.length - suffix);
-    final newMid = newText.substring(shared, newText.length - suffix);
-    if (prevText == newText) return;
-    if (_textSyncKind < 2) {
-      // 未声明 incremental(>=2) 的 server（None/Full）按规范拒收 ranged
-      // change：退化为整文档下发（didChange 内同步基线）。
-      didChange(filePath, newText, version: version, languageId: languageId);
-      return;
-    }
-    final startLine = _lineOf(prevText, shared);
-    final startChar = shared - _lastLineStart(prevText, shared);
-    _sendNotification('textDocument/didChange', {
-      'textDocument': {
-        'uri': Uri.file(filePath).toString(),
-        'version': version,
-      },
-      'contentChanges': [
-        {
-          'range': {
-            'start': {'line': startLine, 'character': startChar},
-            'end': _positionOf(prevText, prevText.length - suffix),
-          },
-          'rangeLength': oldMid.length,
-          'text': newMid,
-        },
-      ],
-    });
-    _lastSyncedText[filePath] = newText;
-    _lastSyncedVersion[filePath] = version;
-  }
-
-  static int _commonPrefix(String a, String b) {
-    final n = a.length < b.length ? a.length : b.length;
-    var i = 0;
-    while (i < n && a.codeUnitAt(i) == b.codeUnitAt(i)) {
-      i++;
-    }
-    return i;
-  }
-
-  static int _commonSuffix(String a, String b, int prefixLimit) {
-    var i = 0;
-    while (i < (a.length - prefixLimit) &&
-        i < (b.length - prefixLimit)) {
-      if (a.codeUnitAt(a.length - 1 - i) != b.codeUnitAt(b.length - 1 - i)) {
-        break;
-      }
-      i++;
-    }
-    return i;
-  }
-
-  static int _lineOf(String text, int offset) {
-    var n = 0;
-    for (var i = 0; i < offset && i < text.length; i++) {
-      if (text.codeUnitAt(i) == 10) n++;
-    }
-    return n;
-  }
-
-  static int _lastLineStart(String text, int offset) {
-    for (var i = offset - 1; i >= 0; i--) {
-      if (text.codeUnitAt(i) == 10) return i + 1;
-    }
-    return 0;
-  }
-
-  static Map<String, dynamic> _positionOf(String text, int offset) {
-    return {
-      'line': _lineOf(text, offset),
-      'character': offset - _lastLineStart(text, offset),
-    };
-  }
 }
 
 /// didChange 增量节流暂存：未实现定时器时仅占位，防误删。

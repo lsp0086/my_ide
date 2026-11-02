@@ -86,6 +86,19 @@ void main() {
     );
   });
 
+  test('A16 无 user 消息时 newTurnDelta 返回空列表', () {
+    // 复现：无 user 时原样返回全量历史，配合 previous_response_id 会把
+    // 服务端已有的旧消息重复发送。现返回空列表（调用方有空增量回退全量路径）。
+    final messages = [
+      {'role': 'system', 'content': 'sys'},
+      {'role': 'assistant', 'content': 'a1'},
+    ];
+    expect(
+      ResponsesDelta.newTurnDelta(messages),
+      isEmpty,
+    );
+  });
+
   test('ChatMessage 默认 ID 在同一毫秒内保持唯一', () {
     final ids = {
       for (var i = 0; i < 1000; i++) ChatMessage(role: 'user', text: '$i').id,
@@ -280,28 +293,5 @@ void main() {
     });
   });
 
-  test('轨迹导出含消息与版本ID', () async {
-    final root = await Directory.systemTemp.createTemp('traj-');
-    addTearDown(() async {
-      if (await root.exists()) await root.delete(recursive: true);
-    });
-    final store = ChatStore();
-    await store.loadForProject(root.path);
-    await store.newChat();
-    final session = store.active!;
-    await store.addMessageTo(
-      sessionId: session.id,
-      msg: ChatMessage(
-        role: 'assistant',
-        text: 'done',
-        files: const ['a.dart'],
-        afterVersionId: 'v123',
-      ),
-    );
-    final md = store.exportTrajectoryMarkdown(session.id);
-    expect(md, contains('done'));
-    expect(md, contains('a.dart'));
-    expect(md, contains('v123'));
-    expect(store.exportTrajectoryMarkdown('missing'), isEmpty);
-  });
+  // A22：轨迹导出用例已随 exportTrajectoryMarkdown 删除。
 }

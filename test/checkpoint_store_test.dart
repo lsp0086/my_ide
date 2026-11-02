@@ -7,6 +7,47 @@ import 'package:my_ide/fs/workspace_fs.dart';
 import 'package:my_ide/version/checkpoint_store.dart';
 import 'package:path/path.dart' as p;
 
+/// 读取 lib 源码：主文件与同名 `_` 前缀的 part 文件（库拆分后按整库断言）。
+Future<String> readLibSource(String relPath) async {
+  final base = File('lib/$relPath');
+  var out = await base.readAsString();
+  final stem = relPath.split('/').last.replaceAll('.dart', '');
+  final parts = base.parent
+      .listSync()
+      .whereType<File>()
+      .where(
+        (f) =>
+            f.uri.pathSegments.last.startsWith('${stem}_') &&
+            f.uri.pathSegments.last.endsWith('.dart'),
+      )
+      .toList()
+    ..sort((a, b) => a.path.compareTo(b.path));
+  for (final f in parts) {
+    out += await f.readAsString();
+  }
+  return out;
+}
+
+String readLibSourceSync(String relPath) {
+  final base = File('lib/$relPath');
+  var out = base.readAsStringSync();
+  final stem = relPath.split('/').last.replaceAll('.dart', '');
+  final parts = base.parent
+      .listSync()
+      .whereType<File>()
+      .where(
+        (f) =>
+            f.uri.pathSegments.last.startsWith('${stem}_') &&
+            f.uri.pathSegments.last.endsWith('.dart'),
+      )
+      .toList()
+    ..sort((a, b) => a.path.compareTo(b.path));
+  for (final f in parts) {
+    out += f.readAsStringSync();
+  }
+  return out;
+}
+
 void main() {
   late Directory root;
   late CheckpointStore store;
@@ -69,10 +110,7 @@ void main() {
     expect(await File(p.join(root.path, 'pic.bin')).readAsBytes(), [255, 0, 1, 2]);
     expect(await File(p.join(root.path, 'gone.txt')).readAsString(), 'temp');
     // R11-7-A 先窥视后执行：apply成功才弹栈落盘，崩在apply前栈顶仍在。
-    // ignore: avoid_slow_async_io
-    final ckptSrc = await File(
-      'lib/version/checkpoint_store.dart',
-    ).readAsString();
+    final ckptSrc = await readLibSource('version/checkpoint_store.dart');
     expect(ckptSrc.contains('R11-7-A 先窥视后执行'), isTrue);
   });
 
@@ -216,7 +254,8 @@ void main() {
       try {
         final fs = WorkspaceFs(rootPath: dir.path);
         await fs.writeText('a.txt', 'hello');
-        expect(await fs.readText('a.txt'), 'hello');
+        // B16：readText 生产无调用已删除，断言改走文件系统直读。
+        expect(await File('${dir.path}/a.txt').readAsString(), 'hello');
       } finally {
         try {
           await dir.delete(recursive: true);
@@ -359,7 +398,7 @@ void main() {
     // 复现：_captureWorkspace length→read间隙外部追加到GB即全文进内存。
     // 修复：读后字节复检超限即跳过。校验：单测走读后复检分支（源码口径）。
     // ignore: avoid_slow_async_io
-    final src = await File('lib/version/checkpoint_store.dart').readAsString();
+    final src = await readLibSource('version/checkpoint_store.dart');
     expect(src.contains('bytes.length > 2 * 1024 * 1024'), isTrue);
     // 链接复检：枚举到读之间换链即跳过，不跟随读区外。
     expect(src.contains('FileSystemEntityType.link'), isTrue);
@@ -369,7 +408,7 @@ void main() {
     // 复现：原over与不存在共用null，create回滚走continue残留不清。
     // 修复：oversized集合隔离。校验：源码三分+回滚复检口径。
     // ignore: avoid_slow_async_io
-    final src = await File('lib/version/checkpoint_store.dart').readAsString();
+    final src = await readLibSource('version/checkpoint_store.dart');
     expect(src.contains('final oversized = <String>{};'), isTrue);
     expect(
       src.contains('prior.isEmpty && oversized.contains(op.rel)'),
@@ -381,7 +420,7 @@ void main() {
     // 复现：主备manifest双坏内存[]时referenced空，删光mtime>1h全库。
     // 修复：_manifestLoaded为false直接返0。校验：源码守卫口径。
     // ignore: avoid_slow_async_io
-    final src = await File('lib/version/checkpoint_store.dart').readAsString();
+    final src = await readLibSource('version/checkpoint_store.dart');
     final idx = src.indexOf('Future<int> gcBlobs() async {');
     expect(idx, greaterThanOrEqualTo(0));
     final body = src.substring(idx, idx + 600);
@@ -389,7 +428,7 @@ void main() {
   });
 
   test('diff超限转贪心不分配矩阵', () async {
-    // 复现：第1轮R3-1，_lcsTable超限分支同样List.generate，
+    // 复现：R3-1，_lcsTable超限分支同样List.generate，
     // 10k x 10k即OOM。现超限抛错，调用方走贪心/逐行路径。
     final big = List.filled(5000, 'line');
     expect(
@@ -455,5 +494,97 @@ void main() {
         store2.dispose();
       }
     });
+  });
+
+  group('版本库 manifest/GC/提交事务 缺陷修复', () {
+    test('F5 源码口径：孤儿 GC 豁免 commit.json 在飞 id', () {
+      final src = readLibSourceSync('version/checkpoint_store.dart');
+      final fn = src.indexOf('Future<void> _gcOrphanArtifacts() async {');
+      expect(fn, greaterThanOrEqualTo(0));
+      final body = src.substring(fn, fn + 1800);
+      expect(body.contains("final jf = File(p.join(versions.path, 'commit.json'))"),
+          isTrue,
+          reason: 'F5：GC 须读 journal 登记的在飞 id');
+      expect(body.contains('live.add(jid)'), isTrue);
+    });
+
+    test('F4 源码口径：manifest 锁竞争超时不降级无锁写', () {
+      final src = readLibSourceSync('version/checkpoint_store.dart');
+      final fn = src.indexOf('Future<void> _saveManifestWithFileLock(Directory versions) async {');
+      expect(fn, greaterThanOrEqualTo(0));
+      final body = src.substring(fn, fn + 1200);
+      expect(body.contains("throw StateError('manifest 跨进程锁竞争超时"), isTrue,
+          reason: 'F4：超时须抛错重试而非无锁合并写');
+      expect(body.contains('attempt < 3'), isTrue);
+    });
+
+    test('F6 源码口径：重链提交失败整组回滚旧链', () {
+      final src = readLibSourceSync('version/checkpoint_store.dart');
+      final idx = src.indexOf('F6：整组回滚到旧链后再抛错');
+      expect(idx, greaterThanOrEqualTo(0));
+      expect(src.contains('final originalContents = <String, String?>{};'), isTrue,
+          reason: 'F6：rename 前须快照原内容');
+      expect(src.contains('renamed.add(s.target.path);'), isTrue,
+          reason: 'F6：须跟踪已提交项以便回滚');
+    });
+  });
+
+  // B3-5：恢复三选项数据层序列（Restore Files / Restore Task Only /
+  // Restore Files&Task；面板侧见 version_panel.RestoreScopeOption）。
+  // 三项分别只碰文件/只碰对话/两者同退，互不污染。
+  test('B3-5 三选项：只退文件不碰对话、只退对话不碰文件、两者同退', () async {
+    await File(p.join(root.path, 'a.txt')).writeAsString('one');
+    final v1 = await store.checkpoint(message: 'init', kind: 'manual');
+    await File(p.join(root.path, 'a.txt')).writeAsString('two');
+    final v2 = await store.checkpoint(message: 'ai', kind: 'ai-edit');
+    expect(v1, isNotNull);
+    expect(v2, isNotNull);
+
+    final chats = ChatStore();
+    addTearDown(chats.dispose);
+    await chats.loadForProject(root.path);
+    await chats.newChat();
+    final sid = chats.active!.id;
+    await chats.addMessageTo(
+      sessionId: sid,
+      msg: ChatMessage(role: 'user', text: 'q1'),
+    );
+    await chats.addMessageTo(
+      sessionId: sid,
+      msg: ChatMessage(role: 'assistant', text: 'a1', afterVersionId: v2!.id),
+    );
+    await chats.addMessageTo(
+      sessionId: sid,
+      msg: ChatMessage(role: 'user', text: 'q2'),
+    );
+    final anchor = chats.active!.messages[1].id;
+    expect(anchor, isNotEmpty);
+
+    // 1) 仅恢复对话：截断到锚点（保留 q1/a1，删 q2）；文件不动。
+    expect(
+      await chats.truncateConversation(sessionId: sid, untilMessageId: anchor),
+      isTrue,
+    );
+    expect(chats.active!.messages.map((m) => m.text), ['q1', 'a1']);
+    expect(await File(p.join(root.path, 'a.txt')).readAsString(), 'two');
+
+    // 2) 仅恢复文件：工作区写回 v1；对话不新增不删。
+    await store.restoreWorkspaceTo(v1!.id);
+    expect(await File(p.join(root.path, 'a.txt')).readAsString(), 'one');
+    expect(chats.active!.messages.map((m) => m.text), ['q1', 'a1']);
+
+    // 3) 两者同退：再造一段后续对话后同时执行——文件回 v1、对话截到锚点。
+    // 先记录现场（fail-closed 语义：未记录改动不被恢复覆盖，与生产
+    // 版本面板的 Redo 栈/安全节点口径一致）。
+    await chats.addMessageTo(
+      sessionId: sid,
+      msg: ChatMessage(role: 'user', text: 'q3'),
+    );
+    await File(p.join(root.path, 'a.txt')).writeAsString('three');
+    await store.checkpoint(message: 'v3', kind: 'manual');
+    await store.restoreWorkspaceTo(v1.id);
+    await chats.truncateConversation(sessionId: sid, untilMessageId: anchor);
+    expect(await File(p.join(root.path, 'a.txt')).readAsString(), 'one');
+    expect(chats.active!.messages.map((m) => m.text), ['q1', 'a1']);
   });
 }

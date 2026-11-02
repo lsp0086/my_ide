@@ -146,8 +146,10 @@ open(sys.argv[1], "wb").write(bytes(data))
         '-e',
         'set theImage to the clipboard as «class PNGf»',
         '-e',
-        'set theFile to open for access POSIX file "$escaped" with write permission'
-            .replaceFirst(r'$escaped', escaped),
+        // R-DEAD-REPLACE：删除死代码 replaceFirst——上方字符串插值 $escaped
+        // 已在编译期展开，replaceFirst(r'$escaped') 永不命中（结果恰好
+        // 正确，纯误导性调用）。
+        'set theFile to open for access POSIX file "$escaped" with write permission',
         '-e',
         'set eof of theFile to 0',
         '-e',

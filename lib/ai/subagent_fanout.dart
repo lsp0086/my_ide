@@ -2,6 +2,9 @@ import 'dart:async';
 
 import 'agent_tools.dart';
 
+// T32：仅测试调用的公共 API 需 meta 注解（visibleForTesting）。
+import 'package:meta/meta.dart' show visibleForTesting;
+
 /// 并行扇出任务。
 class FanoutTask {
   FanoutTask({
@@ -12,6 +15,10 @@ class FanoutTask {
     // 主循环经 runParallel 的 spawn 恒丢 mode，plan 恒走 research。
     this.mode = 'research',
     this.todos = const [],
+    // E5-MODEL：并行链路 model 透传（registry 执行侧按已启用模型解析）。
+    this.modelId = '',
+    // A5：async 透传——扇出白名单此前丢弃 async，异步派生不可达。
+    this.async = false,
   });
 
   final String id;
@@ -19,6 +26,12 @@ class FanoutTask {
   final List<String> files;
   final String mode;
   final List<String> todos;
+
+  /// E5-MODEL：子任务指定模型 id，空串=沿用当前模型。
+  final String modelId;
+
+  /// A5：异步派生标志（spawn_subagent async:true → 立即返回 spawnId）。
+  final bool async;
 }
 
 /// 单个扇出结果。
@@ -43,6 +56,9 @@ class FanoutResult {
     // R16R4：整批超时结构化标记——此前调用方凭output.contains('整批超时')
     // 文本定性，文案一改即失配。现占位带timedOut=true，文本仅展示用。
     this.timedOut = false,
+    // R-SUBINT：中断占位结构化标记——子代理输出引用/复读占位文案时
+    // 文本匹配会误判正常结果为中断，选优失真。定性只认结构化字段。
+    this.interrupted = false,
   });
 
   final String source;
@@ -65,6 +81,9 @@ class FanoutResult {
 
   /// R16R4：整批超时结构化标记。
   final bool timedOut;
+
+  /// R-SUBINT：中断占位结构化标记。
+  final bool interrupted;
 }
 
 /// 扇出评审：全部结果 + 选优 + 合并文本（标注来源）。
@@ -81,6 +100,9 @@ class FanoutReview {
 
   /// R5写交集检测：并行分支touchedFiles交集非空即同文件并发写，
   /// 调用方须串行化或打回（OpenHands共享写坑/LangGraph单步单值口径）。
+  /// T32：生产路径零调用（扇出侧已在 _runSubagent 前做写串行守卫），
+  /// 仅回归测试调用，标 @visibleForTesting 防误当生产 API。
+  @visibleForTesting
   static Set<String> conflictingFiles(List<FanoutResult> rs) {
     final seen = <String>{};
     final conflicts = <String>{};
@@ -126,13 +148,17 @@ Future<FanoutReview> runParallel(
   if (limit < 1) limit = 1;
   if (limit > 3) limit = 3;
   // R4-A1：整批总超时默认兜底——批数×单任务超时+余量，不再靠调用方传参。
+  // R-OVERALL-CAP：默认兜底加上限 120s——9 子任务×60s 兜底 190s 会拖住
+  // 取消感知分支；调用方显式传 overallTimeout 不受上限约束。
   final batchCount = (tasks.length + limit - 1) ~/ limit;
+  final computedOverall = Duration(
+    microseconds:
+        effectiveTimeout.inMicroseconds * (batchCount > 0 ? batchCount : 1) +
+            const Duration(seconds: 10).inMicroseconds,
+  );
+  const overallCap = Duration(seconds: 120);
   final effectiveOverall = overallTimeout ??
-      Duration(
-        microseconds:
-            effectiveTimeout.inMicroseconds * (batchCount > 0 ? batchCount : 1) +
-                const Duration(seconds: 10).inMicroseconds,
-      );
+      (computedOverall > overallCap ? overallCap : computedOverall);
   final overallDeadline =
       effectiveOverall.inMicroseconds > 0 ? DateTime.now().add(effectiveOverall) : null;
   final results = <FanoutResult>[];
@@ -197,6 +223,10 @@ Future<FanoutReview> runParallel(
     }
     if (effective.isEmpty) continue;
     final futures = effective.map((t) async {
+      // R18-08：单任务超时结构化定性——整批超时占位带 timedOut:true，
+      // 单任务超时此前只回文本，调用方（Runner spawnTimedOut 判定）
+      // 对单分支超时判不出。文本保留，仅补结构化标记。
+      var taskTimedOut = false;
       try {
         // R6-O1同口径：有超时即限时等，超时按失败占位有序回填。
         // R8-超时下界：0/负数Duration此前即全部分支必超时（timeout(0)恒抛），
@@ -216,6 +246,8 @@ Future<FanoutReview> runParallel(
             : await runner(t).timeout(
                 bounded,
                 onTimeout: () {
+                  // R18-08：标记本次为单任务超时（占位文本保留）。
+                  taskTimedOut = true;
                   try {
                     onAbandon?.call(t);
                   } catch (_) {}
@@ -235,6 +267,7 @@ Future<FanoutReview> runParallel(
           sourceLabel: r.source ?? 'subagent',
           touchedFiles: r.touchedFiles,
           gen: gen,
+          timedOut: taskTimedOut,
         );
       } catch (e) {
         return FanoutResult(source: t.id, ok: false, output: '失败：$e', gen: gen);
@@ -278,6 +311,23 @@ Future<FanoutReview> runParallel(
             ),
         ];
       } else if (remain != null) {
+        // R-TIMEOUT-PARTIAL：超时熔断同样保留已完成分支——此前整批
+        // 一律回 timedOut 占位，早完成分支的真实调研结果全丢弃。
+        // 改为与取消分支同口径：完成表合成 + 未完成项回 timedOut 占位，
+        // onResult 到达序回调已在下方 then 登记，不重复下发。
+        final completed = <int, FanoutResult>{};
+        for (var i = 0; i < effective.length; i++) {
+          futures[i].then((r) {
+            completed[i] = r;
+          }, onError: (Object e) {
+            completed[i] = FanoutResult(
+              source: effective[i].id,
+              ok: false,
+              output: '失败：$e',
+              gen: gen,
+            );
+          });
+        }
         outputs = await Future.wait(
           futures,
           eagerError: false,
@@ -290,14 +340,15 @@ Future<FanoutReview> runParallel(
               } catch (_) {}
             }
             return [
-              for (final t in effective)
-                FanoutResult(
-                  source: t.id,
-                  ok: false,
-                  output: '子Agent整批超时，已熔断。',
-                  gen: gen,
-                  timedOut: true,
-                ),
+              for (var i = 0; i < effective.length; i++)
+                completed[i] ??
+                    FanoutResult(
+                      source: effective[i].id,
+                      ok: false,
+                      output: '子Agent整批超时，已熔断。',
+                      gen: gen,
+                      timedOut: true,
+                    ),
             ];
           },
         );
@@ -325,6 +376,8 @@ Future<FanoutReview> runParallel(
     // Cline Plan/Act 双模串行语义 https://docs.cline.bot/core-workflows/plan-and-act
     // （采纳：同批有序收集+空 id 不丢；不采纳：worktree 物理隔离，见 README 已知待办）。
     final completed = <int, FanoutResult>{};
+    // A5：本批停止等待原因定性——true=整批超时熔断，false=用户取消。
+    var batchTimedOut = false;
     for (var i = 0; i < effective.length; i++) {
       // 取消感知 then 异常兜底：runner 内部同步抛时此前无 onError，
       // 该 id 永不入表、无取消即 50ms 空转到最慢分支。
@@ -345,6 +398,9 @@ Future<FanoutReview> runParallel(
       // R4-A1：取消感知分支同样受整批超时约束，超限即停等回失败占位。
       if (overallDeadline != null &&
           !DateTime.now().isBefore(overallDeadline)) {
+        // A5：记超时定性——回填占位须与非取消分支同口径（timedOut:true），
+        // 此前统一回填"用户中断"，Runner spawnTimedOut 判定失效。
+        batchTimedOut = true;
         for (var i = 0; i < effective.length; i++) {
           if (completed.containsKey(i)) continue;
           try {
@@ -367,6 +423,9 @@ Future<FanoutReview> runParallel(
     final seenSources = <String>{for (final r in results) r.source};
     var emptyQueued = 0;
     var emptySeen = 0;
+    // A5：缺失项占位口径——超时熔断与用户取消分开定性，
+    // 非取消分支同款"子Agent整批超时，已熔断。"+timedOut:true。
+    final missingNote = batchTimedOut ? '子Agent整批超时，已熔断。' : '用户中断，已取消。';
     for (var i = 0; i < effective.length; i++) {
       final t = effective[i];
       final r = completed[i];
@@ -413,7 +472,14 @@ Future<FanoutReview> runParallel(
         continue;
       }
       results.add(
-        FanoutResult(source: t.id, ok: false, output: '用户中断，已取消。', gen: gen),
+        FanoutResult(
+          source: t.id,
+          ok: false,
+          output: missingNote,
+          gen: gen,
+          timedOut: batchTimedOut,
+          interrupted: !batchTimedOut,
+        ),
       );
     }
     // 取消后剩余批次不再发起执行，直接按中断占位补齐，保证 results 与 tasks 对齐。
@@ -425,8 +491,10 @@ Future<FanoutReview> runParallel(
           FanoutResult(
             source: t.id,
             ok: false,
-            output: '用户中断，已取消。',
+            output: missingNote,
             gen: gen,
+            timedOut: batchTimedOut,
+            interrupted: !batchTimedOut,
           ),
         );
       } else {
@@ -445,16 +513,19 @@ Future<FanoutReview> runParallel(
   final valid = results.where((r) => r.ok && r.output.trim().isNotEmpty);
   // R2-F1：占位不污染选优——此前重复id占位ok:true可被选为best拼入上下文。
   // 现 best 过滤占位文本，全占位批 best.ok==false 不熔断不拼上下文。
-  // R8-F1：中断占位同样过滤——取消截断回填ok:false“用户中断，已取消”，
+  // R8-F1：中断占位同样过滤——取消截断回填ok:false"用户中断，已取消"，
   // 全失败分支按最长输出会选中中断文本拼上下文。现与重复占位同口径过滤。
+  // R-SUBINT/A2：定性以结构化字段（timedOut/interrupted）优先——子代理
+  // 输出"引用/复读"占位文案时不误过滤；占位文案仅作展示。
+  // 同保留整条精确匹配兜底：既有链路 _runSubagent 取消占位经 AgentToolResult
+  // 回流，无结构化字段可带；精确匹配（全串等值）不误伤引用占位文案的
+  // 正常长输出（旧 contains 口径会误伤，即 A2 修复点）。
   bool isPlaceholder(FanoutResult r) =>
       r.output.startsWith('重复任务 id，已跳过') ||
       r.timedOut ||
-      r.output.contains('子Agent整批超时，已熔断');
-  // R4-A1：整批超时占位同样不污染熔断/上下文——与重复占位/中断占位同口径，
-  // best 过滤后失败分支才参与，全占位批 best.ok==false 不熔断不拼占位文本。
+      r.output.trim() == '子Agent整批超时，已熔断。';
   bool isInterrupted(FanoutResult r) =>
-      r.output.contains('用户中断，已取消');
+      r.interrupted || r.output.trim() == '用户中断，已取消。';
   final validNonPlaceholder =
       valid.where((r) => !isPlaceholder(r) && !isInterrupted(r));
   FanoutResult best;

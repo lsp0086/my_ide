@@ -1,7 +1,8 @@
 import 'dart:io';
 
-import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
+
+import 'checkpoint_store.dart';
 
 /// worktree 隔离（默认关闭）。
 class GitWorktree {
@@ -27,19 +28,38 @@ class GitWorktree {
   }
 
   /// git 调用统一加 `-c safe.directory=*`。
-  static List<String> _gitBase() => ['-c', 'safe.directory=*'];
+  /// S4-13：只读调用（rev-parse 等）禁用 fsmonitor——防仓主配置的
+  /// fsmonitor 集成/hook 在状态查询时执行任意命令。
+  static List<String> _gitBase() => [
+        '-c',
+        'safe.directory=*',
+        '-c',
+        'core.fsmonitor=false',
+      ];
+
+  /// S4-10：带超时收管道的 git 执行——`Process.run(...).timeout` 超时后
+  /// 子进程仍存活并挂住管道成为孤儿进程。超时返回 null
+  ///（调用方按失败处理，原"失败返回 null/false"语义不变）。
+  /// B11：stdout/stderr 有界收集委托 GitSnapshot.runProcessBounded——
+  /// 此前 `utf8.decoder.bind(stdout).join()` 无界 join，异常仓库输出可灌爆内存。
+  static Future<ProcessResult?> _runGitWithTimeout(
+    List<String> args, {
+    Duration timeout = const Duration(seconds: 10),
+  }) {
+    return GitSnapshot.runProcessBounded('git', args, timeout: timeout);
+  }
 
   /// 是否为 git 仓库。
   static Future<bool> _isGitRepo(String root) async {
     try {
-      final res = await Process.run('git', [
+      final res = await _runGitWithTimeout([
         ..._gitBase(),
         '-C',
         root,
         'rev-parse',
         '--is-inside-work-tree',
-      ]).timeout(const Duration(seconds: 10));
-      return res.exitCode == 0;
+      ]);
+      return res != null && res.exitCode == 0;
     } catch (_) {
       return false;
     }
@@ -57,7 +77,7 @@ class GitWorktree {
   /// 分支是否存在。
   static Future<bool> _branchExists(String root, String branch) async {
     try {
-      final res = await Process.run('git', [
+      final res = await _runGitWithTimeout([
         ..._gitBase(),
         '-C',
         root,
@@ -65,8 +85,8 @@ class GitWorktree {
         '--verify',
         '--quiet',
         branch,
-      ]).timeout(const Duration(seconds: 10));
-      return res.exitCode == 0;
+      ]);
+      return res != null && res.exitCode == 0;
     } catch (_) {
       return false;
     }
@@ -82,64 +102,25 @@ class GitWorktree {
           '${now.year}${now.month.toString().padLeft(2, '0')}${now.day.toString().padLeft(2, '0')}';
       final base = 'backup/$date-${_safeLabel(label)}';
       var name = base;
-      for (var i = 1; i <= 20; i++) {
+      // B13：off-by-one 修正——旧上限 20 时 base-20 从未被探测：i==20 分支
+      // 先赋名 base-20 再立即 return null，base-20 分支名永远分配不到。
+      // 上限改 21 后探测覆盖 base 与 base-1..base-20 全部 21 个名字。
+      for (var i = 1; i <= 21; i++) {
         if (!await _branchExists(root, name)) break;
         name = '$base-$i';
-        if (i == 20) return null;
+        if (i == 21) return null;
       }
-      final res = await Process.run('git', [
+      final res = await _runGitWithTimeout([
         ..._gitBase(),
         '-C',
         root,
         'branch',
         name,
         'HEAD',
-      ]).timeout(const Duration(seconds: 10));
-      return res.exitCode == 0 ? name : null;
+      ]);
+      return res != null && res.exitCode == 0 ? name : null;
     } catch (_) {
       return null;
     }
-  }
-
-  /// 在 `<root>/.my_ide/worktrees/<branch-safe>` 建隔离 worktree，返回路径；失败 null。
-  static Future<String?> createIsolatedWorktree(
-    String root,
-    String branch,
-  ) async {
-    try {
-      if (!await _isGitRepo(root)) return null;
-      final safe = branch
-          .replaceAll(RegExp(r'[^A-Za-z0-9_-]+'), '-')
-          .replaceAll(RegExp(r'-{2,}'), '-');
-      if (safe.isEmpty) return null;
-      final wtPath = p.join(root, '.my_ide', 'worktrees', safe);
-      final res = await Process.run('git', [
-        ..._gitBase(),
-        '-C',
-        root,
-        'worktree',
-        'add',
-        wtPath,
-        branch,
-      ]).timeout(const Duration(seconds: 10));
-      return res.exitCode == 0 ? wtPath : null;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  /// 移除隔离 worktree，吞错。
-  static Future<void> removeWorktree(String root, String wtPath) async {
-    try {
-      await Process.run('git', [
-        ..._gitBase(),
-        '-C',
-        root,
-        'worktree',
-        'remove',
-        '--force',
-        wtPath,
-      ]).timeout(const Duration(seconds: 10));
-    } catch (_) {}
   }
 }

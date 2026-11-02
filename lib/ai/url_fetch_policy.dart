@@ -19,6 +19,12 @@ class UrlFetchPolicy {
     }
     if (uri.host.isEmpty) return 'url 缺少主机：$uri';
     if (uri.userInfo.isNotEmpty) return '拒绝带用户信息的 url：$uri';
+    // B15：端口白名单——http(80)/https(443) 之外（22/6379/5432 等）
+    // 属探测性连接，默认拒绝。
+    final port = uri.port;
+    if (port != 0 && port != 80 && port != 443) {
+      return '拒绝非标准端口（仅 80/443）：$uri';
+    }
     var host = uri.host.toLowerCase();
     // R15R2：尾点 FQDN 归一——`metadata.google.internal.` 与无点同义，
     // 此前精确匹配即被绕过。剥尾点后再比本地域名。
@@ -61,6 +67,11 @@ class UrlFetchPolicy {
     }
     return false;
   }
+
+  /// G-B12：白名单主机判定的公开口径（外部 CDP 端点 attach 校验复用）。
+  /// 与 rejectLiteral 的 allowedHosts 语义同源：大小写/尾点归一后，
+  /// 命中白名单条目本身或其子域即放行。
+  bool hostAllowed(String host) => _hostAllowed(host);
 
   /// 数字 IP 归一化：0x7f.0.0.1 / 0177.0.0.1 / 2130706433 / 尾点域名。
   /// tryParse 认不出这些写法，手动转点分十进制再判，认不出返回 null。
@@ -146,10 +157,71 @@ class UrlFetchPolicy {
         return '拒绝共享地址空间：${raw.address}';
       }
       if (b[0] >= 224) return '拒绝保留/组播地址：${raw.address}';
+      // A1-8：补齐 IANA 特殊用途注册表（IPv4）保留段——此前这些段
+      // rejectAddress 返回 null 被放行，可被用于绕过内网扫描/伪装可信
+      // 目标。来源 https://www.iana.org/assignments/iana-ipv4-special-registry/
+      // 与 https://datatracker.ietf.org/doc/rfc6890/（特殊用途 IP 地址
+      // 注册表含 RFC5735/RFC3849/RFC2544/RFC7534/RFC7450 等条目）。
+      if (b[0] == 192 && b[1] == 0 && b[2] == 0) {
+        // 192.0.0.0/24 IETF 协议分配（含 192.0.0.9 等知名服务地址）。
+        return '拒绝特殊用途地址：${raw.address}';
+      }
+      if (b[0] == 192 && b[1] == 0 && b[2] == 2) {
+        // 192.0.2.0/24 TEST-NET-1（文档示例）。
+        return '拒绝保留地址：${raw.address}';
+      }
+      if (b[0] == 198 && (b[1] == 18 || b[1] == 19)) {
+        // 198.18.0.0/15 基准测试（RFC2544）。
+        return '拒绝特殊用途地址：${raw.address}';
+      }
+      if (b[0] == 198 && b[1] == 51 && b[2] == 100) {
+        // 198.51.100.0/24 TEST-NET-2（文档示例）。
+        return '拒绝保留地址：${raw.address}';
+      }
+      if (b[0] == 203 && b[1] == 0 && b[2] == 113) {
+        // 203.0.113.0/24 TEST-NET-3（文档示例）。
+        return '拒绝保留地址：${raw.address}';
+      }
+      if (b[0] == 192 && b[1] == 88 && b[2] == 99) {
+        // 192.88.99.0/24 已废弃 6to4 中继任播（RFC7526 deprecated）。
+        return '拒绝特殊用途地址：${raw.address}';
+      }
+      if (b[0] == 192 && b[1] == 31 && b[2] == 196) {
+        // 192.31.196.0/24 AS112 服务（RFC7535）。
+        return '拒绝特殊用途地址：${raw.address}';
+      }
+      if (b[0] == 192 && b[1] == 52 && b[2] == 193) {
+        // 192.52.193.0/24 AMT 任播（RFC7450）。
+        return '拒绝特殊用途地址：${raw.address}';
+      }
+      if (b[0] == 192 && b[1] == 175 && b[2] == 48) {
+        // 192.175.48.0/24 AS112 直接委派服务（RFC7534）。
+        return '拒绝特殊用途地址：${raw.address}';
+      }
     } else if (raw.type == InternetAddressType.IPv6) {
       final b = raw.rawAddress;
       if (b.length != 16) return '拒绝异常 IPv6：${raw.address}';
       if (b.every((e) => e == 0)) return '拒绝未指定地址：${raw.address}';
+      // A1-8：2002::/16（6to4 封装）——其内可嵌入任意 IPv4 目标，
+      // 放行即旁路 IPv4 私网判定（RFC3056）。
+      if (b[0] == 0x20 && b[1] == 0x02) {
+        return '拒绝特殊用途地址：${raw.address}';
+      }
+      // A1-8：64:ff9b::/96（NAT64 知名前缀）——把 IPv4 字面量包装成
+      // IPv6 即可触达 IPv4 目标，私网/回环复核被绕过（RFC6052）。
+      // 前缀 = 00 64 ff 9b + 8 个零字节（共 12 字节），后 4 字节封装 IPv4。
+      if (b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b) {
+        var midZero = true;
+        for (var i = 4; i < 12; i++) {
+          if (b[i] != 0) {
+            midZero = false;
+            break;
+          }
+        }
+        if (midZero) {
+          return '拒绝特殊用途地址：${raw.address}';
+        }
+      }
       // R15R5：AWS IPv6 元数据 fd00:ec2::254——此前仅判 IPv4 169.254.169.254，
       // 双栈 VPC 下 IPv6 元数据漏网。来源
       // https://pipelab.org/learn/preventing-ssrf-in-ai-agents/。

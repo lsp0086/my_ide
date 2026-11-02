@@ -47,29 +47,7 @@ class AgentSkill {
 
   String get id => '$sourceLabel::$name::$directoryPath';
 
-  AgentSkill copyWith({
-    String? name,
-    String? description,
-    String? body,
-    String? parseWarning,
-  }) {
-    return AgentSkill(
-      name: name ?? this.name,
-      description: description ?? this.description,
-      body: body ?? this.body,
-      directoryPath: directoryPath,
-      skillMdPath: skillMdPath,
-      scope: scope,
-      sourceLabel: sourceLabel,
-      license: license,
-      compatibility: compatibility,
-      version: version,
-      author: author,
-      metadata: metadata,
-      allowedTools: allowedTools,
-      parseWarning: parseWarning ?? this.parseWarning,
-    );
-  }
+  // R-DEADCODE-COPYWITH：copyWith 已删——全库 Grep（lib/ + test/）零调用。
 }
 
 class SkillParseException implements Exception {
@@ -146,6 +124,14 @@ class SkillMdParser {
     if (directoryName != null &&
         directoryName.isNotEmpty &&
         directoryName != name) {
+      // B3-8：agentskills 规范要求 SKILL.md 父目录末段与 name 一致——
+      // 宽松模式仅告警（进 UI 提示），严格模式直接拒（与 skills-ref
+      // 对 invalid 样例的判定一致）。
+      if (strict) {
+        throw SkillParseException(
+          'name「$name」与目录名「$directoryName」不一致（严格模式）',
+        );
+      }
       warning = _joinWarning(
         warning,
         'name「$name」与目录名「$directoryName」不一致',
@@ -158,7 +144,14 @@ class SkillMdParser {
     }
 
     final license = _optionalString(fields['license']);
-    final compatibility = _optionalString(fields['compatibility']);
+    var compatibility = _optionalString(fields['compatibility']);
+    // B3-8：compatibility 500 字校验（agentskills 规范上限）——此前完全
+    // 不校验，超长兼容性说明照单全收。严格拒、宽松截断+告警。
+    if (compatibility != null && compatibility.length > 500) {
+      if (strict) throw SkillParseException('compatibility 超过 500 字符');
+      warning = _joinWarning(warning, 'compatibility 超过 500 字符，已截断');
+      compatibility = compatibility.substring(0, 500);
+    }
     final version = _optionalString(fields['version']);
     final author = _optionalString(fields['author']);
     final allowedTools = _optionalString(

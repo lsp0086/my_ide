@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data' show Uint8List;
 
 import 'package:flutter/material.dart';
 
@@ -18,10 +19,14 @@ import '../theme/app_colors.dart';
 /// https://chromedevtools.github.io/devtools-protocol/tot/Page/ ；
 /// agent-browser 录制/串流同协议 https://agent-browser.dev/changelog 。
 class BrowserPageView extends StatefulWidget {
-  const BrowserPageView({super.key, required this.initialUrl});
+  const BrowserPageView({super.key, required this.initialUrl, this.onClose});
 
   /// 页面标签页创建时的 URL；后续以 Agent 打开事件的 URL 为准。
   final String initialUrl;
+
+  /// F11：空态动作出口之一——"关闭该页签"。由宿主（FilePreviewPane ←
+  /// 编辑器面板）接线 WorkspaceController.closeTab；未接线时不出关闭入口。
+  final VoidCallback? onClose;
 
   @override
   State<BrowserPageView> createState() => _BrowserPageViewState();
@@ -34,8 +39,16 @@ class _BrowserPageViewState extends State<BrowserPageView> {
   // R1-BR3：绑定世代——同service二次open时旧帧订阅cancel未await，
   // 旧帧在途仍进_frame闪一下。回调凭世代丢弃旧绑定帧。
   int _bindGen = 0;
+  // S3-3：帧流消费配对——本视图已对哪些 service 调过 startScreencast 且
+  // 未 stop。service 侧按消费计数启停，本视图保证对其 start/stop 严格
+  // 一对一：dispose/换绑退票，重试（renderingState=='off'）先退旧票再
+  // 重新出票，双标签共享 service 时互不代停流。
+  final Set<BrowserService> _screencastHeld = <BrowserService>{};
   String _url = '';
-  String? _frame;
+  // R-FRAME-CACHE：收帧时一次性解码缓存 Uint8List——build 内重复
+  // base64Decode 此前在父级任意 rebuild（窗口 resize/主题切换/手势触发）
+  // 时对同一 MB 级帧反复解码跑 UI isolate；build 只引用缓存。
+  Uint8List? _frameBytes;
   // R3-B2：帧节流——此前逐帧setState+build内base64Decode跑UI isolate，
   // 30fps即卡顿。现100ms节流+丢旧帧（只保最新），loading占位立即清。
   DateTime _lastFrameAt = DateTime.fromMicrosecondsSinceEpoch(0);
@@ -43,12 +56,25 @@ class _BrowserPageViewState extends State<BrowserPageView> {
   // 轮次1：末帧冲刷定时器——节流窗到期后渲染滞留的 pending 帧。
   Timer? _pendingFlushTimer;
 
+  /// R-FRAME-CACHE：base64 解码失败按无帧处理（进 errorBuilder/等待态）。
+  void _setFrame(String? data) {
+    Uint8List? bytes;
+    if (data != null) {
+      try {
+        bytes = base64Decode(data);
+      } catch (_) {
+        bytes = null;
+      }
+    }
+    _frameBytes = bytes;
+  }
+
   @override
   void initState() {
     super.initState();
     _url = widget.initialUrl;
-    // 关键时序：页面标签页由 pageOpened 事件唤起，而本视图在事件之后才
-    // 创建（broadcast 不回放）——必须先吃 lastOpened 立即绑定当前 service，
+    // 关键时序：页面标签页由 BrowserService.pageOpened 事件唤起，而本视图在事件之后才
+    // 创建（broadcast 不回放）——必须先吃 BrowserService.lastOpened 立即绑定当前 service，
     // 否则首开的帧流永远等不到（典型流程里只有一次 browser_open）。
     final last = BrowserService.lastOpened;
     if (last != null) {
@@ -62,13 +88,16 @@ class _BrowserPageViewState extends State<BrowserPageView> {
     final rebind = !identical(e.service, _service);
     // R10R1：同 service 二次 open 同样清空旧帧，否则新页 load 期间仍显示
     // 旧页截图误导。复现：browser_open A 后再 open B，B load 期间仍见 A。
+    // R5-3：清帧并入 setState 且无条件——rebind 分支此前在 setState 外
+    // 清帧，换绑后 setState 已带旧帧重绘，字段清空不触发重绘，旧页截图
+    // 滞留显示到新页首帧到达。
     setState(() {
       _url = e.url;
-      if (!rebind) _frame = null;
+      _setFrame(null);
     });
     if (rebind) {
+      final old = _service;
       _service = e.service;
-      _frame = null;
       // R1-BR3：换绑先占新世代再取消旧订阅——旧帧在途回调凭旧世代丢弃，
       // 不再闪一下旧页。
       final gen = ++_bindGen;
@@ -85,7 +114,7 @@ class _BrowserPageViewState extends State<BrowserPageView> {
           _pendingFlushTimer?.cancel();
           _pendingFlushTimer = null;
           _pendingFrame = null;
-          setState(() => _frame = null);
+          setState(() => _setFrame(null));
           return;
         }
         // R3-B2：100ms节流+丢旧帧——高频帧只保最新pending，不逐帧setState。
@@ -106,7 +135,7 @@ class _BrowserPageViewState extends State<BrowserPageView> {
               if (latest == null) return;
               _pendingFrame = null;
               _lastFrameAt = DateTime.now();
-              setState(() => _frame = latest);
+              setState(() => _setFrame(latest));
             },
           );
           return;
@@ -115,12 +144,28 @@ class _BrowserPageViewState extends State<BrowserPageView> {
         _lastFrameAt = now;
         final latest = _pendingFrame;
         _pendingFrame = null;
-        if (latest != null) setState(() => _frame = latest);
+        if (latest != null) setState(() => _setFrame(latest));
       });
+      // S3-3：换绑到其他 service 先退本视图在旧 service 的消费——旧页
+      // 帧流随归零停推，不悬空空转。
+      if (old != null && !identical(old, e.service) &&
+          _screencastHeld.remove(old)) {
+        unawaited(old.stopScreencast());
+      }
     }
-    // 幂等：同 client 已挂流则早退；此前启动失败（如 Chrome 未起）时
-    // 借后续 open 事件自动重试，不需要额外定时器。
-    unawaited(e.service.startScreencast());
+    // S3-3：幂等+重试——首次绑定为该 service 出一个消费（start）；已持有
+    // 且 renderingState=='off'（上次 start 未生效：建连失败/超 30s/连续
+    // 失败清 off）时先退旧票再重新出票，保证 start/stop 配对、计数不膨胀。
+    if (_screencastHeld.add(e.service)) {
+      unawaited(e.service.startScreencast());
+    } else if (e.service.renderingState == 'off') {
+      unawaited(() async {
+        try {
+          await e.service.stopScreencast();
+        } catch (_) {}
+        await e.service.startScreencast();
+      }());
+    }
   }
 
   @override
@@ -129,7 +174,11 @@ class _BrowserPageViewState extends State<BrowserPageView> {
     _frameSub?.cancel();
     _pendingFlushTimer?.cancel();
     _pendingFlushTimer = null;
-    unawaited(_service?.stopScreencast());
+    // S3-3：只退本视图的消费——同 service 其他标签页仍在消费时帧流不停。
+    final svc = _service;
+    if (svc != null && _screencastHeld.remove(svc)) {
+      unawaited(svc.stopScreencast());
+    }
     _service = null;
     super.dispose();
   }
@@ -197,24 +246,44 @@ class _BrowserPageViewState extends State<BrowserPageView> {
                     ],
                   ),
                 ),
+                // F11：标题栏角部关闭出口，接线宿主页签的 closeTab。
+                if (widget.onClose != null)
+                  IconButton(
+                    tooltip: '关闭该页签',
+                    visualDensity: VisualDensity.compact,
+                    onPressed: widget.onClose,
+                    icon: Icon(
+                      Icons.close_rounded,
+                      size: 15,
+                      color: colors.textMuted,
+                    ),
+                  ),
               ],
             ),
           ),
           Expanded(
-            child: _frame != null
+            child: _frameBytes != null
                 ? InteractiveViewer(
                     minScale: 0.4,
                     maxScale: 6,
                     child: Image.memory(
-                      base64Decode(_frame!),
+                      _frameBytes!,
                       fit: BoxFit.contain,
                       gaplessPlayback: true,
                       errorBuilder: (context, error, stackTrace) {
-                        return _WaitHint(colors: colors, url: _url);
+                        return _WaitHint(
+                          colors: colors,
+                          url: _url,
+                          onClose: widget.onClose,
+                        );
                       },
                     ),
                   )
-                : _WaitHint(colors: colors, url: _url),
+                : _WaitHint(
+                    colors: colors,
+                    url: _url,
+                    onClose: widget.onClose,
+                  ),
           ),
         ],
       ),
@@ -223,10 +292,15 @@ class _BrowserPageViewState extends State<BrowserPageView> {
 }
 
 class _WaitHint extends StatelessWidget {
-  const _WaitHint({required this.colors, required this.url});
+  const _WaitHint({required this.colors, required this.url, this.onClose});
 
   final IdeColors colors;
   final String url;
+
+  /// F11：空态动作出口——接线宿主页签关闭（未接线则不显示该按钮）。
+  /// "让 Agent 打开页面"暂无聊天输入预填接线（composer 控制器私有），
+  /// 按文案引导（见下方空态提示句）。
+  final VoidCallback? onClose;
 
   @override
   Widget build(BuildContext context) {
@@ -256,6 +330,15 @@ class _WaitHint extends StatelessWidget {
             textAlign: TextAlign.center,
             style: TextStyle(color: colors.textMuted, fontSize: 12),
           ),
+          // F11：空态可操作出口——直接关闭该页签返回编辑器。
+          if (onClose != null) ...[
+            const SizedBox(height: 16),
+            OutlinedButton.icon(
+              onPressed: onClose,
+              icon: const Icon(Icons.close_rounded, size: 15),
+              label: const Text('关闭该页签'),
+            ),
+          ],
         ],
       ),
     );

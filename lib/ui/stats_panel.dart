@@ -31,8 +31,9 @@ class StatsPanel extends StatelessWidget {
 
   final VoidCallback? onClose;
 
-  /// GitHub 贡献绿：空 + 4 档由浅到深。
-  static const _levels = <Color>[
+  /// GitHub 贡献绿色阶：空 + 4 档由浅到深，按主题亮度分两套——暗色主题
+  /// 下空格用中性深灰（亮色 #EBEDF0 在暗面板上刺眼），绿谱同步提亮。
+  static const _lightLevels = <Color>[
     Color(0xFFEBEDF0),
     Color(0xFF9BE9A8),
     Color(0xFF40C463),
@@ -40,10 +41,38 @@ class StatsPanel extends StatelessWidget {
     Color(0xFF216E39),
   ];
 
+  static const _darkLevels = <Color>[
+    Color(0xFF2B2B30),
+    Color(0xFF0E4429),
+    Color(0xFF006D32),
+    Color(0xFF26A641),
+    Color(0xFF39D353),
+  ];
+
+  static List<Color> _levelsFor(Brightness brightness) =>
+      brightness == Brightness.dark ? _darkLevels : _lightLevels;
+
   static DateTime _dayKey(DateTime dt) => DateTime(dt.year, dt.month, dt.day);
+
+  // R-STATS-CACHE：静态缓存（StatelessWidget 不可持有实例可变字段）。
+  static int? _aggCacheKey;
+  static Map<DateTime, _DayStat>? _aggCache;
 
   Map<DateTime, _DayStat> _aggregate(
       List<ChatSession> sessions, List<CheckpointInfo> checkpoints) {
+    // R-STATS-CACHE：按会话内容指纹粗粒度失效——长 token 统计累积后
+    // 每次 rebuild 全量遍历会话×消息 O(N)，UI 卡顿。粗键漏检代价仅为
+    // 一次重算（无正确性风险）。
+    final sessionsStamp = Object.hash(
+      chatsFingerprint(sessions),
+      checkpoints.length,
+      checkpoints.isEmpty
+          ? 0
+          : checkpoints.first.createdAt.millisecondsSinceEpoch,
+    );
+    if (_aggCacheKey == sessionsStamp && _aggCache != null) {
+      return _aggCache!;
+    }
     final map = <DateTime, _DayStat>{};
     _DayStat statOf(DateTime dt) {
       final key = _dayKey(dt);
@@ -69,7 +98,23 @@ class StatsPanel extends StatelessWidget {
       st.fileChanges +=
           cp.files.where((e) => !e.endsWith('.DS_Store')).length;
     }
+    _aggCacheKey = sessionsStamp;
+    _aggCache = map;
     return map;
+  }
+
+  /// R-STATS-CACHE：会话内容指纹（消息数+最后消息时间），轻量粗键。
+  static int chatsFingerprint(List<ChatSession> sessions) {
+    var h = sessions.length;
+    for (final s in sessions) {
+      h = h * 31 + s.messages.length;
+      final last = s.messages.isEmpty
+          ? 0
+          : (s.messages.last.createdAt ?? DateTime.now())
+              .millisecondsSinceEpoch;
+      h = h * 31 + last.hashCode;
+    }
+    return h;
   }
 
   int _levelFor(int score, int maxScore) {
@@ -179,6 +224,8 @@ class StatsPanel extends StatelessWidget {
       animation:
           Listenable.merge(<Listenable>[chats, checkpoints]),
       builder: (context, _) {
+        // 热力色阶跟随当前主题亮度：暗色主题用深灰空格 + 提亮绿谱。
+        final levels = _levelsFor(Theme.of(context).brightness);
         final stats = _aggregate(chats.sessions, checkpoints.checkpoints);
         var maxScore = 0;
         for (final st in stats.values) {
@@ -274,11 +321,13 @@ class StatsPanel extends StatelessWidget {
                                   margin: const EdgeInsets.only(bottom: 3),
                                   alignment: Alignment.centerRight,
                                   child: Text(
-                                    r == 1
+                                    // R6-2：r=0..6 对应周一..周日（lastMonday
+                                    // 为周一锚点），标签须画在 r=0/2/4 行。
+                                    r == 0
                                         ? '一'
-                                        : r == 3
+                                        : r == 2
                                             ? '三'
-                                            : r == 5
+                                            : r == 4
                                                 ? '五'
                                                 : '',
                                     style: TextStyle(
@@ -335,7 +384,7 @@ class StatsPanel extends StatelessWidget {
                                                         bottom: 3),
                                                 decoration:
                                                     BoxDecoration(
-                                                  color: _levels[level],
+                                                  color: levels[level],
                                                   borderRadius:
                                                       BorderRadius.circular(
                                                           3),
@@ -365,13 +414,13 @@ class StatsPanel extends StatelessWidget {
                       style: TextStyle(
                           color: colors.textMuted, fontSize: 11)),
                   const SizedBox(width: 6),
-                  for (var i = 0; i < _levels.length; i++)
+                  for (var i = 0; i < levels.length; i++)
                     Container(
                       width: 13,
                       height: 13,
                       margin: const EdgeInsets.only(right: 3),
                       decoration: BoxDecoration(
-                        color: _levels[i],
+                        color: levels[i],
                         borderRadius: BorderRadius.circular(3),
                         border: Border.all(color: colors.border),
                       ),

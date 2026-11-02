@@ -17,6 +17,7 @@ class ResponsesDelta {
   }
 
   /// 跨轮续聊：服务端已有上一 response 的历史，只补 system（指令/摘要可能变了）和本轮新 user。
+  /// A16：无 user 消息时返回空列表（调用方有空增量回退全量路径），不再回全量历史防重复发送。
   static List<Map<String, dynamic>> newTurnDelta(
     List<Map<String, dynamic>> messages,
   ) {
@@ -27,7 +28,10 @@ class ResponsesDelta {
         break;
       }
     }
-    if (lastUser < 0) return messages;
+    // A16：无 user 消息时返回空列表——此前原样返回全量历史，配合
+    // previous_response_id 会把服务端已有的旧消息重复发送。调用方已有
+    // “空增量回退全量”路径，空列表语义安全。
+    if (lastUser < 0) return const [];
     final out = <Map<String, dynamic>>[];
     for (var i = 0; i < lastUser; i++) {
       if (messages[i]['role'] == 'system') out.add(messages[i]);

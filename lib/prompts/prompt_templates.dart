@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
@@ -62,6 +63,20 @@ class PromptTemplateStore {
     void warn(String msg) => warnings?.add(msg);
     if (rootPath == null) return const [];
     final dir = Directory(p.join(rootPath, '.my_ide', 'prompts'));
+    // D19：prompts 目录本体是符号链接即拒——仓库可控的
+    // `.my_ide/prompts -> 区外目录` 会把链接目标文件当作项目模板整批
+    // 注入 prompt（与 rules/hooks/skills 的拒链接口径一致，fail-closed）。
+    try {
+      if (FileSystemEntity.typeSync(dir.path, followLinks: false) ==
+          FileSystemEntityType.link) {
+        warn('模板目录为符号链接，已拒绝加载');
+        return const [];
+      }
+    } catch (_) {
+      // 探测异常按可疑处理（fail-closed），与 rules_hooks 同口径。
+      warn('模板目录类型探测失败，已拒绝加载');
+      return const [];
+    }
     try {
       if (!await dir.exists()) return const [];
       final out = <PromptTemplate>[];
@@ -76,6 +91,13 @@ class PromptTemplateStore {
           }
           final body = (await e.readAsString()).trim();
           if (body.isEmpty) continue;
+          // B11：UTF-8 字节数复检——length() 传回的是盘上字节，理论上与
+          // 读入一致，但符号链接被 followLinks:false 挡外的竞态窗口内
+          // 换文件/追加写时，读入内容可超门禁。以实际 UTF-8 字节数为准。
+          if (utf8.encode(body).length > maxTemplateBytes) {
+            warn('模板 $name 超过 256KB（UTF-8 复检），已跳过');
+            continue;
+          }
           out.add(PromptTemplate(name: name, body: body, source: '项目'));
         } catch (_) {
           warn('模板 $name 读取失败，已跳过');

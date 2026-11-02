@@ -214,4 +214,152 @@ void main() {
       }
     });
   });
+
+  group('诊断存储', () {
+    IdeDiagnostic d(int v, String msg) => IdeDiagnostic(
+          filePath: '/a.dart',
+          startLine: v,
+          startChar: 0,
+          endLine: v,
+          endChar: 1,
+          severity: DiagnosticSeverity.warning,
+          message: msg,
+          source: 'dart',
+        );
+
+    test('setForFileSource 先排序再截断（保留 severity 头部，unmodifiable 输入不抛）', () {
+      // E1：_compare 主键 severity 升序（error 在前），截断取排序头部。
+      // 2010 条同 severity 按 line 升序，头部 2000 = m0..m1999。
+      final store = DiagnosticsStore();
+      final diags = List<IdeDiagnostic>.generate(
+        2010,
+        (i) => d(i, 'm$i'),
+      );
+      store.setForFileSource(
+        path: '/a.dart',
+        source: 'dart',
+        diagnostics: List.unmodifiable(diags),
+        contentVersion: 2009,
+      );
+      final out = store.diagnosticsOf('/a.dart');
+      expect(out.length, 2000);
+      expect(out.any((e) => e.message == 'm0'), isTrue);
+      expect(out.any((e) => e.message == 'm2009'), isFalse);
+      store.dispose();
+    });
+
+    test('E1 截断保头部：多数 hint 少量 error 时 error 不被挤掉', () {
+      // 复现：截断取排序尾部——error 在前被截掉只留 hint，高危问题丢失。
+      // 修复：取排序头部保 error/warning。
+      final store = DiagnosticsStore();
+      IdeDiagnostic sev(DiagnosticSeverity s, int line) => IdeDiagnostic(
+            filePath: '/a.dart',
+            startLine: line,
+            startChar: 0,
+            endLine: line,
+            endChar: 1,
+            severity: s,
+            message: '$s-$line',
+            source: 's',
+          );
+      final diags = <IdeDiagnostic>[
+        // 1999 条 hint 排在输入前部，2 条 error 压尾：不排序按序截断时
+        // error 会被丢；排序后 error 升到头部，截断头部必然保留。
+        for (var i = 0; i < 1999; i++) sev(DiagnosticSeverity.hint, i),
+        sev(DiagnosticSeverity.error, 100000),
+        sev(DiagnosticSeverity.error, 100001),
+      ];
+      expect(diags.length, 2001);
+      store.setForFileSource(
+        path: '/a.dart',
+        source: 's',
+        diagnostics: diags,
+      );
+      final out = store.diagnosticsOf('/a.dart');
+      expect(out.length, 2000);
+      expect(
+        out.where((e) => e.severity == DiagnosticSeverity.error).length,
+        2,
+        reason: '截断后 error 必须仍在（此前取尾部全被 hint 挤掉）',
+      );
+      store.dispose();
+    });
+  });
+
+  group('E14 插值跨行行号', () {
+    test('内层引号未闭合停在换行：后续多余闭合诊断行号不偏移', () {
+      // 复现：内层引号 break 停在 '\n'（j 指向它），nlCount 统计区间不含它
+      // 但 i = j + 1 消费了它 → 行号偏移 1。修复：统计 k <= j 与消费对齐。
+      const text = '`x\${\'a\nb)}y`}';
+      final diags = LocalIntegrityChecker.analyze(
+        filePath: 'a.js',
+        text: text,
+        languageId: 'javascript',
+      );
+      final extra = diags.where((d) => d.code == 'bracket.extra').toList();
+      expect(extra, isNotEmpty);
+      expect(
+        extra.first.startLine,
+        1,
+        reason: '插值内层换行后第 2 行（0-based 1）的多余闭合符，行号不偏移',
+      );
+    });
+  });
+
+  group('A4-11 tsconfig 缓存 null 命中存在性复检', () {
+    test('TTL 内新建 tsconfig 立即被使用；非 null 命中删除后兜底',() async {
+      // 复现 A4-11：缓存命中且值为 null 时直接返回不复检——项目中途新建
+      // tsconfig 后 60s TTL 内仍按"无配置"跑，新配置迟迟不生效。
+      final dir = await Directory.systemTemp.createTemp('tsc-cache-');
+      try {
+        final sub = Directory(p.join(dir.path, 'a', 'b'));
+        await sub.create(recursive: true);
+        // 第一次：无配置 → null（入缓存，值 null）。
+        expect(LocalTscChecker.findProjectTsConfigForTest(sub.path), isNull);
+        // 新建 tsconfig：TTL（60s）内再次查询必须复检发现新配置。
+        final cfg = p.join(dir.path, 'a', 'tsconfig.json');
+        await File(cfg).writeAsString('{}');
+        expect(
+          LocalTscChecker.findProjectTsConfigForTest(sub.path),
+          cfg,
+          reason: 'null 命中必须做存在性复检，不能 60s 内忽视新配置',
+        );
+        // 非 null 命中：TTL 内文件被删 → 存在性复检按"已删除"处理。
+        await File(cfg).delete();
+        expect(
+          LocalTscChecker.findProjectTsConfigForTest(sub.path),
+          anyOf(isNull, isNot(cfg)),
+          reason: '命中路径已删除时不得返回陈旧路径',
+        );
+        // 缓存按 startDir 隔离：不同目录互不污染。
+        final other = Directory(p.join(dir.path, 'other'));
+        await other.create(recursive: true);
+        await File(p.join(dir.path, 'other', 'jsconfig.json'))
+            .writeAsString('{}');
+        expect(
+          LocalTscChecker.findProjectTsConfigForTest(other.path),
+          p.join(dir.path, 'other', 'jsconfig.json'),
+        );
+      } finally {
+        try {
+          await dir.delete(recursive: true);
+        } catch (_) {}
+      }
+    });
+  });
+
+  group('E2 tsc 超时杀进程与排队上限（源码口径）', () {
+    test('超时走 Process.start+sigkill，忙等有等待者上限', () async {
+      // 本检查器无 fake 进程注入点（debugResolverOverride 只换解析路径），
+      // 按 analyze 级源码口径验证：超时杀进程 + 等待者上限防无界堆积。
+      final src =
+          await File('lib/diagnostics/local_tsc_checker.dart').readAsString();
+      expect(src.contains('Process.start'), isTrue,
+          reason: '超时需可杀进程，Process.run(...).timeout 不杀');
+      expect(src.contains('ProcessSignal.sigkill'), isTrue,
+          reason: '超时必须 sigkill 挂起的 tsc 并 await exitCode 收尸');
+      expect(src.contains('_waiters'), isTrue,
+          reason: '忙等队列必须有等待者上限');
+    });
+  });
 }

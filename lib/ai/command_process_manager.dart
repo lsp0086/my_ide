@@ -24,6 +24,20 @@ class CommandProcessManager {
   final Map<int, String> _sessionOf = {};
   bool _disposed = false;
 
+  /// B9：Windows exe 劫持防护（cline §4.1.19 口径）——工作区内植入
+  /// rg.exe/git.exe 时，默认当前目录优先解析即被劫持。合并父环境后注入
+  /// NoDefaultCurrentDirectoryInExePath=1 关闭该解析路径。
+  /// 非 Windows 传 null 才继承环境（Dart 传空表反而丢失），故调用处
+  /// 非 Windows 保持传 null。
+  static Map<String, String> childEnvironment(
+    Map<String, String> parent, {
+    bool? windowsOverrideForTest,
+  }) {
+    final isWindows = windowsOverrideForTest ?? Platform.isWindows;
+    if (!isWindows) return parent;
+    return {...parent, 'NoDefaultCurrentDirectoryInExePath': '1'};
+  }
+
   int get activeCount => _active.length;
 
   Future<Process> start(
@@ -65,8 +79,24 @@ class CommandProcessManager {
       arguments,
       workingDirectory: workingDirectory,
       runInShell: false,
+      // B9：Windows exe 劫持防护（cline §4.1.19 口径）——工作区内植入
+      // rg.exe/git.exe 时，默认当前目录优先解析即被劫持。传合并表
+      // （childEnvironment 在父环境上注入 NoDefaultCurrentDirectoryInExePath=1）。
+      // 非 Windows 传 null 才继承环境（Dart 传空表反而丢失）。
+      environment: Platform.isWindows
+          ? childEnvironment(Platform.environment)
+          : null,
     );
     final proc = trackedProcess;
+    // R-START-DISPOSE：dispose 与本方法 await start 存在竞态窗口——
+    // 窗口内 dispose/terminateAll 已完成，晚注册的 pid 否则永挂
+    // periodic Timer 失管。复检已关闭即杀新进程并抛错。
+    if (_disposed) {
+      try {
+        proc.kill(ProcessSignal.sigkill);
+      } catch (_) {}
+      throw StateError('命令进程管理器已关闭');
+    }
     _active[proc.pid] = proc;
     _sessionOf[proc.pid] = sessionId;
     _descendants[proc.pid] = <int>{};
@@ -117,10 +147,24 @@ class CommandProcessManager {
     Process process, {
     Duration gracePeriod = const Duration(seconds: 2),
   }) {
-    return _terminating.putIfAbsent(
-      process.pid,
-      () => _terminateOnce(process, gracePeriod),
+    final existing = _terminating[process.pid];
+    // S2-8：命中旧 future 时校验活跃注册表——pid 复用/句柄更替后旧 future
+    // 绑定的是另一句柄，沿用会等错对象。失配则重入 _terminateOnce 并替换表项。
+    if (existing != null && _active[process.pid] == process) return existing;
+    final next = _terminateOnce(process, gracePeriod);
+    _terminating[process.pid] = next;
+    // 老 future 的 finally 不得误删新表项：仅 identical 时摘队。
+    // （_terminateOnce 内部不再碰 _terminating 表，摘队统一在此。）
+    unawaited(
+      next
+          .whenComplete(() {
+            if (identical(_terminating[process.pid], next)) {
+              _terminating.remove(process.pid);
+            }
+          })
+          .catchError((_) {}),
     );
+    return next;
   }
 
   Future<void> _terminateOnce(Process process, Duration gracePeriod) async {
@@ -176,11 +220,15 @@ class CommandProcessManager {
         await process.exitCode.timeout(const Duration(seconds: 2));
       } catch (_) {}
     } finally {
-      _trackers.remove(process.pid)?.cancel();
-      _descendants.remove(process.pid);
-      _sessionOf.remove(process.pid);
-      _active.remove(process.pid);
-      _terminating.remove(process.pid);
+      // S2-8：pid 复用守卫——若 _active[pid] 已是新句柄（重入替换后），
+      // 不得清掉新进程的注册表/追踪器/后代集/会话归属；_terminating 摘队
+      // 统一由 terminate() 的 whenComplete identical 检查负责。
+      if (identical(_active[process.pid], process)) {
+        _trackers.remove(process.pid)?.cancel();
+        _descendants.remove(process.pid);
+        _sessionOf.remove(process.pid);
+        _active.remove(process.pid);
+      }
     }
   }
 
@@ -246,24 +294,7 @@ class CommandProcessManager {
     );
   }
 
-  Future<List<ProcessTerminateReport>> terminateAllWithReport() async {
-    final processes = List<Process>.from(_active.values);
-    final reports = <ProcessTerminateReport>[];
-    for (final process in processes) {
-      try {
-        reports.add(await terminateWithReport(process));
-      } catch (e) {
-        reports.add(
-          ProcessTerminateReport(
-            pid: process.pid,
-            exited: false,
-            remainingPids: [process.pid],
-          ),
-        );
-      }
-    }
-    return reports;
-  }
+  // A22：terminateAllWithReport 零调用已删除（关窗清理走 terminateAll）。
 
   /// R1-02：按会话终止前台进程——只杀归属 sessionId 的进程，
   /// 他会话/后台不受影响。空 sessionId 走 terminateAll 兼容旧路径。
@@ -340,24 +371,35 @@ class CommandProcessManager {
   }
 
   void _signalAll(Iterable<int> pids, ProcessSignal signal) {
+    // S2-12：批量一次 `ps` 取存活集内存判定——此前逐 pid
+    // Process.runSync('kill',['-0']) spawn，N 个后代即 N 次建进程。
+    // 现单次 `ps -e -o pid=` 取全量存活集，内存 contains 判定。
+    final alive = _alivePidSet();
     for (final pid in pids) {
-      // R3-F1：发信号前验活——kill pid取不到进程组（ESRCH）即已退出，
-      // 跳过不发，避免PID复用后杀到无关新进程。
-      if (!_isAlive(pid)) continue;
+      // R3-F1：发信号前验活——存活集里找不到即已退出，
+      // 跳过不发，避免PID复用后杀到无关新进程。ps 不可用（null）
+      // 时回退全发（保守，不漏杀）。
+      if (alive != null && !alive.contains(pid)) continue;
       try {
         Process.killPid(pid, signal);
       } catch (_) {}
     }
   }
 
-  bool _isAlive(int queryPid) {
-    if (Platform.isWindows) return true;
+  /// 单次 `ps` 取全量存活 pid 集；失败返回 null（调用方回退全发）。
+  Set<int>? _alivePidSet() {
+    if (Platform.isWindows) return null;
     try {
-      // signal 0只探活不发信号：ESRCH抛错即已退出。
-      final result = Process.runSync('kill', ['-0', '$queryPid']);
-      return result.exitCode == 0;
+      final result = Process.runSync('ps', ['-e', '-o', 'pid=']);
+      if (result.exitCode != 0) return null;
+      final alive = <int>{};
+      for (final token in '${result.stdout}'.split(RegExp(r'\s+'))) {
+        final pid = int.tryParse(token);
+        if (pid != null) alive.add(pid);
+      }
+      return alive;
     } catch (_) {
-      return true;
+      return null;
     }
   }
 

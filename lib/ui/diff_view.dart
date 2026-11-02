@@ -10,6 +10,7 @@ class _DiffLine {
     required this.text,
     this.oldNo,
     this.newNo,
+    this.unparsed = false,
   });
 
   /// 'meta' | 'hunk' | 'add' | 'del' | 'ctx'
@@ -17,6 +18,9 @@ class _DiffLine {
   final String text;
   final int? oldNo;
   final int? newNo;
+
+  /// R-HUNK-UNPARSED：hunk 头解析失败（行号不可信）。
+  final bool unparsed;
 }
 
 class _ChangeHunk {
@@ -56,6 +60,12 @@ List<_DiffLine> _parseUnifiedDiff(String diff) {
       if (m != null) {
         oldNo = int.parse(m.group(1)!);
         newNo = int.parse(m.group(2)!);
+      } else {
+        // R-HUNK-UNPARSED：hunk 头解析失败标记不可信——截断/手拼 diff 中
+        // 行号沿用旧值继续累加会整体错位；标记后调用方可显示原始头
+        // 而非误导性行号。
+        out.add(_DiffLine(kind: 'hunk', text: raw, unparsed: true));
+        continue;
       }
       out.add(_DiffLine(kind: 'hunk', text: raw));
       continue;
@@ -326,7 +336,7 @@ class _RevertBubble extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    const color = Color(0xFFE03131);
+    final color = IdeColors.of(context).danger;
     return Tooltip(
       message: '回退此块',
       child: GestureDetector(
@@ -447,12 +457,14 @@ class DiffDialog extends StatelessWidget {
                   ),
                   _StatChip(
                     label: '+$adds',
-                    color: const Color(0xFF2F9E44),
+                    // E14：语义状态色随亮暗主题切换（上方 diff 底色亮暗对为
+                    // 豁免点，保留原样）。
+                    color: colors.statusOk,
                   ),
                   const SizedBox(width: 6),
                   _StatChip(
                     label: '-$dels',
-                    color: const Color(0xFFE5484D),
+                    color: colors.statusError,
                   ),
                   IconButton(
                     visualDensity: VisualDensity.compact,

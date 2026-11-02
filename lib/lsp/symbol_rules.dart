@@ -531,7 +531,3 @@ LanguageSymbolRules? rulesForExtension(String ext) {
   }
   return null;
 }
-
-Set<String> get kIndexedExtensions => {
-      for (final lang in kLanguageSymbolRules) ...lang.extensions,
-    };

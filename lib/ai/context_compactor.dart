@@ -1,7 +1,13 @@
+import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
+
+import 'package:path/path.dart' as p;
 
 import 'agent_client.dart';
 import 'chat_store.dart';
+// A6-R2：todos 块围栏化——模型可写文件内容按不可信外部数据包裹。
+import 'external_content.dart' show wrapUntrustedToolOutput;
 import 'provider_config.dart';
 
 /// C1（对齐 cline context management）：compact 触发阈值显式化。上下文用量
@@ -14,6 +20,86 @@ const double defaultCompactTriggerRatio = 0.8;
 /// 步中硬裁剪阈值（_trimMessagesToBudget 兜底线）：比压缩触发线高一个档，
 /// 保证「先压缩、压缩不动才硬裁」的次序，压缩/摘要请求自身不会被硬裁误伤。
 const double midLoopTrimRatio = 0.85;
+
+/// G2-1（对齐 Cline v3.31 manual compact / OpenHands v1.13 usage meter）：
+/// 默认上下文窗口（token）——模型未声明 contextLength 时的用量估算兜底值，
+/// 与 [ContextCompactor.contextLimitOf] 的回退值同口径。
+const int defaultContextWindowTokens = 128000;
+
+/// G2-1：上下文用量估算纯函数，返回 0~1 比例（超 1 钳 1）。
+/// 复用 shouldCompact 的 TokenEstimator 消息口径（role/content/tool_calls
+/// 全计入）；[contextLength] 为空/非正时按 [defaultContextWindowTokens] 估。
+/// 仅供 UI 用量条等展示场景，不参与压缩触发判定（触发仍走 shouldCompact，
+/// 含 schema 开销与校准系数，避免两套口径漂移）。
+double estimateContextUsage(
+  List<Map<String, dynamic>> messages, {
+  int? contextLength,
+}) {
+  final limit = contextLength != null && contextLength > 0
+      ? contextLength
+      : defaultContextWindowTokens;
+  // S2-10：limit 恒 ≥128000（两分支均为正），`if (limit <= 0) return 0`
+  // 为不可达死代码已删。
+  final used = TokenEstimator.estimateMessages(messages);
+  return (used / limit).clamp(0.0, 1.0).toDouble();
+}
+
+/// E6 Focus Chain：待办块周期重注入判定（每 6 条消息一次，Cline Focus
+/// Chain 口径 https://docs.cline.bot/features/focus-chain ）。
+/// 纯函数暴露（测试可见）——runner 每轮据此决定是否拼入待办状态块：
+/// [messageCount] 为会话当前消息数（含本轮 user 消息）。
+/// 首条 user（count<=1）不注入（首轮尚无 todo 可注），此后每条 user 计
+/// 一次，每 6 条一轮回注（防长任务清单漂移，不依赖压缩触发）。
+bool todosReinjectDueForTest(int messageCount) =>
+    messageCount > 1 && (messageCount - 1) % 6 == 0;
+
+/// G2-2（对齐 Cline Focus Chain）：读取工作区 `.my_ide/todos.json`
+/// （写入格式见 agent_tools.dart `_saveTodosToDisk`：`[{id,content,status}]`，
+/// status ∈ pending/in_progress/completed），拼装为追加在压缩摘要末尾的
+/// 待办状态块。压缩后模型据此仍知道任务清单进度。
+/// 文件不存在/为空/无有效条目返回 null（调用方不附加）；读盘/解析失败
+/// 静默返回 null，不抛错、不影响摘要主流程。
+/// A6-R2：todos.json 是模型可写文件（todo_write 落盘），内容属不可信
+/// 外部数据——非空块统一包 wrapUntrustedToolOutput 围栏（上轮恶意页
+/// 诱导 todo_write 写入注入指令，下一轮以 system 特权直进的跨轮注入链），
+/// 同时调用方据非空块 markUntrustedThisTurn 提级写/命令审批。
+Future<String?> buildTodosStatusBlock(String? rootPath) async {
+  if (rootPath == null || rootPath.isEmpty) return null;
+  try {
+    final f = File(p.join(rootPath, '.my_ide', 'todos.json'));
+    if (!await f.exists()) return null;
+    // R-TODOSIZE：>1MB 直接跳过——todos.json 被外部写成超大文件时
+    // 每轮压缩全量 jsonDecode 进内存（正常 ≤50 项不可能达 1MB）。
+    if (await f.length() > 1024 * 1024) return null;
+    final decoded = jsonDecode(await f.readAsString());
+    if (decoded is! List) return null;
+    final lines = <String>[];
+    for (final e in decoded) {
+      if (e is! Map) continue;
+      final content = '${e['content'] ?? ''}'.trim();
+      if (content.isEmpty) continue;
+      // 状态标记与 agent_tools._todosText 同口径：[x] 完成 / [~] 进行中 / [ ] 待办。
+      final status = '${e['status'] ?? ''}'.trim().toLowerCase();
+      final mark =
+          status == 'completed' || status == 'done' || status == 'complete'
+          ? '[x]'
+          : status == 'in_progress' ||
+                status == 'in-progress' ||
+                status == 'doing'
+          ? '[~]'
+          : '[ ]';
+      lines.add('$mark $content');
+    }
+    if (lines.isEmpty) return null;
+    // A6-R2：围栏化返回（source=todos），非空块由调用方计入本轮不可信。
+    return wrapUntrustedToolOutput(
+      source: 'todos',
+      body: '【当前待办】\n${lines.join('\n')}',
+    );
+  } catch (_) {
+    return null;
+  }
+}
 
 /// Token 估算：英文 ~4 字符/token，中文 ~1.2 字符/token（R6-05 保守：1.5 偏乐观
 /// 致压缩触发晚），emoji 按 2 token 保守估。
@@ -47,6 +133,44 @@ class TokenEstimator {
       }
     }
     return (ascii / 4 + cjk / 1.2).ceil();
+  }
+
+  /// B12：上下文用量分解（Cursor Context Usage Breakdown / Claude Code
+  /// /usage 口径）——按构成分桶估算，供"哪部分在吃上下文"可视化与
+  /// 自动压缩决策说服力：
+  /// system=系统/规则提示（role=system）；tools=工具 schema；
+  /// history=历史消息（system 与末条除外）；latest=末条消息。
+  static ({int system, int tools, int history, int latest}) contextBreakdown(
+    List<Map<String, dynamic>> messages,
+    List<Map<String, dynamic>>? tools,
+  ) {
+    var system = 0;
+    var history = 0;
+    var latest = 0;
+    for (var i = 0; i < messages.length; i++) {
+      final m = messages[i];
+      if ('${m['role'] ?? ''}' == 'system') {
+        system += estimateMessages([m]);
+        continue;
+      }
+      if (i == messages.length - 1) {
+        latest += estimateMessages([m]);
+      } else {
+        history += estimateMessages([m]);
+      }
+    }
+    var toolTokens = 0;
+    if (tools != null && tools.isNotEmpty) {
+      try {
+        toolTokens = estimate(jsonEncode(tools)) + 16;
+      } catch (_) {}
+    }
+    return (
+      system: system,
+      tools: toolTokens,
+      history: history,
+      latest: latest,
+    );
   }
 
   /// 全量计数：content 字符串/多模态 List（含 image_url base64）、tool_calls、
@@ -138,35 +262,35 @@ class ContextCompactor {
   /// 摘要模型 key（prefs agentSummaryModel，可空，为空则用主模型）。
   String? summaryModelKey;
 
+  /// R-SUMMARY-MODEL：解析 summaryModelKey 用的候选 provider 集合。
+  /// 不注入（null）时保持主模型行为——摘要模型设置需要调用方提供
+  /// 已配置的 provider 列表才能按 key 找模型。
+  List<AiProviderConfig>? summaryProviders;
+
+  /// R-SUMMARY-MODEL：按 summaryModelKey 解析 (provider, model)。
+  /// key 为空/未命中/无 providers 时返回 null（调用方回退主模型）。
+  /// 解析口径与 spawn_subagent 的 model 参数一致：任一 provider 的
+  /// models 中 id/name 匹配即可。
+  ({AiProviderConfig provider, AiModelOption model})? resolveSummaryModel() {
+    final key = summaryModelKey?.trim();
+    if (key == null || key.isEmpty) return null;
+    final providers = summaryProviders ?? const [];
+    for (final p in providers) {
+      if (p.id == key || p.name == key) {
+        if (p.models.isEmpty) return null;
+        return (provider: p, model: p.models.first);
+      }
+      for (final m in p.models) {
+        if (m.id == key || m.displayName == key) {
+          return (provider: p, model: m);
+        }
+      }
+    }
+    return null;
+  }
+
   int contextLimitOf(AiModelOption model) {
     return model.contextLength ?? 128000;
-  }
-
-  /// 分级摘要：文件列表只保留路径 + 数量，不贴内容。
-  static String compactFiles(List<String> files, {int maxShow = 20}) {
-    if (files.isEmpty) return '';
-    final shown = files.take(maxShow).join(', ');
-    final more = files.length > maxShow ? ' 等共 ${files.length} 个' : '';
-    return '【文件摘要】$shown$more';
-  }
-
-  /// 分级摘要：工具结果只保留首行/截断，避免大输出压爆上下文。
-  static String compactToolResults(List<String> outputs, {int maxChars = 2000}) {
-    if (outputs.isEmpty) return '';
-    final buf = StringBuffer();
-    for (var i = 0; i < outputs.length; i++) {
-      final text = outputs[i];
-      final first = text.split('\n').firstWhere(
-            (l) => l.trim().isNotEmpty,
-            orElse: () => '',
-          );
-      final snippet =
-          first.length > 200 ? '${first.substring(0, 200)}…' : first;
-      buf.writeln('- 结果${i + 1}：$snippet');
-    }
-    final s = buf.toString().trimRight();
-    if (s.length <= maxChars) return s;
-    return '${s.substring(0, maxChars)}\n…（工具结果过长已截断）';
   }
 
   /// 切出「尚未摘要」与「最近窗口」。失败路径不改旧边界。
@@ -225,6 +349,76 @@ class ContextCompactor {
     return cleared;
   }
 
+  /// R1-8（采纳 opencode mid-loop 工具结果折叠
+  /// https://github.com/sst/opencode）：估算/压缩前把最近 [keepRecentSteps]
+  /// 条工具结果之前的 read/grep/search 大结果替换为
+  /// `“[工具结果已折叠: <路径>, 前缀指纹:xx]”` 占位——模型可凭路径与指纹
+  /// 复读经 read_file 回捞原文。只折叠 role=='tool' 且 name 属只读检索集、
+  /// content ≥ [minChars] 的消息；路径取自配对 assistant tool_calls 的
+  /// arguments.path（无配对回退工具名）。幂等：已是占位符不再处理。
+  /// 返回折叠条数。
+  static int foldOldToolResults(
+    List<Map<String, dynamic>> messages, {
+    int keepRecentSteps = 10,
+    int minChars = 4000,
+  }) {
+    const foldable = {
+      'read_file',
+      'read_media',
+      'search_text',
+      'list_files',
+      'repo_map',
+      'semantic_search',
+    };
+    const marker = '[工具结果已折叠:';
+    final toolIndexes = <int>[
+      for (var i = 0; i < messages.length; i++)
+        if ('${messages[i]['role'] ?? ''}' == 'tool') i,
+    ];
+    if (toolIndexes.length <= keepRecentSteps) return 0;
+    // 配对 tool_call_id → arguments.path（取路径信息用于占位，便于回捞）。
+    final pathByCallId = <String, String>{};
+    for (final m in messages) {
+      if ('${m['role'] ?? ''}' != 'assistant') continue;
+      final tcs = m['tool_calls'];
+      if (tcs is! List) continue;
+      for (final tc in tcs) {
+        if (tc is! Map) continue;
+        final fn = tc['function'];
+        final argsRaw = fn is Map ? fn['arguments'] : tc['input'];
+        final raw = argsRaw is String ? argsRaw : (argsRaw == null ? '' : '$argsRaw');
+        final path = RegExp(r'"path"\s*:\s*"([^"]*)"').firstMatch(raw);
+        if (path != null) pathByCallId['${tc['id'] ?? tc['name'] ?? ''}'] = path.group(1) ?? '';
+      }
+    }
+    var folded = 0;
+    for (final i in toolIndexes.sublist(0, toolIndexes.length - keepRecentSteps)) {
+      final m = messages[i];
+      final name = '${m['name'] ?? ''}';
+      if (!foldable.contains(name)) continue;
+      final content = m['content'];
+      if (content is! String || content.length < minChars) continue;
+      if (content.startsWith(marker)) continue;
+      final path = pathByCallId['${m['tool_call_id'] ?? ''}'] ?? name;
+      // 前缀指纹：取首 128 字符的简易散列，模型复读即可验证回捞内容一致。
+      final head = content.length > 128
+          ? content.substring(0, 128)
+          : content;
+      m['content'] = '$marker $path, 前缀指纹:${_prefixFingerprint(head)}]';
+      folded++;
+    }
+    return folded;
+  }
+
+  /// R1-8：前缀指纹（FNV-1a 简化 32 位），折叠占位可复读校验。
+  static String _prefixFingerprint(String head) {
+    var hash = 0x811c9dc5;
+    for (final unit in head.codeUnits) {
+      hash = (hash ^ unit) * 0x01000193 & 0x7fffffff;
+    }
+    return hash.toRadixString(16);
+  }
+
   /// 单条 ChatMessage 的 token 估算：文本+思考+文件开销+图片引用+子Agent，
   /// 与 Runner._budgetHistory 同口径，避免触发偏晚或视觉轮次低估 400。
   /// 图片已资产化：`asset:` 只计路径小头；残留 dataUrl 仍按全量计。
@@ -254,11 +448,15 @@ class ContextCompactor {
     required AiModelOption model,
     double calibration = 1.0,
     List<Map<String, dynamic>>? tools,
+    // R-PROBEIMG：调用方补充估算（图片解析后体积等探针难以自算的部分），
+    // 直接加进 used 口径，避免历史图片会话压缩系统性晚触发。
+    int extraTokens = 0,
   }) {
     // R3-A5：探针加schema开销——此前只算消息，满MCP时实际早超限仍不压缩。
     final used =
         (TokenEstimator.estimateMessages(messages) +
-                TokenEstimator.estimateTools(tools)) *
+                TokenEstimator.estimateTools(tools) +
+                (extraTokens > 0 ? extraTokens : 0)) *
             calibration;
     return used >= contextLimitOf(model) * triggerRatio;
   }
@@ -273,19 +471,40 @@ class ContextCompactor {
     required AiModelOption model,
     String? previousSummary,
     String? previousUntilMessageId,
+    // R1-2：摘要请求透传会话 id——成功路径 resetAbort 只摘本会话标记，
+    // 此前空 key 会清掉并行会话的取消标记。
+    String sessionId = '',
   }) async {
+    // R-SUMMARY-MODEL：摘要模型优先于主模型——此前 agentSummaryModel
+    // 只写入 summaryModelKey 后无任何消费点（死赋值），配置项实际
+    // 不生效。解析失败（key 空/未命中）时回落主模型，不改旧行为。
+    var effectiveProvider = provider;
+    var effectiveModel = model;
+    final resolved = resolveSummaryModel();
+    if (resolved != null) {
+      effectiveProvider = resolved.provider;
+      effectiveModel = resolved.model;
+    }
     final tokensBefore =
         history.fold<int>(0, (sum, m) => sum + estimateChatMessage(m));
     if (history.length <= keepRecent + 2 &&
         (previousSummary == null || previousSummary.isEmpty)) {
-      return CompactionResult(
-        summary: previousSummary ?? '',
-        keptMessages: history,
-        tokensBefore: tokensBefore,
-        tokensAfter: tokensBefore,
-        droppedCount: 0,
-        untilMessageId: previousUntilMessageId,
-      );
+      // A1-12：短历史不得无条件空转早退——探针按含 tools/calibration 的
+      // 口径已判超限才进来，若单条巨大消息（长粘贴/大工具结果）使纯消息
+      // 估算仍超 triggerRatio，必须走完整切片流程；仅真的低于阈值才早退
+      // （此前 keepRecent+2 魔数与 triggerRatio 无关，超限短会话压缩空转、
+      // 不发请求也不改历史，UI "压缩中" 闪切无效果）。
+      // tokensBefore 即上方全量估算，直接复用不二次折叠。
+      if (tokensBefore < contextLimitOf(model) * triggerRatio) {
+        return CompactionResult(
+          summary: previousSummary ?? '',
+          keptMessages: history,
+          tokensBefore: tokensBefore,
+          tokensAfter: tokensBefore,
+          droppedCount: 0,
+          untilMessageId: previousUntilMessageId,
+        );
+      }
     }
 
     final sliced = sliceForCompaction(
@@ -307,12 +526,25 @@ class ContextCompactor {
         untilMessageId: previousUntilMessageId,
       );
     }
+    // A24：toSummarize 为空但旧摘要非空时直接沿用 previousSummary——
+    // 此前白白调 LLM 重写旧摘要（内容走样 + 多花一次请求）。
+    if (toSummarize.isEmpty) {
+      return CompactionResult(
+        summary: previousSummary ?? '',
+        keptMessages: kept,
+        tokensBefore: tokensBefore,
+        tokensAfter: tokensBefore,
+        droppedCount: 0,
+        untilMessageId: previousUntilMessageId,
+      );
+    }
 
     final summary = await _summarize(
       messages: toSummarize,
-      provider: provider,
-      model: model,
+      provider: effectiveProvider,
+      model: effectiveModel,
       previousSummary: previousSummary,
+      sessionId: sessionId,
     );
     if (summary.isEmpty) {
       return CompactionResult(
@@ -346,6 +578,7 @@ class ContextCompactor {
     required AiProviderConfig provider,
     required AiModelOption model,
     String? previousSummary,
+    String sessionId = '',
   }) async {
     final buf = StringBuffer();
     if (previousSummary != null && previousSummary.trim().isNotEmpty) {
@@ -410,6 +643,8 @@ $buf''';
       // 摘要不挂工具
       tools: null,
       toolChoiceAuto: false,
+      // R1-2：会话 id 透传（abort/resetAbort 按会话口径）。
+      sessionId: sessionId,
     )) {
       if (event.content != null) reply.write(event.content);
       if (event.done) break;

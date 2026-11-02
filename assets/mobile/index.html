@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0d1117">
+<title>my_ide 远控</title>
+<link rel="manifest" href="manifest.json">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin: 0; font: 14px/1.5 -apple-system, "PingFang SC", sans-serif;
+         background: #0d1117; color: #e6edf3; }
+  header { position: sticky; top: 0; z-index: 5; display: flex; gap: 8px;
+           align-items: center; padding: 10px 12px; background: #161b22;
+           border-bottom: 1px solid #30363d; }
+  header h1 { font-size: 15px; margin: 0; flex: 1; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #f85149; }
+  .dot.on { background: #3fb950; }
+  #list { padding: 8px 10px 96px; }
+  .group { margin: 10px 0 4px; font-size: 12px; color: #8b949e; }
+  .session { padding: 10px 12px; border: 1px solid #30363d; border-radius: 10px;
+             margin-bottom: 8px; background: #161b22; }
+  .session.active { border-color: #1f6feb; }
+  .session .t { font-size: 13px; }
+  .session .m { font-size: 11px; color: #8b949e; margin-top: 2px; }
+  .bubble { padding: 8px 10px; border-radius: 10px; margin: 6px 0;
+            max-width: 88%; white-space: pre-wrap; word-break: break-word; }
+  .me { background: #1f6feb; margin-left: auto; }
+  .ai { background: #21262d; }
+  .step { font-size: 11px; color: #8b949e; padding: 2px 0 2px 8px;
+          border-left: 2px solid #30363d; margin: 2px 0; }
+  .step b { color: #79c0ff; font-weight: 600; }
+  .card { border: 1px solid #d29922; border-radius: 10px; padding: 10px 12px;
+          margin: 8px 0; background: #2d2410; }
+  .row { display: flex; gap: 8px; margin-top: 8px; }
+  button { flex: 1; padding: 9px 0; border-radius: 8px; border: 1px solid #30363d;
+           background: #21262d; color: #e6edf3; font-size: 13px; }
+  button.primary { background: #238636; border-color: #238636; }
+  button.danger { background: #da3633; border-color: #da3633; }
+  footer { position: fixed; left: 0; right: 0; bottom: 0; display: flex; gap: 8px;
+           padding: 8px 10px calc(8px + env(safe-area-inset-bottom));
+           background: #161b22EE; border-top: 1px solid #30363d; }
+  input, select { flex: 1; min-width: 0; padding: 9px 10px; border-radius: 8px;
+           border: 1px solid #30363d; background: #0d1117; color: #e6edf3;
+           font-size: 14px; }
+  #login { position: fixed; inset: 0; display: flex; flex-direction: column;
+           gap: 10px; align-items: center; justify-content: center;
+           background: #0d1117; padding: 24px; }
+  #login h2 { font-size: 16px; }
+  #login p { color: #8b949e; font-size: 12px; text-align: center; }
+  #login input { width: 100%; max-width: 320px; text-align: center;
+                 letter-spacing: 4px; font-size: 20px; }
+  #login button { width: 100%; max-width: 320px; }
+  .badge { font-size: 10px; padding: 1px 6px; border-radius: 999px;
+           background: #30363d; color: #8b949e; }
+  .badge.run { background: #1f6feb33; color: #79c0ff; }
+  .badge.fin { background: #23863633; color: #56d364; }
+  .badge.fail { background: #da363333; color: #ff7b72; }
+  .badge.wait { background: #d2992233; color: #e3b341; }
+</style>
+</head>
+<body>
+<header>
+  <span id="conn" class="dot"></span>
+  <h1>my_ide 远控</h1>
+  <span id="ver" class="badge">v1</span>
+  <button style="flex:0 0 auto;padding:4px 10px" id="newChatBtn">新对话</button>
+</header>
+
+<div id="login">
+  <h2>配对连接</h2>
+  <p>输入电脑端显示的 6 位配对码（60 秒内有效，一次性）</p>
+  <input id="pairCode" inputmode="numeric" maxlength="6" placeholder="······">
+  <button class="primary" id="pairBtn">配对并连接</button>
+  <p id="loginErr" style="color:#ff7b72"></p>
+</div>
+
+<main id="list" hidden>
+  <div id="models" class="group"></div>
+  <div id="groups"></div>
+  <div id="chat"></div>
+</main>
+
+<footer hidden>
+  <select id="modelSel"></select>
+  <input id="text" placeholder="发消息给当前会话…">
+  <button style="flex:0 0 auto;padding:9px 12px" id="attachBtn" title="附图片">📎<span id="imgCount"></span></button>
+  <input id="fileInput" type="file" accept="image/*" multiple hidden>
+  <button class="primary" id="sendBtn" style="flex:0 0 64px">发送</button>
+</footer>
+
+<script>
+"use strict";
+/* CSP：禁内联脚本外链；无第三方 CDN 依赖，自包含离线可用。 */
+var state = {
+  token: null,
+  bootstrap: null,
+  sessionId: null,
+  messages: [],
+  steps: [],
+  ws: null,
+  hb: 0,
+  // 待发图片（canvas 降采样后的 dataUrl，最多 4 张；服务端请求体 2MB 上限）。
+  pendingImages: [],
+};
+var $ = function (id) { return document.getElementById(id); };
+
+function setConn(on) { $("conn").className = "dot" + (on ? " on" : ""); }
+function showLogin(show) { $("login").style.display = show ? "flex" : "none"; }
+
+function api(method, path, body) {
+  return fetch(path, {
+    method: method,
+    headers: {
+      "authorization": "Bearer " + state.token,
+      "content-type": "application/json",
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  }).then(function (r) { return r.json().then(function (j) {
+    return { status: r.status, body: j };
+  }); });
+}
+
+function loadBootstrap() {
+  return api("GET", "/api/bootstrap").then(function (r) {
+    state.bootstrap = r.body;
+    $("ver").textContent = "契约 " + (r.body.apiVersion || "v1");
+    renderSessions();
+    renderModels();
+    return r.body;
+  });
+}
+
+function loadSession(id) {
+  state.sessionId = id;
+  // 切会话清空待发图片：附件不跨会话残留。
+  state.pendingImages = [];
+  renderImgCount();
+  return api("GET", "/api/session?id=" + encodeURIComponent(id)).then(function (r) {
+    state.messages = r.body.messages || [];
+    // 手机端只展示"步骤"摘要，reasoning 不透传（契约 v1）。
+    state.steps = [];
+    renderChat();
+  });
+}
+
+function renderModels() {
+  var models = (state.bootstrap && state.bootstrap.models) || [];
+  var sel = $("modelSel");
+  sel.innerHTML = "";
+  models.forEach(function (m) {
+    var o = document.createElement("option");
+    o.value = m.id;
+    o.textContent = m.label || m.id;
+    sel.appendChild(o);
+  });
+}
+
+function renderSessions() {
+  var groups = $("groups");
+  groups.innerHTML = "";
+  ((state.bootstrap && state.bootstrap.projects) || []).forEach(function (p) {
+    var h = document.createElement("div");
+    h.className = "group";
+    h.textContent = p.name || p.root;
+    groups.appendChild(h);
+    (p.sessions || []).forEach(function (s) {
+      var d = document.createElement("div");
+      d.className = "session" + (s.id === state.sessionId ? " active" : "");
+      var badge = s.busy ? '<span class="badge run">运行中</span>' : "";
+      d.innerHTML = '<div class="t">' + esc(s.title || s.id) + " " + badge +
+        '</div><div class="m">' + esc(s.id) + "</div>";
+      d.onclick = function () {
+        state.sessionId = s.id;
+        renderSessions();
+        loadSession(s.id);
+      };
+      groups.appendChild(d);
+    });
+  });
+}
+
+function renderChat() {
+  var chat = $("chat");
+  chat.innerHTML = "";
+  state.messages.forEach(function (m) {
+    if (m.role === "assistant" && m.steps) {
+      m.steps.forEach(function (st) {
+        var d = document.createElement("div");
+        d.className = "step";
+        d.innerHTML = "<b>" + esc(st.tool) + "</b> " + esc(st.args || "") +
+          " · " + esc(st.status || "") + " · " + (st.ms || 0) + "ms";
+        chat.appendChild(d);
+      });
+      return;
+    }
+    var d = document.createElement("div");
+    d.className = "bubble " + (m.role === "user" ? "me" : "ai");
+    d.textContent = m.text || "";
+    chat.appendChild(d);
+  });
+  state.steps.forEach(function (st) {
+    var d = document.createElement("div");
+    d.className = "step";
+    d.innerHTML = "<b>" + esc(st.tool) + "</b> " + esc(st.args || "") +
+      " · " + esc(st.status || "") + " · " + (st.ms || 0) + "ms";
+    chat.appendChild(d);
+  });
+  window.scrollTo(0, document.body.scrollHeight);
+}
+
+function pushApproval(a) {
+  var chat = $("chat");
+  var c = document.createElement("div");
+  c.className = "card";
+  c.innerHTML = "<div>待审批：<b>" + esc(a.tool) + "</b></div>" +
+    '<div class="m">' + esc(a.args || "") + "</div>" +
+    '<div class="m">风险：' + esc(a.risk || "") + "</div>";
+  var row = document.createElement("div");
+  row.className = "row";
+  var ok = document.createElement("button");
+  ok.className = "primary"; ok.textContent = "确认";
+  ok.onclick = function () {
+    api("POST", "/api/approval", { approvalId: a.approvalId, approve: true });
+    c.remove();
+  };
+  var no = document.createElement("button");
+  no.className = "danger"; no.textContent = "拒绝";
+  no.onclick = function () {
+    api("POST", "/api/approval", { approvalId: a.approvalId, approve: false });
+    c.remove();
+  };
+  row.appendChild(ok); row.appendChild(no);
+  c.appendChild(row);
+  chat.appendChild(c);
+}
+
+function connectWs() {
+  var proto = location.protocol === "https:" ? "wss:" : "ws:";
+  var ws = new WebSocket(proto + "//" + location.host + "/ws");
+  state.ws = ws;
+  ws.onopen = function () { setConn(true); };
+  ws.onclose = function () { setConn(false); setTimeout(connectWs, 1500); };
+  ws.onmessage = function (ev) {
+    var d = JSON.parse(ev.data);
+    if (d.type === "ping") return;
+    if (state.sessionId && d.sessionId && d.sessionId !== state.sessionId) return;
+    if (d.type === "delta") {
+      var last = state.messages[state.messages.length - 1];
+      if (!last || last.role !== "assistant" || last._closed) {
+        last = { id: "a-" + Date.now(), role: "assistant", text: "" };
+        state.messages.push(last);
+      }
+      last.text += d.text || "";
+      renderChat();
+    } else if (d.type === "step") {
+      state.steps.push({ tool: d.tool, args: d.args, status: d.status, ms: d.ms });
+      renderChat();
+    } else if (d.type === "status") {
+      state.steps = [];
+      if (d.status === "running") { renderSessions(); }
+      if (d.status === "finished") { loadSession(state.sessionId); }
+      if (d.status === "failed") {
+        var last2 = state.messages[state.messages.length - 1];
+        if (last2 && last2.role === "assistant") {
+          last2._closed = true;
+          renderChat();
+        }
+      }
+    } else if (d.type === "approval") {
+      pushApproval(d);
+    }
+  };
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, function (c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+  });
+}
+
+$("pairBtn").onclick = function () {
+  var code = $("pairCode").value.trim();
+  api("POST", "/api/pair", { code: code }).then(function (r) {
+    if (r.status !== 200 || !r.body.token) {
+      $("loginErr").textContent = "配对失败：配对码错误/过期/已被锁定";
+      return;
+    }
+    state.token = r.body.token;
+    showLogin(false);
+    $("list").hidden = false;
+    document.querySelector("footer").hidden = false;
+    // 重新配对：清空上一账号的待发图片。
+    state.pendingImages = [];
+    renderImgCount();
+    loadBootstrap().then(function () {
+      var first = (state.bootstrap.projects || []).length &&
+        state.bootstrap.projects[0].activeId;
+      if (first) loadSession(first);
+    });
+    connectWs();
+  }).catch(function () {
+    $("loginErr").textContent = "网络错误，请重试";
+  });
+};
+
+$("sendBtn").onclick = function () {
+  var t = $("text").value.trim();
+  if (!t || !state.sessionId) return;
+  state.messages.push({ id: "u-" + Date.now(), role: "user", text: t });
+  renderChat();
+  $("text").value = "";
+  var attachments = state.pendingImages.map(function (u) {
+    return { dataUrl: u };
+  });
+  state.pendingImages = [];
+  renderImgCount();
+  api("POST", "/api/send", {
+    sessionId: state.sessionId,
+    text: t,
+    messageId: "m-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8),
+    attachments: attachments,
+  });
+};
+
+/* —— 附图片：canvas 降采样（长边 1280、JPEG 0.75）控体量，请求体 2MB 上限 —— */
+function renderImgCount() {
+  $("imgCount").textContent = state.pendingImages.length
+    ? " " + state.pendingImages.length
+    : "";
+}
+
+function downscaleImage(file, cb) {
+  var reader = new FileReader();
+  reader.onload = function () {
+    var img = new Image();
+    img.onload = function () {
+      var max = 1280;
+      var scale = Math.min(1, max / Math.max(img.width, img.height));
+      var w = Math.round(img.width * scale);
+      var h = Math.round(img.height * scale);
+      var canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+      cb(canvas.toDataURL("image/jpeg", 0.75));
+    };
+    img.onerror = function () {};
+    img.src = reader.result;
+  };
+  reader.onerror = function () {};
+  reader.readAsDataURL(file);
+}
+
+$("attachBtn").onclick = function () { $("fileInput").click(); };
+
+$("fileInput").onchange = function () {
+  var files = Array.prototype.slice.call($("fileInput").files || []);
+  $("fileInput").value = "";
+  files.forEach(function (f) {
+    if (state.pendingImages.length >= 4) return;
+    if (!/^image\//.test(f.type)) return;
+    downscaleImage(f, function (dataUrl) {
+      if (state.pendingImages.length < 4) {
+        state.pendingImages.push(dataUrl);
+        renderImgCount();
+      }
+    });
+  });
+};
+
+$("newChatBtn").onclick = function () {
+  if (!state.bootstrap || !state.bootstrap.projects.length) return;
+  var root = state.bootstrap.projects[0].root;
+  var model = $("modelSel").value;
+  api("POST", "/api/newChat", { projectRoot: root, model: model }).then(function (r) {
+    if (r.body.sessionId) loadSession(r.body.sessionId);
+  });
+};
+
+setConn(false);
+</script>
+</body>
+</html>

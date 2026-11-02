@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/foundation.dart';
@@ -32,6 +33,68 @@ class WindowLauncher {
 
   static const _channel = MethodChannel('my_ide/window');
 
+  /// 最小窗口尺寸，与原生 MainFlutterWindow.minimumWindowSize /
+  /// linux / win32_window 保持一致：恢复退出尺寸时不小于它；
+  /// 屏幕可视区域小于它时整个 IDE 判定“不支持”。
+  static const double minWindowWidth = 1000;
+  static const double minWindowHeight = 600;
+
+  /// 纯函数（便于回归测试）：恢复退出记忆的窗口尺寸时，先夹紧到屏幕可视尺寸，
+  /// 再兜底不小于最小窗口尺寸。屏幕小于最小尺寸时不压到屏幕以下——窗口仍按
+  /// 最小尺寸展示，由 Dart 侧显示“不支持”页且不启动任何功能。
+  @visibleForTesting
+  static Size clampWindowSize({
+    required Size saved,
+    required Size screenMax,
+    Size min = const Size(minWindowWidth, minWindowHeight),
+  }) {
+    final w = math.max(math.min(saved.width, screenMax.width), min.width);
+    final h = math.max(math.min(saved.height, screenMax.height), min.height);
+    return Size(w, h);
+  }
+
+  /// 纯函数：屏幕可视尺寸是否达到最小窗口尺寸。
+  /// 启动门禁与屏幕变化动态重判都走它（见 ScreenGateApp），无平台依赖，
+  /// 便于在测试环境按任意尺寸回归。
+  static bool isScreenSizeSupported(
+    Size screen, {
+    Size min = const Size(minWindowWidth, minWindowHeight),
+  }) =>
+      screen.width >= min.width && screen.height >= min.height;
+
+  /// 原生屏幕可视区域尺寸（macOS）：取所有已连接屏幕中最大的一块，多显示器下
+  /// 外接大屏不会被 `screens.first`（通常是内置小屏）顶掉。
+  /// 非 macOS 或通道不可用时返回 null。
+  /// 通道在 engine.run 后注册，冷启动首调可能 race，故有限重试。
+  static Future<Size?> screenVisibleFrame() async {
+    if (!Platform.isMacOS) return null;
+    for (var i = 0; i < 5; i++) {
+      try {
+        final v = await _channel.invokeMethod('getScreenVisibleFrame');
+        if (v is Map) {
+          final w = (v['w'] as num?)?.toDouble();
+          final h = (v['h'] as num?)?.toDouble();
+          if (w != null && h != null && w > 0 && h > 0) {
+            return Size(w, h);
+          }
+        }
+        return null;
+      } catch (_) {
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+      }
+    }
+    return null;
+  }
+
+  /// 屏幕尺寸门禁：屏幕小于最小窗口尺寸 → 不支持（main 据此只渲染
+  /// “不支持”页，不启动 MCP/Skills/工作区等任何功能）。
+  /// 通道不可用（如 flutter run 直连调试）默认放行，不阻塞正常使用。
+  static Future<bool> isScreenSupported() async {
+    final screen = await screenVisibleFrame();
+    if (screen == null) return true;
+    return isScreenSizeSupported(screen);
+  }
+
   /// 新窗口 ready 后主动拉取待直达路径（取走即清空，见原生 pendingOpenPath）。
   /// 首窗口返回 null（首窗口直达走 main(args) 的 InitialOpenPath）。
   static Future<String?> takePendingOpenPath() async {
@@ -53,23 +116,102 @@ class WindowLauncher {
     } catch (_) {}
   }
 
-  /// 注册原生 windowReady 推送：窗口 ready 即拉取直达路径并回调。
-  /// 返回取消监听函数。
+  /// 原生推事件注册（方法通道全局只有一个 handler，故在此统一分派）：
+  /// - windowReady：窗口 ready 后主动拉取直达路径（见 takePendingOpenPath）；
+  /// - screenChanged：屏幕变化（挪屏 / 插拔显示器 / 改缩放）推送最新可用屏幕尺寸，
+  ///   Dart 侧据此刻动态重判屏幕门禁（见 main.dart 的 ScreenGateApp）。
+  /// E5：三槽改 List 多播——此前单槽 handler 在同 isolate 内互相覆盖，
+  /// 后注册者顶掉先注册者，且注销会把他人注册一并清空（安全关键回调
+  /// prepareEngineShutdown/screenChanged 可静默失效）。多播下注册返回的
+  /// 取消函数只移除自身，全部注销后才清掉通道 handler。
   static VoidCallback onWindowReady(
     Future<void> Function(String path) onOpenPath,
   ) {
-    if (!Platform.isMacOS) return () {};
+    Future<void> handler(String path) => onOpenPath(path);
+    _windowReadyHandlers.add(handler);
+    _installChannelHandler();
+    return () {
+      _windowReadyHandlers.remove(handler);
+      _installChannelHandler();
+    };
+  }
+
+  /// 注册屏幕变化事件：回调拿到最新可用屏幕尺寸（所有屏幕中最大可视区域）。
+  static VoidCallback onScreenChanged(
+    void Function(Size screen) onChange,
+  ) {
+    _screenChangeHandlers.add(onChange);
+    _installChannelHandler();
+    return () {
+      _screenChangeHandlers.remove(onChange);
+      _installChannelHandler();
+    };
+  }
+
+  static final List<Future<void> Function(String path)> _windowReadyHandlers =
+      [];
+  static final List<void Function(Size)> _screenChangeHandlers = [];
+  static final List<Future<void> Function()> _prepareShutdownHandlers = [];
+
+  /// 注册引擎拆毁前清理回调（macOS 窗口 × → 原生 windowWillClose 在
+  /// shutDownEngine 之前经 'my_ide/window' 通道调用，给 Dart 0.3s 窗口期，
+  /// 回执或超时后原生才拆引擎）：ide_shell 用它同步快杀手机远控隧道——
+  /// cloudflared 是独立进程组，父进程/引擎退出不会连带杀它，仅靠
+  /// AppLifecycleState.detached 存在时序不确定性，这里是确定性保险。
+  static VoidCallback onPrepareEngineShutdown(
+    Future<void> Function() handler,
+  ) {
+    _prepareShutdownHandlers.add(handler);
+    _installChannelHandler();
+    return () {
+      _prepareShutdownHandlers.remove(handler);
+      _installChannelHandler();
+    };
+  }
+
+  /// 重建通道 handler：向当前全部已注册回调多播分派，全注销则置空。
+  static void _installChannelHandler() {
+    if (_windowReadyHandlers.isEmpty &&
+        _screenChangeHandlers.isEmpty &&
+        _prepareShutdownHandlers.isEmpty) {
+      _channel.setMethodCallHandler(null);
+      return;
+    }
     _channel.setMethodCallHandler((call) async {
-      if (call.method == 'windowReady') {
-        final path = await takePendingOpenPath();
-        if (path != null && path.isNotEmpty) {
-          await onOpenPath(path);
-        }
+      switch (call.method) {
+        case 'windowReady':
+          final handlers = List.of(_windowReadyHandlers);
+          if (handlers.isNotEmpty) {
+            final path = await takePendingOpenPath();
+            if (path != null && path.isNotEmpty) {
+              for (final handler in handlers) {
+                await handler(path);
+              }
+            }
+          }
+          break;
+        case 'screenChanged':
+          final handlers = List.of(_screenChangeHandlers);
+          if (handlers.isNotEmpty && call.arguments is Map) {
+            final w = (call.arguments['w'] as num?)?.toDouble();
+            final h = (call.arguments['h'] as num?)?.toDouble();
+            if (w != null && h != null && w > 0 && h > 0) {
+              for (final handler in handlers) {
+                handler(Size(w, h));
+              }
+            }
+          }
+          break;
+        case 'prepareEngineShutdown':
+          // 关窗前最后清理：同步快杀远控隧道 + 尽力完整 stop（限时）。
+          // E5：快照后逐个 await——执行中的注销不影响本轮，本轮新注册
+          // 下一轮才收到（避免迭代中增删列表）。
+          for (final handler in List.of(_prepareShutdownHandlers)) {
+            await handler();
+          }
+          break;
       }
     });
-    return () {
-      _channel.setMethodCallHandler(null);
-    };
   }
 
   /// 打开一个全新窗口。[path] 为空则打开空窗口。

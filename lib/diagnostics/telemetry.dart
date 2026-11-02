@@ -25,11 +25,8 @@ class Telemetry {
     _root = root;
   }
 
-  /// 内存快照（仅测试/排查用）。
-  static List<Map<String, dynamic>> recentForTest() =>
-      List.unmodifiable(_memory);
-
-  /// 遥测总开关：默认关闭。
+  /// R-DEADCODE-TELEMETRY：内存快照钩子已删——名为测试钩子但测试亦
+  /// 未使用（零调用），遥测内容改看 telemetry.log 落盘文件。
   static Future<bool> isEnabled() async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -77,6 +74,17 @@ class Telemetry {
       final dir = Directory(p.join(root, '.my_ide', 'logs'));
       await dir.create(recursive: true);
       final file = File(p.join(dir.path, 'telemetry.log'));
+      // R-TELEMETRY-ROTATE：512KB 轮转（与 app_logger 同口径）——长期运行
+      // 无限 append 单文件无界增长。
+      try {
+        if (await file.exists() && await file.length() > 512 * 1024) {
+          final bak = File(p.join(dir.path, 'telemetry.log.1'));
+          try {
+            if (await bak.exists()) await bak.delete();
+            await file.rename(bak.path);
+          } catch (_) {}
+        }
+      } catch (_) {}
       await file.writeAsString(
         '${jsonEncode(entry)}\n',
         mode: FileMode.append,

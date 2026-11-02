@@ -166,9 +166,12 @@ class ShortcutController extends ChangeNotifier {
   }
 
   /// 启动时恢复已落盘的自定义绑定；非法数据保持默认并返回 false。
+  /// 文本编辑预留键（Cmd/Ctrl+C/V/X/A/Z）同样拒绝：此前录入未过滤，
+  /// 一旦存成保存键，内层保存 Shortcuts 会抢占粘贴，致设置页无法粘贴。
   bool applySavedBinding(ShortcutAction action, String prefsValue) {
     final binding = ShortcutBinding.fromPrefsJson(prefsValue);
     if (binding == null) return false;
+    if (_isReservedTextEditing(binding.key, binding.modifiers)) return false;
     _bindings[action] = binding;
     return true;
   }
@@ -227,6 +230,14 @@ class ShortcutController extends ChangeNotifier {
       return false;
     }
 
+    // 预留文本编辑键：Cmd/Ctrl+C/V/X/A/Z 交给输入框粘贴/复制，
+    // 不允许录为“保存”等全局快捷键，否则保存 Shortcuts（更靠近
+    // 输入框）会抢占 DefaultTextEditingShortcuts，致设置页无法粘贴。
+    // 此时放行（保持录入态），让粘贴正常落入输入框。
+    if (_isReservedTextEditing(key, modifiers)) {
+      return false;
+    }
+
     _bindings[action] = ShortcutBinding(key: key, modifiers: modifiers);
     _capturingAction = null;
     notifyListeners();
@@ -239,6 +250,23 @@ class ShortcutController extends ChangeNotifier {
       _capturingAction = null;
     }
     notifyListeners();
+  }
+
+  static bool _isReservedTextEditing(
+    LogicalKeyboardKey key,
+    Set<LogicalKeyboardKey> modifiers,
+  ) {
+    // 文本编辑预留：Cmd/Ctrl+C/V/X/A/Z（含 Shift+Cmd+Z 重做）交给输入框，
+    // 不允许录为全局快捷键，否则内层保存 Shortcuts 会抢占粘贴。
+    if (!modifiers.contains(LogicalKeyboardKey.control) &&
+        !modifiers.contains(LogicalKeyboardKey.meta)) {
+      return false;
+    }
+    return key == LogicalKeyboardKey.keyC ||
+        key == LogicalKeyboardKey.keyV ||
+        key == LogicalKeyboardKey.keyX ||
+        key == LogicalKeyboardKey.keyA ||
+        key == LogicalKeyboardKey.keyZ;
   }
 
   static bool _isModifier(LogicalKeyboardKey key) {

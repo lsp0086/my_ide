@@ -3,17 +3,23 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:crypto/crypto.dart';
-
 import 'package:http/http.dart' as http;
+import 'package:meta/meta.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+
+part 'bundled_language_servers_install.dart';
+part 'bundled_language_servers_env.dart';
 
 /// 跨平台解压：不依赖 unzip/gzip 命令。
 class ArchiveExtract {
   static Future<void> gzipFile(String gzPath, String outPath) =>
       _extractGzip(gzPath, outPath);
 
-  static Future<void> zipFile(String zipPath, String destDir) =>
+  /// A4-6 测试钩子：暴露 _extractZip（含 ZipSlip 清洗）供回归——
+  /// clangd 安装已从系统 unzip 统一改走本函数（R17-06）。
+  @visibleForTesting
+  static Future<void> zipFileForTest(String zipPath, String destDir) =>
       _extractZip(zipPath, destDir);
 }
 
@@ -115,6 +121,30 @@ class BundledLanguageServers {
   final Map<String, String?> _lastError = {};
 
   String? lastErrorFor(String id) => _lastError[id];
+
+  /// A4-7 测试钩子：暴露 _runToolWithTimeout（Process.start + exitCode
+  /// 超时 kill）供 npm/go 安装超时回归。
+  @visibleForTesting
+  static Future<ProcessResult?> runToolWithTimeoutForTest(
+    String executable,
+    List<String> args, {
+    String? workingDirectory,
+    Map<String, String>? environment,
+    required Duration timeout,
+  }) =>
+      _runToolWithTimeout(
+        executable,
+        args,
+        workingDirectory: workingDirectory,
+        environment: environment,
+        timeout: timeout,
+      );
+
+  /// A4-8 测试钩子：暴露 _verifyArchiveChecksum 供"缺 .sha256 默认拒绝"
+  /// 回归（生产路径经 ensureArchiveExtracted 调用）。
+  @visibleForTesting
+  Future<bool> verifyArchiveChecksumForTest(File archive) =>
+      _verifyArchiveChecksum(archive);
 
   bool canAutoInstall(String id) {
     switch (id) {
@@ -232,7 +262,9 @@ class BundledLanguageServers {
       // zstd -dc archive | tar -x -C tmp
       final z = await Process.start(zstd, ['-dc', archive.path]);
       final t = await Process.start('tar', ['-x', '-C', tmp.path]);
-      z.stdout.pipe(t.stdin);
+      // R-PIPE-ERR：pipe 未 await/未监听错误——tar 先退出时 zstd 写管道
+      // 失败，pipe 的 Future 错误无人消费即 unhandled async exception。
+      unawaited(z.stdout.pipe(t.stdin).catchError((_) {}));
       final zErr = await z.stderr.transform(utf8.decoder).join();
       final tErr = await t.stderr.transform(utf8.decoder).join();
       final zCode = await z.exitCode;
@@ -382,649 +414,76 @@ class BundledLanguageServers {
     return _findOnPath(['node', 'node.exe']);
   }
 
-  Future<String?> ensureInstalled(String id, {bool force = false}) {
-    if (!canAutoInstall(id)) {
-      _lastError[id] = '该语言服务不支持应用目录自动下发';
-      return Future.value(null);
-    }
-    // html 复用 typescript 安装
-    final key = id == 'html-via-ts' ? 'typescript' : id;
-    if (!force && _installing[key] != null) return _installing[key]!;
-    final future = _ensureInstalled(key, force: force);
-    _installing[key] = future;
-    return future.whenComplete(() {
-      if (identical(_installing[key], future)) _installing[key] = null;
-      if (id == 'html-via-ts') {
-        _resolved[id] = _resolved['typescript'];
-        _lastError[id] = _lastError['typescript'];
-      }
-    });
-  }
-
-  Future<String?> _ensureInstalled(String id, {required bool force}) async {
-    _lastError[id] = null;
-    // JS/TS/Pyright 依赖便携 node：先解压 node 归档。
-    if (id == 'typescript' || id == 'pyright') {
-      await ensureArchiveExtracted('node');
-    }
-    // 优先：App 内 .tar.zst 解压（离线、小安装包）
-    final folder = id;
-    await ensureArchiveExtracted(folder);
-
-    if (!force) {
-      final existing = await binaryPathIfPresent(id);
-      if (existing != null) {
-        _resolved[id] = existing;
-        return existing;
-      }
-    }
-
-    try {
-      switch (id) {
-        case 'typescript':
-          // TS 7 已移除 tsserver.js，typescript-language-server 无法工作。
-          return await _installNpm(
-            id: id,
-            folder: 'typescript',
-            packages: const [
-              'typescript-language-server@4.3.3',
-              'typescript@5.8.3',
-            ],
-            binaryName: 'typescript-language-server',
-          );
-        case 'pyright':
-          return await _installNpm(
-            id: id,
-            folder: 'pyright',
-            packages: const ['pyright@latest'],
-            binaryName: 'pyright-langserver',
-          );
-        case 'gopls':
-          return await _installGo(
-            id: id,
-            folder: 'gopls',
-            packageUri: 'golang.org/x/tools/gopls@latest',
-            binaryName: 'gopls',
-          );
-        case 'rust-analyzer':
-          return await _installGithubGzBinary(
-            id: id,
-            folder: 'rust-analyzer',
-            repo: 'rust-lang/rust-analyzer',
-            assetMatcher: _rustAnalyzerAssetName(),
-            binaryName: 'rust-analyzer',
-          );
-        case 'clangd':
-          return await _installClangd(id);
-        default:
-          _lastError[id] = '未知语言服务：$id';
-          return null;
-      }
-    } catch (e) {
-      _lastError[id] = '$e';
-      return null;
-    }
-  }
-
-  Future<String?> _findNpmBin(String folder, String binaryName) async {
-    final roots = await _searchRoots(folder);
-    for (final dir in roots) {
-      if (!dir.existsSync()) continue;
-      final candidates = <String>[
-        p.join(dir.path, 'node_modules', '.bin', binaryName),
-        if (Platform.isWindows)
-          p.join(dir.path, 'node_modules', '.bin', '$binaryName.cmd'),
-      ];
-      for (final path in candidates) {
-        if (File(path).existsSync()) {
-          _resolved[folder == 'typescript' ? 'typescript' : folder] = path;
-          if (folder == 'typescript') {
-            _resolved['html-via-ts'] = path;
-          }
-          return path;
-        }
-      }
-    }
-    return null;
-  }
-
-  Future<String?> _findPlainBin(String folder, String binaryName) async {
-    final roots = await _searchRoots(folder);
-    for (final dir in roots) {
-      if (!dir.existsSync()) continue;
-      final candidates = <String>[
-        p.join(dir.path, 'bin', binaryName),
-        p.join(dir.path, binaryName),
-        if (Platform.isWindows) p.join(dir.path, 'bin', '$binaryName.exe'),
-        if (Platform.isWindows) p.join(dir.path, '$binaryName.exe'),
-      ];
-      for (final path in candidates) {
-        if (File(path).existsSync()) {
-          _resolved[folder] = path;
-          return path;
-        }
-      }
-    }
-    return null;
-  }
-
-  Future<String?> _findClangdBin() async {
-    final roots = await _searchRoots('clangd');
-    for (final dir in roots) {
-      if (!dir.existsSync()) continue;
-      // 官方 zip 解压后是 clangd_<ver>/bin/clangd
-      final matches = dir
-          .listSync(recursive: true)
-          .whereType<File>()
-          .where((f) {
-            final name = p.basename(f.path);
-            return name == 'clangd' || name == 'clangd.exe';
-          })
-          .map((f) => f.path)
-          .toList();
-      if (matches.isNotEmpty) {
-        _resolved['clangd'] = matches.first;
-        return matches.first;
-      }
-    }
-    return null;
-  }
-
-  Future<String?> _installNpm({
-    required String id,
-    required String folder,
-    required List<String> packages,
-    required String binaryName,
+  /// A4-7：npm/go 安装子进程带超时执行——Process.run 无超时，npm/go
+  /// 挂起（网络 hang/交互提示）则 _installing[key] future 永久在途，
+  /// UI 无反馈。改 Process.start + exitCode 超时 kill，口径对齐
+  /// _download 60s 与 checkpoint_store/git_anchor 的 _runWithTimeout：
+  /// 管道不收干会撑满阻塞子进程，并行收集 stdout/stderr 后再 kill。
+  /// 超时返回 null（调用方按"安装失败"处理，原失败语义不变）。
+  static Future<ProcessResult?> _runToolWithTimeout(
+    String executable,
+    List<String> args, {
+    String? workingDirectory,
+    Map<String, String>? environment,
+    required Duration timeout,
   }) async {
-    final npm = await _findOnPath(['npm', 'npm.cmd']);
-    if (npm == null) {
-      _lastError[id] = '未找到 npm / node，无法下发 $id';
-      return null;
-    }
-    final dir = await _langDir(folder);
-    final result = await Process.run(
-      npm,
-      [
-        'install',
-        '--prefix',
-        dir.path,
-        '--no-fund',
-        '--no-audit',
-        '--silent',
-        ...packages,
-      ],
-      workingDirectory: dir.path,
-      environment: {
-        ..._toolEnv(),
-        'NPM_CONFIG_FUND': 'false',
-        'NPM_CONFIG_AUDIT': 'false',
-      },
+    final proc = await Process.start(
+      executable,
+      args,
+      workingDirectory: workingDirectory,
+      environment: environment,
     );
-    if (result.exitCode != 0) {
-      _lastError[id] = _stderrOf(result).isEmpty
-          ? 'npm install 失败（exit ${result.exitCode}）'
-          : _stderrOf(result);
-      return null;
-    }
-    _resolved.remove(id);
-    final path = await _findNpmBin(folder, binaryName);
-    if (path == null) {
-      _lastError[id] = '安装完成但未找到 $binaryName';
-    }
-    return path;
-  }
-
-  Future<String?> _installGo({
-    required String id,
-    required String folder,
-    required String packageUri,
-    required String binaryName,
-  }) async {
-    final go = await _findOnPath(['go', 'go.exe']);
-    if (go == null) {
-      _lastError[id] = '未找到 go，无法下发 $id';
-      return null;
-    }
-    final dir = await _langDir(folder);
-    final binDir = Directory(p.join(dir.path, 'bin'));
-    if (!await binDir.exists()) await binDir.create(recursive: true);
-    final result = await Process.run(
-      go,
-      ['install', packageUri],
-      workingDirectory: dir.path,
-      environment: {..._toolEnv(), 'GOBIN': binDir.path},
-    );
-    if (result.exitCode != 0) {
-      _lastError[id] = _stderrOf(result).isEmpty
-          ? 'go install 失败（exit ${result.exitCode}）'
-          : _stderrOf(result);
-      return null;
-    }
-    _resolved.remove(id);
-    final path = await _findPlainBin(folder, binaryName);
-    if (path == null) {
-      _lastError[id] = '安装完成但未找到 $binaryName';
-    }
-    return path;
-  }
-
-  Future<String?> _installGithubGzBinary({
-    required String id,
-    required String folder,
-    required String repo,
-    required String assetMatcher,
-    required String binaryName,
-  }) async {
-    final dir = await _langDir(folder);
-    final binDir = Directory(p.join(dir.path, 'bin'));
-    if (!await binDir.exists()) await binDir.create(recursive: true);
-
-    final release = await _latestRelease(repo);
-    if (release == null) {
-      _lastError[id] = '无法获取 $repo 最新 release';
-      return null;
-    }
-    final assets = (release['assets'] as List?) ?? const [];
-    Map<String, dynamic>? asset;
-    for (final raw in assets) {
-      if (raw is! Map) continue;
-      final name = '${raw['name'] ?? ''}';
-      final exact = name == assetMatcher || name.contains(assetMatcher);
-      final okExt = name.endsWith('.gz') || name.endsWith('.zip');
-      if (exact && okExt && !name.endsWith('.tar.gz')) {
-        asset = Map<String, dynamic>.from(raw);
-        break;
-      }
-    }
-    if (asset == null) {
-      _lastError[id] = '未找到匹配资源：$assetMatcher';
-      return null;
-    }
-    final url = '${asset['browser_download_url'] ?? ''}';
-    if (url.isEmpty) {
-      _lastError[id] = 'release 资源缺少下载地址';
-      return null;
-    }
-
-    final assetFileName = '${asset['name']}';
-    final downloadPath = p.join(dir.path, assetFileName);
-    final bytes = await _download(url);
-    await File(downloadPath).writeAsBytes(bytes, flush: true);
-
-    final outPath = p.join(
-      binDir.path,
-      Platform.isWindows ? '$binaryName.exe' : binaryName,
-    );
-
-    if (assetFileName.endsWith('.zip')) {
-      try {
-        await _extractZip(downloadPath, dir.path);
-      } catch (e) {
-        _lastError[id] = '解压 zip 失败：$e';
-        return null;
-      }
-      final found = dir
-          .listSync(recursive: true)
-          .whereType<File>()
-          .where((f) {
-            final name = p.basename(f.path);
-            return name == binaryName || name == '$binaryName.exe';
-          })
-          .map((f) => f.path)
-          .toList();
-      if (found.isEmpty) {
-        _lastError[id] = '解压完成但未找到 $binaryName';
-        return null;
-      }
-      await File(found.first).copy(outPath);
-    } else {
-      try {
-        await _extractGzip(downloadPath, outPath);
-      } catch (e) {
-        _lastError[id] = '解压 gzip 失败：$e';
-        return null;
-      }
-    }
-
-    if (!Platform.isWindows) {
-      await Process.run('chmod', ['+x', outPath]);
-    }
+    final stdoutFuture =
+        utf8.decoder.bind(proc.stdout).join().catchError((Object _) => '');
+    final stderrFuture =
+        utf8.decoder.bind(proc.stderr).join().catchError((Object _) => '');
     try {
-      await File(downloadPath).delete();
-    } catch (_) {}
-
-    _resolved[id] = outPath;
-    if (!File(outPath).existsSync()) {
-      _lastError[id] = '安装完成但未找到 $binaryName';
-      return null;
-    }
-    return outPath;
-  }
-
-  Future<String?> _installClangd(String id) async {
-    final dir = await _langDir('clangd');
-    final release = await _latestRelease('clangd/clangd');
-    if (release == null) {
-      _lastError[id] = '无法获取 clangd 最新 release';
-      return null;
-    }
-    final assetName = _clangdAssetName();
-    final assets = (release['assets'] as List?) ?? const [];
-    Map<String, dynamic>? asset;
-    for (final raw in assets) {
-      if (raw is! Map) continue;
-      final name = '${raw['name'] ?? ''}';
-      if (name.contains(assetName) && name.endsWith('.zip')) {
-        asset = Map<String, dynamic>.from(raw);
-        break;
-      }
-    }
-    if (asset == null) {
-      _lastError[id] = '未找到匹配资源：$assetName';
-      return null;
-    }
-    final url = '${asset['browser_download_url'] ?? ''}';
-    if (url.isEmpty) {
-      _lastError[id] = 'release 资源缺少下载地址';
-      return null;
-    }
-    final zipPath = p.join(dir.path, asset['name'] as String);
-    final bytes = await _download(url);
-    await File(zipPath).writeAsBytes(bytes, flush: true);
-
-    final unzip = await Process.run('unzip', [
-      '-o',
-      zipPath,
-      '-d',
-      dir.path,
-    ], workingDirectory: dir.path);
-    if (unzip.exitCode != 0) {
-      _lastError[id] = _stderrOf(unzip).isEmpty
-          ? 'unzip 失败（exit ${unzip.exitCode}）'
-          : _stderrOf(unzip);
-      return null;
-    }
-    try {
-      await File(zipPath).delete();
-    } catch (_) {}
-
-    _resolved.remove(id);
-    final path = await _findClangdBin();
-    if (path == null) {
-      _lastError[id] = '安装完成但未找到 clangd';
-      return null;
-    }
-    if (!Platform.isWindows) {
-      await Process.run('chmod', ['+x', path]);
-    }
-    return path;
-  }
-
-  Future<Map<String, dynamic>?> _latestRelease(String repo) async {
-    final uri = Uri.parse('https://api.github.com/repos/$repo/releases/latest');
-    final resp = await http.get(
-      uri,
-      headers: {
-        'Accept': 'application/vnd.github+json',
-        'User-Agent': 'my-ide-language-bootstrap',
-      },
-    );
-    if (resp.statusCode != 200) return null;
-    final decoded = jsonDecode(resp.body);
-    if (decoded is Map<String, dynamic>) return decoded;
-    if (decoded is Map) return Map<String, dynamic>.from(decoded);
-    return null;
-  }
-
-  Future<List<int>> _download(String url) async {
-    // R8-下载有界：语言服务包数十 MB，此前 http.get 无 timeout、无大小门禁，
-    // 慢链 hang 住 UI+超大包直接进内存 OOM。现 60s 超时+50MB 上限。
-    final resp = await http
-        .get(
-          Uri.parse(url),
-          headers: {'User-Agent': 'my-ide-language-bootstrap'},
-        )
-        .timeout(
-          const Duration(seconds: 60),
-          onTimeout: () => throw TimeoutException('语言服务下载超时（60s）：$url'),
-        );
-    if (resp.statusCode < 200 || resp.statusCode >= 300) {
-      throw StateError('下载失败 HTTP ${resp.statusCode}: $url');
-    }
-    if (resp.bodyBytes.length > 50 * 1024 * 1024) {
-      throw StateError('语言服务包超过 50MB，拒绝载入：$url');
-    }
-    return resp.bodyBytes;
-  }
-
-  String _rustAnalyzerAssetName() {
-    final os = Platform.operatingSystem;
-    final arch = _arch();
-    if (os == 'macos') {
-      return arch == 'aarch64'
-          ? 'rust-analyzer-aarch64-apple-darwin.gz'
-          : 'rust-analyzer-x86_64-apple-darwin.gz';
-    }
-    if (os == 'windows') {
-      return 'rust-analyzer-x86_64-pc-windows-msvc.zip';
-    }
-    return arch == 'aarch64'
-        ? 'rust-analyzer-aarch64-unknown-linux-gnu.gz'
-        : 'rust-analyzer-x86_64-unknown-linux-gnu.gz';
-  }
-
-  String _clangdAssetName() {
-    final os = Platform.operatingSystem;
-    final arch = _arch();
-    if (os == 'macos') {
-      return arch == 'aarch64' ? 'clangd-mac-arm64' : 'clangd-mac-x64';
-    }
-    if (os == 'windows') {
-      return 'clangd-windows';
-    }
-    return arch == 'aarch64' ? 'clangd-linux-arm64' : 'clangd-linux-x64';
-  }
-
-  String _arch() {
-    final info = Platform.version.toLowerCase();
-    // Dart Platform.version 含 "macos_arm64" / "linux_arm64" 等
-    if (info.contains('arm64') || info.contains('aarch64')) return 'aarch64';
-    return 'x86_64';
-  }
-
-  /// Finder / DMG 启动的 GUI App 往往没有 shell PATH，这里补齐常见安装位置。
-  Map<String, String> _toolEnv() {
-    final env = Map<String, String>.from(Platform.environment);
-    final extras = <String>[
-      // App 内置便携 node（打包脚本写入）优先
-      ..._bundledNodeBinDirs(),
-      if (Platform.isMacOS) ...[
-        '/opt/homebrew/bin',
-        '/usr/local/bin',
-        '/usr/local/go/bin',
-        '${Platform.environment['HOME']}/.npm-global/bin',
-        '${Platform.environment['HOME']}/.local/bin',
-        '${Platform.environment['HOME']}/.cargo/bin',
-        '${Platform.environment['HOME']}/Documents/go_works/bin',
-      ],
-      if (Platform.isLinux) ...[
-        '/usr/local/bin',
-        '/usr/bin',
-        '${Platform.environment['HOME']}/.npm-global/bin',
-        '${Platform.environment['HOME']}/.local/bin',
-        '${Platform.environment['HOME']}/.cargo/bin',
-        '${Platform.environment['HOME']}/go/bin',
-      ],
-    ];
-    final current = (env['PATH'] ?? '')
-        .split(Platform.isWindows ? ';' : ':')
-        .where((e) => e.isNotEmpty);
-    final merged = <String>[
-      ...extras.where((e) => e.isNotEmpty && Directory(e).existsSync()),
-      ...current,
-    ];
-    // 去重保序
-    final seen = <String>{};
-    env['PATH'] = merged
-        .where((e) => seen.add(e))
-        .join(Platform.isWindows ? ';' : ':');
-    return env;
-  }
-
-  List<String> _bundledNodeBinDirs() {
-    try {
-      // 解压后在 Application Support；兼容旧包 App 内 node。
-      final supportCandidates = <String>[];
-      try {
-        // 同步路径不可用 path_provider；用常见位置 + 已解析缓存
-        final home = Platform.environment['HOME'];
-        if (home != null) {
-          supportCandidates.addAll([
-            p.join(
-              home,
-              'Library',
-              'Application Support',
-              'com.example.myIde',
-              'languages',
-              'node',
-              'bin',
-            ),
-            p.join(
-              home,
-              'Library',
-              'Application Support',
-              'my_ide',
-              'languages',
-              'node',
-              'bin',
-            ),
-          ]);
-        }
-      } catch (_) {}
-      final exe = File(Platform.resolvedExecutable);
-      final macOsDir = exe.parent;
-      final candidates = <String>[
-        ...supportCandidates,
-        p.normalize(
-          p.join(macOsDir.path, '..', 'Resources', 'languages', 'node', 'bin'),
-        ),
-        p.normalize(
-          p.join(
-            macOsDir.path,
-            '..',
-            'Resources',
-            'languages',
-            'node',
-            'current',
-            'bin',
-          ),
-        ),
-        p.join(macOsDir.path, 'languages', 'node', 'bin'),
-        p.join(macOsDir.path, 'languages', 'node', 'current', 'bin'),
-        p.normalize(p.join(macOsDir.path, 'data', 'languages', 'node', 'bin')),
-      ];
-      return candidates.where((e) => Directory(e).existsSync()).toList();
-    } catch (_) {
-      return const [];
-    }
-  }
-
-  Future<bool> _verifyArchiveChecksum(File archive) async {
-    final checksumFile = File('${archive.path}.sha256');
-    final signatureFile = File('${archive.path}.sig');
-    if (!await checksumFile.exists()) return true;
-    final expected = (await checksumFile.readAsString())
-        .trim()
-        .split(RegExp(r'\s+'))
-        .first
-        .toLowerCase();
-    if (!RegExp(r'^[0-9a-f]{64}$').hasMatch(expected)) {
-      _lastError[p.basenameWithoutExtension(archive.path)] =
-          '语言包 SHA-256 文件格式无效';
-      return false;
-    }
-    // R8-A2同口径：校验读同样先判大小，大包拒验免OOM。
-    try {
-      if (await archive.length() > 512 * 1024 * 1024) {
-        _lastError[p.basenameWithoutExtension(archive.path)] = '语言包过大拒验';
-        return false;
-      }
-    } catch (_) {}
-    final actual = sha256.convert(await archive.readAsBytes()).toString();
-    if (actual != expected) {
-      _lastError[p.basenameWithoutExtension(archive.path)] = '语言包 SHA-256 校验失败';
-      return false;
-    }
-    if (await signatureFile.exists()) {
-      _lastError[p.basenameWithoutExtension(archive.path)] =
-          '语言包附带签名文件，但当前版本仅完成 SHA-256 校验，尚未启用签名公钥验证';
-    }
-    return true;
-  }
-
-  Future<String?> _findZstd() async {
-    final root = await archiveRootDir();
-    if (root != null) {
-      for (final name in ['zstd', 'zstd.exe']) {
-        final local = File(p.join(root.path, name));
-        if (await local.exists()) return local.path;
-      }
-    }
-    return _findOnPath(['zstd', 'zstd.exe']);
-  }
-
-  Future<String?> _findOnPath(List<String> names) async {
-    final env = _toolEnv();
-    for (final name in names) {
-      // 先扫补齐后的 PATH 绝对路径，避免依赖 which 的环境。
-      for (final dir in (env['PATH'] ?? '').split(
-        Platform.isWindows ? ';' : ':',
-      )) {
-        if (dir.isEmpty) continue;
-        final candidate = p.join(dir, name);
-        if (File(candidate).existsSync()) return candidate;
-        if (Platform.isWindows) {
-          final cmd = p.join(dir, '$name.cmd');
-          if (File(cmd).existsSync()) return cmd;
-        }
-      }
-      try {
-        final result = await Process.run(
-          Platform.isWindows ? 'where' : 'which',
-          [name],
-          environment: env,
-        );
-        if (result.exitCode == 0) {
-          final out = (result.stdout as String).trim().split('\n').first.trim();
-          if (out.isNotEmpty) return out;
-        }
-      } catch (_) {}
-    }
-    return null;
-  }
-
-  String _stderrOf(ProcessResult result) {
-    final err = result.stderr;
-    if (err is String) return err.trim();
-    if (err is List<int>) return utf8.decode(err).trim();
-    return '$err'.trim();
-  }
-}
-
-/// 兼容旧调用点。
-class BundledTsServer {
-  BundledTsServer._();
-  static final BundledTsServer instance = BundledTsServer._();
-
-  String? get lastError =>
-      BundledLanguageServers.instance.lastErrorFor('typescript');
-
-  Future<String?> binaryPathIfPresent() =>
-      BundledLanguageServers.instance.binaryPathIfPresent('typescript');
-
-  Future<String?> ensureInstalled({bool force = false}) =>
-      BundledLanguageServers.instance.ensureInstalled(
-        'typescript',
-        force: force,
+      final exitCode = await proc.exitCode.timeout(timeout);
+      return ProcessResult(
+        proc.pid,
+        exitCode,
+        await stdoutFuture,
+        await stderrFuture,
       );
+    } on TimeoutException {
+      // 安装工具收到 TERM 也可能不理会（忽略信号的假脚本/hang 子进程），
+      // 直接 SIGKILL 确保收敛；收干管道防僵尸。对齐 local_tsc_checker
+      // E2 的 sigkill 口径（安装中途被杀的半成品由下次重装覆盖）。
+      try {
+        proc.kill(ProcessSignal.sigkill);
+      } catch (_) {}
+      // 收尸防僵尸：进程死后管道 EOF，join 自然完成；2s 兜底不阻塞。
+      try {
+        await Future.wait([stdoutFuture, stderrFuture])
+            .timeout(const Duration(seconds: 2));
+      } catch (_) {}
+      return null;
+    }
+  }
+
+  /// A4-7：npm/go 安装超时（对齐 _download 60s）——超时即 kill，
+  /// 在途安装 future 收敛，UI 拿到失败而非永久挂起。
+  static const Duration _toolInstallTimeout = Duration(seconds: 60);
+
+  /// D2-S3：GitHub 下载主机白名单——`_download` 只认 GitHub 系官方
+  /// 主机（api.github.com 元数据 / objects.githubusercontent.com 与
+  /// release-assets.githubusercontent.com 资产落地），代理/劫持注入的
+  /// 伪造 host 一律拒绝（此前无白名单，下载链可被指向任意主机）。
+  static const _githubDownloadHosts = {
+    'api.github.com',
+    'github.com',
+    'objects.githubusercontent.com',
+    'release-assets.githubusercontent.com',
+  };
+
+  /// D2-S3：从 release 资产元数据提取期望 SHA-256（digest 字段，
+  /// 形如 `sha256:<hex>`）。无 digest / 格式不符返回 null（调用方
+  /// fail-closed）。
+  static String? expectedSha256FromDigest(Object? digest) {
+    final raw = '${digest ?? ''}'.trim().toLowerCase();
+    if (raw.isEmpty) return null;
+    final hex = raw.startsWith('sha256:') ? raw.substring(7) : raw;
+    return RegExp(r'^[0-9a-f]{64}$').hasMatch(hex) ? hex : null;
+  }
+
 }

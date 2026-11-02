@@ -14,11 +14,16 @@ class FilePreviewPane extends StatelessWidget {
     required this.tab,
     this.editorKey,
     this.onSaved,
+    this.onClose,
   });
 
   final OpenEditorTab tab;
   final GlobalKey<CodeEditorPaneState>? editorKey;
   final Future<void> Function(String path)? onSaved;
+
+  /// F11：页面标签页（FileKind.browser）的"关闭该页签"出口，由宿主
+  /// （_EditorPanel）接线 WorkspaceController.closeTab。
+  final VoidCallback? onClose;
 
   @override
   Widget build(BuildContext context) {
@@ -38,7 +43,7 @@ class FilePreviewPane extends StatelessWidget {
         );
       case FileKind.browser:
         // Agent 唤起的页面标签页：CDP screencast 渲染，只读观看窗。
-        return BrowserPageView(initialUrl: tab.url ?? '');
+        return BrowserPageView(initialUrl: tab.url ?? '', onClose: onClose);
       case FileKind.unsupported:
         return _SmartUnsupportedPreview(
           path: tab.path,
@@ -67,6 +72,14 @@ class _ImagePreview extends StatelessWidget {
         child: Image.file(
           File(path),
           fit: BoxFit.contain,
+          // R-PREVIEW-CACHE：按视口尺寸限解码——数十 MP 大图全尺寸解码
+          // 内存峰值高；cacheWidth 钳到视口宽度×DPR，缩放交互由
+          // InteractiveViewer 在已解码位图上完成。
+          cacheWidth: () {
+            final size = MediaQuery.sizeOf(context);
+            final dpr = MediaQuery.devicePixelRatioOf(context);
+            return ((size.width * dpr).round()).clamp(1, 4096);
+          }(),
           errorBuilder: (context, error, stackTrace) {
             return _Message(
               icon: Icons.broken_image_outlined,

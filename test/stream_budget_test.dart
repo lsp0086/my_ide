@@ -271,4 +271,65 @@ void main() {
     final loaded2 = await UsageLedger.load();
     expect(loaded2.totalPrompt, 150);
   });
+
+  group('用量账本 Infinity 容错', () {
+    test('prefs 写 1e400 后 load 不清空其余日期且该条钳 0', () async {
+      // 毒化串按字面写入（jsonDecode 后 1e400 → double.infinity，
+      // jsonEncode 无法编码 Infinity，故不构造 Map 再编码）。
+      SharedPreferences.setMockInitialValues({
+        'usageLedger': '{"days":{'
+            '"2026-10-01":{"day":"2026-10-01","promptTokens":100,'
+            '"completionTokens":50,"cost":0.5},'
+            '"2026-10-02":{"day":"2026-10-02","promptTokens":1e400,'
+            '"completionTokens":20,"cost":0.2}}}',
+      });
+      final ledger = await UsageLedger.load();
+      expect(ledger.day('2026-10-01')?.promptTokens, 100,
+          reason: '历史日期不得被 Infinity 拖垮整本清空');
+      final bad = ledger.day('2026-10-02');
+      expect(bad, isNotNull);
+      expect(bad!.promptTokens, 0, reason: '非有限值钳 0');
+      expect(bad.completionTokens, 20);
+    });
+
+    test('UsageModelEntry 同口径：Infinity token 钳 0', () {
+      final e = UsageModelEntry.fromJson({
+        'provider': 'p',
+        'model': 'm',
+        'promptTokens': double.infinity,
+      });
+      expect(e.promptTokens, 0);
+    });
+
+    test('毒单价 Infinity/NaN 落 cost 为 0 且 recordAndSave 不抛', () async {
+      SharedPreferences.setMockInitialValues({});
+      final ledger = UsageLedger();
+      ledger.record(
+        promptTokens: 1000,
+        completionTokens: 1000,
+        pricePer1K: double.infinity,
+      );
+      ledger.record(
+        promptTokens: 1000,
+        completionTokens: 1000,
+        pricePer1K: double.nan,
+      );
+      expect(ledger.totalCost, 0.0);
+      // 累计写入钳制后仍有限：日熔断可正常触发判定。
+      expect(
+        UsageLedger.dayCostExceededForTest(ledger.totalCost, 5),
+        isFalse,
+      );
+      await UsageLedger.recordAndSave(
+        promptTokens: 100,
+        completionTokens: 0,
+        pricePer1K: double.infinity,
+        provider: 'p',
+        model: 'm',
+      );
+      final loaded = await UsageLedger.load();
+      expect(loaded.totalCost.isFinite, isTrue);
+      expect(loaded.totalCost, 0.0);
+    });
+  });
 }

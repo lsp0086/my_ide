@@ -1,7 +1,9 @@
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:my_ide/ai/agent_tools.dart';
+import 'package:my_ide/diagnostics/app_logger.dart';
 import 'package:my_ide/ai/tool_registry.dart';
 import 'package:my_ide/ai/provider_config.dart';
 import 'package:my_ide/browser/browser_console.dart';
@@ -15,6 +17,7 @@ import 'package:path/path.dart' as p;
 
 void main() {
   setUp(() async {
+    SharedPreferences.setMockInitialValues({});
     final dir = await Directory.systemTemp.createTemp('vault-headers-');
     SecretVault.setTestSupportDir(dir.path);
     SecretVault.setTestKeychain(available: false);
@@ -67,6 +70,39 @@ void main() {
     // 仅校验打码逻辑形状：redacted 常量可用，解密兼容明文。
     expect(WebDavBackup.redacted, '__REDACTED__');
     expect(SecretVault.decryptSync('plain-value'), 'plain-value');
+  });
+
+  test('S4-2 日志脱敏：Basic 认证头整值打码', () {
+    // 复现：键组规则的值字符类遇空白即停，`authorization: Basic xxx` 只
+    // 打码到 "Basic"，base64 凭据原文落盘。修复后整值打码（大小写不敏感）。
+    final out = AppLogger.redactSensitiveText(
+      'authorization: Basic dXNlcjpwYXNzd29yZA==',
+    );
+    // 凭据原文不落盘；"Basic xxx" 整值先后被整值/键组规则打码。
+    expect(out, isNot(contains('dXNlcjpwYXNzd29yZA==')));
+    expect(out, isNot(contains('Basic dXNl')));
+    expect(out, contains('authorization:'));
+    expect(out, contains('<redacted>'));
+    // 小写/紧凑空白形态同口径。
+    final out2 = AppLogger.redactSensitiveText(
+      'authorization:basic QWxhZGRpbjpvcGVuIHNlc2Ft',
+    );
+    expect(out2, isNot(contains('QWxhZGRpbjpvcGVuIHNlc2Ft')));
+  });
+
+  test('S4-2 日志脱敏：JSON 引号形态键值对打码', () {
+    // 复现：`"api_key":"v"` 键后是引号，键组规则（键后紧跟 [=:]，值字符
+    // 类排除引号）不命中，非 sk-/Bearer 的 JSON 串形态密钥泄漏。
+    final out = AppLogger.redactSensitiveText(
+      '{"api_key":"supersecret123","note":"keep"}',
+    );
+    expect(out, isNot(contains('supersecret123')));
+    expect(out, contains('"note":"keep"'));
+    // authorization JSON 形态同口径。
+    final out2 = AppLogger.redactSensitiveText(
+      '{"authorization":"Bearer abcdefgh1234"}',
+    );
+    expect(out2, isNot(contains('abcdefgh1234')));
   });
 
   group('R1-10 MCP stdio 毒配置门禁', () {
@@ -421,5 +457,34 @@ void main() {
       'env': {'K': 'enc:v5:a:b:c'},
     });
     expect((out['env'] as Map)['K'], 'enc:v5:a:b:c');
+  });
+
+  test('F2 行为：日志脱敏覆盖裸写 secret 类键', () {
+    for (final raw in const [
+      'login failed client_secret=c3VwZXJzZWNyZXQ=',
+      'private_key: -----BEGIN',
+      'access_key=AKIAEXAMPLEVALUE',
+      'secret_key=abc123def',
+      'app_secret = supersecretvalue',
+    ]) {
+      final out = AppLogger.redactSensitiveText(raw);
+      expect(out, contains('<redacted>'), reason: '脱敏命中：$raw');
+      expect(out, isNot(contains('c3VwZXJzZWNyZXQ=')));
+      expect(out, isNot(contains('supersecretvalue')));
+      expect(out, isNot(contains('abc123def')));
+    }
+    // 既有口径不回归：token/password/api_key/Bearer 仍打码。
+    for (final raw in const [
+      'token=abc123',
+      'password: hunter2',
+      'api-key=sk-xxxxx',
+      'Authorization: Bearer abc.def.ghi',
+    ]) {
+      expect(AppLogger.redactSensitiveText(raw), contains('<redacted>'),
+          reason: '既有键组规则回归：$raw');
+    }
+    // 无密钥文本不被误伤。
+    expect(AppLogger.redactSensitiveText('normal log line'),
+        'normal log line');
   });
 }

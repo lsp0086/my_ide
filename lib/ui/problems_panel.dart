@@ -202,9 +202,10 @@ class _ProblemTile extends StatelessWidget {
   static Color _severityColor(DiagnosticSeverity s, IdeColors colors) {
     switch (s) {
       case DiagnosticSeverity.error:
-        return const Color(0xFFE35D6A);
+        // E14：语义状态色随亮暗主题切换。
+        return colors.statusError;
       case DiagnosticSeverity.warning:
-        return const Color(0xFFE3A008);
+        return colors.statusWarn;
       case DiagnosticSeverity.info:
         return colors.accent;
       case DiagnosticSeverity.hint:

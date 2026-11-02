@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:my_ide/ai/agent_runner.dart';
 import 'package:my_ide/ai/chat_store.dart';
+import 'package:my_ide/ai/rules_hooks.dart';
 import 'package:my_ide/version/checkpoint_store.dart';
 import 'package:my_ide/workspace/workspace_controller.dart';
 import 'package:path/path.dart' as p;
@@ -266,30 +267,23 @@ void main() {
     });
 
     test('无规则文件时返回空', () async {
-      expect(await loadProjectRules(root.path), isEmpty);
-      expect(await loadProjectRules(null), isEmpty);
+      // A22：旧名 loadProjectRules 已删，改走 rules_hooks.loadRules。
+      expect(await loadRules(root.path), isEmpty);
+      expect(await loadRules(null), isEmpty);
     });
 
     test('读取工作区根目录 AGENTS.md 并截断超长内容', () async {
       await File(p.join(root.path, 'AGENTS.md'))
           .writeAsString('对话期间禁止新建文件，优先编辑已有文件。');
-      final rules = await loadProjectRules(root.path);
+      final rules = await loadRules(root.path);
       expect(rules, contains('禁止新建文件'));
 
       // 超长规则截断保护。
       await File(p.join(root.path, 'AGENTS.md'))
           .writeAsString('x' * 9000);
-      final truncated = await loadProjectRules(root.path);
+      final truncated = await loadRules(root.path);
       expect(truncated.length, lessThan(8300));
       expect(truncated, contains('已截断'));
-    });
-  });
-
-  group('R15R10 agent恢复钳制', () {
-    test('R15R10 agent恢复钳制纯函数口径', () {
-      // 恢复钳制与 fromJson 钳制同源：超限即 clamp。
-      expect(999999.clamp(1, 200), 200);
-      expect(0.clamp(1, 200), 1);
     });
   });
 

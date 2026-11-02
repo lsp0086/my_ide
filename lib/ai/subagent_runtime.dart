@@ -7,21 +7,23 @@ import 'agent_tools.dart';
 import 'command_process_manager.dart';
 import 'context_compactor.dart';
 import 'provider_config.dart';
+// R1-6：复用 Registry 层参数校验纯函数（ToolArgs.validate），
+// 子 Agent 执行侧与主循环同口径钳制。
+import 'tool_registry.dart' show ToolArgs;
 
 /// 子 Agent 独立运行时：只读调研，独立 client / 取消标记 / 上下文。
 /// 不再与主 Runner 共享 _currentTool / _cancelRequested，避免状态交错。
 /// depth 固定为 1：只读工具集天然不含 spawn_subagent，不可再套娃。
 class SubAgentProgress {
-  SubAgentProgress({required this.task, this.step = '', this.tool = ''});
+  SubAgentProgress({required this.task, this.step = ''});
 
   /// 子 Agent 任务描述（spawn 时的 task）。
   final String task;
 
-  /// 当前步文本摘要（最近一条 content/工具名）。
+  /// 当前步文本摘要（最近一条 content/工具名，格式 "toolName path"）。
+  /// R-PROG-TOOL：原 tool 字段与 step 文本重复且全库无消费，已删除——
+  /// UI 嵌套行直接展示 step 即可见正在用的工具。
   final String step;
-
-  /// 正在执行的只读工具名，可空。
-  final String tool;
 }
 
 class SubagentRuntime {
@@ -31,14 +33,35 @@ class SubagentRuntime {
     this.timeoutSeconds = 60,
     this.tokenBudget = defaultTokenBudget,
     this.ownerSessionId = '',
+    // G4-R2：本运行时所处的派生深度（主循环直派=1）。默认 1：达到
+    // maxSubagentSpawnDepth 上限后 _runInner 工具门拒绝 spawn_subagent。
+    this.spawnDepth = 1,
   }) : _client = client ?? AgentClient();
 
   /// 默认 token 预算：父循环 spawn 前按此值预占，防止并行超支。
   static const int defaultTokenBudget = 20000;
 
+  /// G4-R2：spawn_subagent 嵌套深度上限（默认 1：子 Agent 不得再派生）。
+  /// 子 Agent 的 spawn 入口是 _runInner 工具门（子 Agent 经 AgentTools.execute
+  /// 调 spawn_subagent 本就被「需经 Runner 调度」挡住，且 schema 供给层已滤除；
+  /// 此处在执行门再显式拦截）：调用方 spawnDepth 达上限即直接拒绝并返回明确
+  /// 错误信息，不进审批（子 Agent 无审批通道）。可配置：放宽上限需同步让
+  /// Registry 侧按 depth 派生更深层运行时，当前生产恒为默认值。
+  static int maxSubagentSpawnDepth = 1;
+
+  /// G4-R2：异步子 Agent 时长上限——Runner 侧 spawn_subagent(async:true)
+  /// 看门狗，任务超过该时长即 requestCancel 并以「超限终止」失败占位入池，
+  /// pending/归属与正常完成同口径清理（poll_task 返回失败态不谎报运行中）。
+  /// token 预算上限由运行时自身 tokenBudget 熔断承担，此处只补时长维度。
+  static Duration asyncSubagentMaxDuration = const Duration(minutes: 10);
+
   final AgentClient _client;
   final int maxSteps;
   final String ownerSessionId;
+
+  /// G4-R2：本运行时的派生深度（主循环直派=1）。与
+  /// maxSubagentSpawnDepth 配合实现嵌套上限守卫。
+  final int spawnDepth;
 
   /// 全程超时兜底（秒），默认 60。
   final int timeoutSeconds;
@@ -46,6 +69,12 @@ class SubagentRuntime {
   /// token 预算，默认 20000；超预算即截断返回已有摘要。
   final int tokenBudget;
   bool _cancelRequested = false;
+
+  /// R18-05：孤儿强制释放总上限（秒）——超时后 5s 收敛等待再加这么久，
+  /// 孤儿（MCP hang 等无取消句柄场景）仍不退出即按 ownerSessionId 强制
+  /// 兜底释放，防 whenComplete 兜底在孤儿永不完成时永不执行、子 Agent
+  /// 私有终端仓/后台任务句柄永久泄漏。生产默认 30s，测试可调小。
+  int orphanGraceSeconds = 30;
 
   /// R1-1：取消态可见——onAbandon空id回退文本匹配时调用方需跳过已取消实例，
   /// 否则同批同task双spawn单超时全杀。只读暴露，不破坏封装。
@@ -65,7 +94,11 @@ class SubagentRuntime {
     try {
       // 按归属会话中断：子 Agent 自带独立 client，abort 只标本会话，
       // 不关闭共享连接（主 Runner 的 AgentClient 与此独立，无串扰）。
-      _client.abort(sessionId: ownerSessionId);
+      // R-SUBCANCEL：空 ownerSessionId 会命中 AgentClient 全局 abort 分支，
+      // 污染所有并行会话的在途流——旧测试/异常路径可能传空，此处跳过。
+      if (ownerSessionId.isNotEmpty) {
+        _client.abort(sessionId: ownerSessionId);
+      }
     } catch (_) {}
     // 取消传播到在途 search_text：底层 isolate 不再跑到自然结束。
     try {
@@ -93,10 +126,19 @@ class SubagentRuntime {
     CommandProcessManager? processManager,
     List<String> todos = const [],
     // R7-S1：plan/research 承接——plan 只出方案不落 diff。
+    // B1-3：architect 同属只规划模式（Aider architect/editor 分层口径）——
+    // mode='architect' 或 task 以 'architect:' 前缀触发，见
+    // normalizeSubagentModeForTest；执行期仍由主循环走现行审批。
     String mode = 'research',
   }) async {
+    // A4：持有 _runInner Future——超时后孤儿仍在途（abort 感知需数秒），
+    // finally 立即 disposeTools 会与孤儿在途 tools.execute/流读取构成
+    // use-after-dispose 竞态（杀掉的终端/搜索句柄可能被孤儿复用）。
+    Future<AgentToolResult>? inner;
+    // R-ORPHAN-DISPOSE：超时且孤儿未收敛时置位，finally 让路。
+    var orphanUnconverged = false;
     try {
-      return await _runInner(
+      final fut = _runInner(
         task: task,
         files: files,
         provider: provider,
@@ -107,11 +149,50 @@ class SubagentRuntime {
         processManager: processManager,
         todos: todos,
         mode: mode,
-      ).timeout(Duration(seconds: timeoutSeconds.clamp(5, 600)));
+      );
+      inner = fut;
+      return await fut.timeout(Duration(seconds: timeoutSeconds.clamp(5, 600)));
     } on TimeoutException {
       // 超时即 abort：此前只返回截断结果，后台流式请求继续烧 token 直到服务端结束。
       // 记账保留：超时前已烧 prompt/completion 不丢，否则父循环预算低估。
       requestCancel();
+      // A4：先等孤儿 _runInner 感知取消退出（5s 上限防挂死）再释放工具。
+      final orphan = inner;
+      if (orphan != null) {
+        try {
+          await orphan.timeout(const Duration(seconds: 5));
+        } catch (_) {
+          // R-ORPHAN-DISPOSE：区分"孤儿已收敛"与"孤儿仍在途"——后者
+          // 立即 disposeTools 会让其对已释放终端/句柄继续 execute
+          // （use-after-dispose）。未收敛时把本次调用的释放责任
+          // 转挂到孤儿自身完成点：既不提前释放，也不无限泄漏。
+          orphanUnconverged = true;
+          unawaited(orphan.whenComplete(disposeTools));
+          // R18-05：孤儿收敛总上限——whenComplete 兜底依赖孤儿自然完成，
+          // 孤儿永不完成（MCP hang 等无取消句柄场景）时 disposeTools 永不
+          // 执行，私有终端仓/后台任务句柄永久泄漏。现对强制释放设总上限：
+          // 5s 宽限后再等 orphanGraceSeconds 仍不收敛，即由本类按
+          // ownerSessionId 强制兜底释放（disposeTools 幂等：孤儿后续完成时
+          // 二次调用 no-op；潜在 use-after-dispose 风险由总上限显式兜底，
+          // 优于无限泄漏）。
+          final grace = Duration(seconds: orphanGraceSeconds.clamp(1, 600));
+          unawaited(
+            Future<void>.delayed(grace)
+                .then((_) => disposeTools())
+                .catchError((_) {}),
+          );
+        }
+      }
+      if (orphanUnconverged) {
+        return AgentToolResult(
+          ok: false,
+          output: '子 Agent 超时（${timeoutSeconds}s）已截断；取消未在 5s 内收敛，'
+              '工具释放延迟至后台孤儿退出（期间勿复用本会话终端）',
+          touchedFiles: const [],
+          promptTokens: _lastPromptTokens,
+          completionTokens: _lastCompletionTokens,
+        );
+      }
       return AgentToolResult(
         ok: false,
         output: '子 Agent 超时（${timeoutSeconds}s）已截断',
@@ -123,7 +204,11 @@ class SubagentRuntime {
     } finally {
       // 超时/正常/取消任一路径都释放：此前 dispose 只关 client，
       // AgentTools 的后台任务/终端每 spawn 泄漏一套。
-      await disposeTools();
+      // R-ORPHAN-DISPOSE：孤儿未收敛的超时路径跳过——释放责任已由
+      // 上述返回说明移交孤儿 finally，此处抢先释放即 use-after-dispose。
+      if (!orphanUnconverged) {
+        await disposeTools();
+      }
     }
   }
 
@@ -168,16 +253,30 @@ class SubagentRuntime {
     'browser_download_dir',
     'browser_wait',
     'browser_wait_network_idle',
+    'browser_pdf',
     'browser_go_back',
     'browser_stop_loading',
     'browser_viewport',
     'browser_user_agent',
     'browser_close_target',
     'browser_frames',
+    // computer-use 本机操控同样禁：子 Agent 走 AgentTools.execute 直接执行，
+    // 不支持 computer_*（它们由 ToolRegistry 经 AgentComputerTools 调度），
+    // 避免“未知工具”空转；与 browser_ 前缀兜底同口径显式补齐可审计。
+    'computer_screenshot',
+    'computer_click',
+    'computer_move',
+    'computer_drag',
+    'computer_scroll',
+    'computer_press',
+    'computer_type',
+    'computer_open',
   };
 
   static bool isBlockedForTest(String name) =>
-      blockedTools.contains(name) || name.startsWith('browser_');
+      blockedTools.contains(name) ||
+      name.startsWith('browser_') ||
+      name.startsWith('computer_');
 
   /// R7-02 子 Agent 允许集纯函数（测试可见）：readOnly - blocked - allowedTools
   /// 交集三层收紧。此前收紧逻辑散在 _runInner 内联，口径漂移不可测。
@@ -194,12 +293,32 @@ class SubagentRuntime {
     return out;
   }
 
-  /// R4-执行判据（测试可见）：blocked枚举或browser_前缀一律拒，
-  /// 新增browser_*无需改枚举。
+  /// R4-执行判据（测试可见）：blocked枚举或browser_/computer_前缀一律拒，
+  /// 新增browser_*/computer_*无需改枚举。
   static bool isDeniedForTest(String name, {Set<String>? allowedTools}) {
-    if (blockedTools.contains(name) || name.startsWith('browser_')) return true;
+    if (blockedTools.contains(name) ||
+        name.startsWith('browser_') ||
+        name.startsWith('computer_')) {
+      return true;
+    }
     if (allowedTools != null && !allowedTools.contains(name)) return true;
     return false;
+  }
+
+  /// B1-3（测试可见）：architect→executor 分层的模式归一纯函数。
+  /// 触发口径（Aider architect/editor 分层）：mode 显式传 'architect'，
+  /// 或 task 以 'architect:' 前缀——两种入口都归一到 architect 模式：
+  /// 子 Agent 只做规划（分步执行方案+涉及文件+风险点），工具快照只含
+  /// 只读工具，写入仍由主循环（executor）走现行审批执行。
+  /// 只读派生底线不变：architect/plan 均不落 diff，research 维持原行为。
+  static String normalizeSubagentModeForTest(String mode, String task) {
+    final m = mode.trim().toLowerCase();
+    if (m == 'architect' ||
+        task.trim().toLowerCase().startsWith('architect:')) {
+      return 'architect';
+    }
+    if (m == 'plan') return 'plan';
+    return 'research';
   }
 
   /// R5-占位有界纯函数（测试可见）：未预载文件最多列5个+溢出单行，
@@ -249,6 +368,9 @@ class SubagentRuntime {
     List<String> todos = const [],
     String mode = 'research',
   }) async {
+    // B1-3：architect→executor 分层归一口径——mode='architect' 或 task
+    // 以 'architect:' 前缀均归一为 architect（与 Registry 侧 spawn case 同口径）。
+    final effectiveMode = normalizeSubagentModeForTest(mode, task);
     if (maxRetries != null) _client.maxRetries = maxRetries;
     // 复用父循环的 processManager：子 Agent 的后台任务/终端挂同一管理器，
     // 父循环 cancelCommands 时统一终止；外部未注入时才新建并记入 _tools 待释放。
@@ -284,14 +406,39 @@ class SubagentRuntime {
           })
           .toList(growable: false);
     }
+    // B1-3：architect 工具快照显式收口到只读集合——schema 源本就是
+    // readOnly()，此处按 readOnlyNames 与 blockedTools 再收一层（纵深
+    // 防御）：即便将来 readOnly() 混入写工具 schema、或 allowedTools
+    // 白名单含写工具名，architect 请求体的 tools 也绝不出现 edit/write
+    // 类工具（任务清单 B1-3 安全校验的单测断言点）。
+    if (effectiveMode == 'architect') {
+      readOnlySchemas = readOnlySchemas
+          .where((t) {
+            final fn = t['function'] as Map<String, dynamic>?;
+            final name = '${fn?['name'] ?? ''}';
+            return AgentToolSchemas.isReadOnly(name) &&
+                !blockedTools.contains(name);
+          })
+          .toList(growable: false);
+    }
     var context = '你是子 Agent，只做只读调研并返回摘要，不要写文件。\n';
     var preloadToolTokens = 0;
     context += '你不能再派生子 Agent（无 spawn_subagent 工具）。\n';
     // R7-S1：plan 模式只出方案不落 diff——此前 mode 仅参数校验，
     // plan/research 同行为空转。现 plan 加方案前缀约束，主循环审后执行。
-    if (mode.trim() == 'plan') {
+    if (effectiveMode == 'plan') {
       context +=
           '当前为 plan 模式：只输出分步方案与涉及文件，不做任何写入假设，主循环审核后才会执行。\n';
+    }
+    // B1-3：architect 模式（Aider architect/editor 分层口径）——mode=
+    // 'architect' 或 task 以 'architect:' 前缀触发（归一见
+    // normalizeSubagentModeForTest）。子 Agent 只做规划：产出分步执行
+    // 方案（含涉及文件与风险点），不调用任何写工具；执行由主循环
+    // （executor）审核方案后走现行审批落地，本层不落 diff。
+    if (effectiveMode == 'architect') {
+      context +=
+          '当前为 architect 模式：你只负责产出分步执行方案（含涉及文件与风险点），'
+          '不要调用任何写工具；主循环审核你的方案后才会执行写入。\n';
     }
     // 并行隔离声明：同批多个子 Agent 共享同一工作区读视图、无 worktree 隔离，
     // 不要假设其它并发子任务的输出已落盘；只读各自 files 范围，避免结论互相覆盖。
@@ -343,11 +490,17 @@ class SubagentRuntime {
         _lastPromptTokens = TokenEstimator.estimate(context + task) +
             preloadToolTokens;
         _lastCompletionTokens ??= 0;
-        final r = await tools.execute(
-          'read_file',
-          preloadArgs,
-          sessionId: ownerSessionId,
-        );
+        // R-PRELOAD-TIMEOUT：单文件预载 10s 上限——任一 read_file hang
+        // 此前会吃满子代理 60s 全程，与主循环只读熔断同口径。
+        final AgentToolResult r;
+        try {
+          r = await tools
+              .execute('read_file', preloadArgs, sessionId: ownerSessionId)
+              .timeout(const Duration(seconds: 10));
+        } on TimeoutException {
+          context += '\n--- $f ---\n（文件 $f 预载超时(10s)，已跳过）\n';
+          continue;
+        }
         if (!r.ok) {
           final note = '（文件 $f 预载失败：${r.output}）';
           context += '\n--- $f ---\n$note\n';
@@ -436,6 +589,34 @@ class SubagentRuntime {
       steps++;
       keepGoing = false;
       lastStepHadToolCalls = false;
+      // B5：子Agent 独立压缩（zed #64135 口径）——长派生任务此前无压缩，
+      // 先于父任务爆上下文，budgetHit 即整任务作废。现步进循环接入压缩
+      // 触发（模型上下文阈值 shouldCompact 或自有预算 80%）：清旧工具结果
+      // 占位（保留最近2条）+ 保尾截断（从最靠后 user 消息起保留后缀，
+      // tool_calls/tool 成对完整），裁剪后重算预算继续执行。
+      if (steps > 1) {
+        final subCompactor = ContextCompactor(client: _client);
+        final modelCtxTrigger = subCompactor.shouldCompact(
+          messages: messages,
+          model: model,
+        );
+        final budgetTrigger = usedTokens >= tokenBudget * 0.8;
+        if (modelCtxTrigger || budgetTrigger) {
+          ContextCompactor.clearOldToolResults(messages, keepRecent: 2);
+          var cut = 1;
+          for (var i = messages.length - 1; i >= 1; i--) {
+            if ('${messages[i]['role']}' == 'user') {
+              cut = i;
+              break;
+            }
+          }
+          if (cut > 1) messages.removeRange(1, cut);
+          usedTokens = TokenEstimator.estimateMessages(messages) +
+              completionTokens;
+          toolOutputTokens = 0;
+          budgetHit = usedTokens >= tokenBudget;
+        }
+      }
       _lastPromptTokens = promptTokens;
       _lastCompletionTokens = completionTokens;
       // 实时动态推送：每步开始报一次，UI 嵌套显示子 Agent 在干什么。
@@ -502,7 +683,6 @@ class SubagentRuntime {
               SubAgentProgress(
                 task: task,
                 step: '$toolName ${toolArgs['path'] ?? ''}'.trim(),
-                tool: toolName,
               ),
             );
           } catch (_) {}
@@ -510,10 +690,23 @@ class SubagentRuntime {
           if (budgetHit) break;
           if (!AgentToolSchemas.isReadOnly(toolName) ||
               subagentBlocked.contains(toolName) ||
-              // R4-同allowedForTest：browser_前缀一律拒，新增无需改枚举。
+              // G4-R2：嵌套派生守卫——子 Agent（spawnDepth 已达上限）内再
+              // spawn 直接拒绝并返回明确错误，不进审批（子 Agent 无审批
+              // 通道；独立于 isReadOnly 判定，防止将来只读集误纳 spawn）。
+              (toolName == 'spawn_subagent' &&
+                  spawnDepth >= maxSubagentSpawnDepth) ||
+              // R4-同allowedForTest：browser_/computer_前缀一律拒，新增无需改枚举。
               toolName.startsWith('browser_') ||
+              toolName.startsWith('computer_') ||
               (allowedTools != null && !allowedTools.contains(toolName))) {
-            const denied = '子 Agent 仅允许只读工具，已拒绝。';
+            // G4-R2：spawn 深度超限给专属明确报错（含当前深度与上限），
+            // 其余维持原只读拒绝文案。
+            final denied =
+                toolName == 'spawn_subagent' &&
+                    spawnDepth >= maxSubagentSpawnDepth
+                ? '子 Agent 嵌套深度已达上限（$spawnDepth/$maxSubagentSpawnDepth）：'
+                    '不得再派生子 Agent，请直接用只读工具完成本任务。'
+                : '子 Agent 仅允许只读工具，已拒绝。';
             final deniedResult = clipToBudget(denied);
             addTokens(deniedResult);
             // 拒工具同样先补 assistant tool_calls 再补 tool：
@@ -543,6 +736,40 @@ class SubagentRuntime {
             keepGoing = !budgetHit;
             continue;
           }
+          // R1-6：执行前先过 ToolArgs.validate——此前子 Agent 直连
+          // AgentTools，绕过挂在 ToolRegistry.executeWithGuards 的
+          // 参数校验（read_file limit/offset、search maxResults 上限等），
+          // 幻觉 limit=999999 直透执行层。校验失败按拒绝口径回填不发起执行。
+          final checkedArgs = ToolArgs.validate(toolName, toolArgs);
+          if (!checkedArgs.ok) {
+            final deniedResult = clipToBudget(checkedArgs.error);
+            addTokens(deniedResult);
+            messages.add(<String, dynamic>{
+              'role': 'assistant',
+              'content': stepContent.toString(),
+              'tool_calls': <Map<String, dynamic>>[
+                <String, dynamic>{
+                  'id': toolCall.id,
+                  'type': 'function',
+                  'function': <String, dynamic>{
+                    'name': toolName,
+                    'arguments': argumentsJson,
+                  },
+                },
+              ],
+            });
+            stepContent.clear();
+            messages.add({
+              'role': 'tool',
+              'tool_call_id': toolCall.id,
+              'name': toolName,
+              'content': deniedResult,
+            });
+            keepGoing = !budgetHit;
+            continue;
+          }
+          final effectiveToolArgs =
+              Map<String, dynamic>.from(checkedArgs.args);
           // 单工具超时熔断：search isolate / MCP hang 时此前只能等外层
           // timeoutSeconds（默认 60s），取消感知延迟整整一轮。
           // 取消感知：await 工具期间 _cancelRequested 到达即不等满 30s，
@@ -556,7 +783,7 @@ class SubagentRuntime {
             // 此前 tools.execute 省 sessionId，终端挂空会话致父清理分叉泄漏。
             final fut = tools.execute(
               toolName,
-              toolArgs,
+              effectiveToolArgs,
               sessionId: ownerSessionId,
             );
             var elapsed = 0;
@@ -704,13 +931,21 @@ class SubagentRuntime {
 
   void dispose() => _client.dispose();
 
+  /// R18-05（测试可见）：disposeTools 实际执行次数——超时孤儿强制兜底
+  /// 释放是否真实跑到的验活指针。
+  int disposeToolsCallsForTest = 0;
+
   /// 释放自建的 AgentTools 私有终端仓与后台任务：_tools 每次新建（私有仓），
   /// 复用父管理器也必须释放，否则每 spawn 泄漏一个终端仓；
   /// disposeBackgroundTasks 只动自有仓/任务，不释放共享 _processManager。
   /// 第5轮N5：按 ownerSessionId 传参——此前传 null 走"全局兜底全清"分支，
   /// 隔离靠实例边界而非参数边界，实例一旦共享即全清他会话终端/后台任务。
   /// 现非空只杀本会话，父循环常驻终端保留；空会话仍传 null 兼容旧路径。
+  ///
+  /// R18-05（测试可见）：[disposeToolsCallsForTest] 计实际执行次数——
+  /// 孤儿强制兜底释放验活（幂等：_tools 已摘时二次调用直接返回）。
   Future<void> disposeTools() async {
+    disposeToolsCallsForTest++;
     final owned = _tools;
     _tools = null;
     if (owned == null) return;

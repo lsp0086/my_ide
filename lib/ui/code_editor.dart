@@ -10,6 +10,8 @@ import 'package:re_highlight/languages/all.dart';
 import 'package:re_highlight/re_highlight.dart';
 
 import '../ai/agent_tools.dart';
+import '../ai/inline_completion_service.dart';
+import '../ai/provider_config.dart' show AiModelOption, AiProviderConfig;
 import '../diagnostics/diagnostics_store.dart';
 import '../diagnostics/ide_diagnostic.dart';
 import '../diagnostics/local_integrity_checker.dart';
@@ -27,6 +29,28 @@ import '../workspace/ide_completion_prompts_builder.dart';
 import '../workspace/workspace_controller.dart';
 import 'code_autocomplete_view.dart';
 import 'highlight_theme_utils.dart';
+import 'inline_ghost_text.dart';
+
+part 'code_editor_merge.dart';
+part 'code_editor_inline.dart';
+part 'code_editor_goto.dart';
+part 'code_editor_diagnostics.dart';
+part 'code_editor_load.dart';
+part 'code_editor_save.dart';
+part 'code_editor_widgets.dart';
+
+/// G-R2-15 纯函数：首个差异行（0-based；无差异返回 -1）。
+/// 按行前缀扫描：两文本逐行比较，第一处不等（或行数超出）即返回该行号。
+@visibleForTesting
+int firstDiffLineForTest(String oldText, String newText) {
+  final a = oldText.split('\n');
+  final b = newText.split('\n');
+  final n = a.length < b.length ? a.length : b.length;
+  for (var i = 0; i < n; i++) {
+    if (a[i] != b[i]) return i;
+  }
+  return a.length == b.length ? -1 : n;
+}
 
 class CodeEditorPane extends StatefulWidget {
   const CodeEditorPane({
@@ -34,11 +58,15 @@ class CodeEditorPane extends StatefulWidget {
     required this.path,
     this.readOnly = false,
     this.onSaved,
+    this.inlineCompletions,
   });
 
   final String path;
   final bool readOnly;
   final Future<void> Function(String path)? onSaved;
+
+  /// E3 测试注入：自定义补全服务（生产默认自建并随 pane 释放）。
+  final InlineCompletionService? inlineCompletions;
 
   @override
   State<CodeEditorPane> createState() => CodeEditorPaneState();
@@ -49,6 +77,8 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
   late final FocusNode _focusNode;
 
   bool _loading = true;
+  // R-LOAD-GEN：_load 代际计数（换 path 重载作废旧续体）。
+  int _loadGen = 0;
   bool _saving = false;
   bool _dirty = false;
   String? _error;
@@ -83,28 +113,53 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
   // 大文件窗口“加载全部”开关：置 true 后下次 _open() 加载整文件，
   // 与 _largeFileEditMode（局部编辑确认）共同构成保存放行条件。
   bool _largeFileExpanded = false;
+  // S5-9：窗口当前行数（2000 步进追加）；到尾/追加中标记供按钮与自动追加用。
+  int _largeFileWindowCount = _largeFileWindowLines;
+  bool _largeFileReachedEnd = false;
+  bool _largeFileAppending = false;
+  Timer? _largeFileAppendDebounce;
   late final CodeFindController _findController;
   bool _wordWrap = false;
   bool _showMinimap = false;
   Timer? _signatureDebounce;
   String? _signatureHint;
 
+  // ——— T38：inline ghost-text 补全 ———
+  /// 当前建议（null/空=无）。只在本 pane 处于编辑态（非只读/大文件窗口
+  /// 未解锁）时才可能非空；`_inlineRequesting` 防并发重复请求。
+  String? _inlineSuggestion;
+  Timer? _inlineDebounce;
+  bool _inlineRequesting = false;
+  late final InlineCompletionService _inlineCompletions;
+  /// 光标几何（编辑器坐标系）：Tab 接受与 ghost 渲染共用同一来源，
+  /// 避免"接受位置"与"展示位置"分叉。
+  Offset? _inlineCursorPoint;
+  double _inlineBaseline = 0;
+
+  /// 测试/内部可见：是否持有建议（用于回归断言）。
+  bool get hasInlineSuggestionForTest =>
+      _inlineSuggestion != null && _inlineSuggestion!.isNotEmpty;
+
+  /// E2/E7 测试钩子：注入建议文本（焦点守卫/接受回归用）。
+  void setInlineSuggestionForTest(String suggestion) =>
+      _setInlineSuggestion(suggestion);
+
+  /// E7 测试钩子：行编辑控制器（小地图缓存刷新回归用）。
+  @visibleForTesting
+  CodeLineEditingController get controllerForTest => _controller;
+
   bool get isDirty => _dirty;
   bool get isSaving => _saving;
   String get path => widget.path;
 
+  /// extension 分域拆分桥接：State.setState 标注 @protected，extension
+  /// 成员调用会触发 invalid_use_of_protected_member；分域 part 统一经
+  /// 此公开入口刷新 UI（与 setState 行为一致）。
+  // ignore: invalid_use_of_protected_member
+  void editorSetState(VoidCallback fn) => setState(fn);
+
   /// 当前加载进编辑器的行数（大文件窗口化时为窗口行数；测试/调试用）。
   int get loadedLineCount => _controller.codeLines.length;
-
-  bool get _gotoModifierPressed {
-    final pressed = HardwareKeyboard.instance.logicalKeysPressed;
-    return pressed.contains(LogicalKeyboardKey.control) ||
-        pressed.contains(LogicalKeyboardKey.controlLeft) ||
-        pressed.contains(LogicalKeyboardKey.controlRight) ||
-        pressed.contains(LogicalKeyboardKey.meta) ||
-        pressed.contains(LogicalKeyboardKey.metaLeft) ||
-        pressed.contains(LogicalKeyboardKey.metaRight);
-  }
 
   @override
   void initState() {
@@ -114,6 +169,8 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
     _controller = CodeLineEditingController(spanBuilder: _gotoSpanBuilder);
     _findController = CodeFindController(_controller);
     _focusNode = FocusNode();
+    // E3：允许测试注入自建服务；生产默认自建（随 pane dispose 释放）。
+    _inlineCompletions = widget.inlineCompletions ?? InlineCompletionService();
 
     _controller.addListener(_onChanged);
     HardwareKeyboard.instance.addHandler(_onHardwareKey);
@@ -138,136 +195,6 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
     }
     _diagnostics = DiagnosticsScope.maybeOf(context);
   }
-
-  void _onWorkspaceChanged() {
-    _syncExternalContent();
-  }
-
-  void _syncExternalContent() {
-    final workspace = _workspace;
-    if (workspace == null) return;
-    final epoch = workspace.contentEpochOf(widget.path);
-    if (epoch == _seenContentEpoch) return;
-    _seenContentEpoch = epoch;
-    if (_loading || _saving) return;
-    // 外部覆盖：干净 tab 才重读磁盘；脏 tab 走冲突抉择，不静默覆盖丢编辑。
-    if (_dirty || (workspace.isDirty(widget.path))) {
-      workspace.markConflict(widget.path);
-      return;
-    }
-    _mergeExternalDisk();
-  }
-
-  /// 干净 tab 的外部合并：以磁盘为准重载，但走 _applyDiskText 保留撤销栈，
-  /// Ctrl+Z 可回到合并前，不直接销毁撤销历史。
-  Future<void> _mergeExternalDisk() async {
-    try {
-      final disk = await _readText(widget.path);
-      if (!mounted) return;
-      _applyDiskText(disk);
-    } catch (_) {
-      if (!mounted) return;
-      _load();
-    }
-  }
-
-  /// 保留撤销栈的磁盘同步：磁盘内容经 controller.text 写入（re_editor 会记一条
-  /// 可撤销记录），_savedContent 同步为磁盘态，dirty 清零但撤销历史保留。
-  void _applyDiskText(String disk) {
-    if (_controller.text == disk) {
-      _savedContent = disk;
-      if (_dirty) {
-        setState(() => _dirty = false);
-        _workspace?.setDirty(widget.path, false);
-      }
-      _workspace?.rememberDiskStamp(widget.path);
-      return;
-    }
-    _savedContent = disk;
-    // 经 setter 写入：re_editor runRevocableOp 会记撤销节点，Ctrl+Z 可回退合并。
-    _controller.text = disk;
-    if (!mounted) return;
-    setState(() => _dirty = false);
-    _workspace?.setDirty(widget.path, false);
-    _workspace?.rememberDiskStamp(widget.path);
-    _scheduleLocalIntegrityCheck(immediate: true);
-  }
-
-  /// 三向合并（冲突选“合并”用）：base=_savedContent，local=当前缓冲，remote=磁盘。
-  /// 未改行用磁盘，本地改过行保留本地并插冲突标记；经 controller.text 一次写入，
-  /// 撤销栈保留，Ctrl+Z 可回到合并前。
-  Future<void> mergeDiskPreservingLocal() async {
-    if (_loading || _saving) return;
-    String disk;
-    try {
-      disk = await _readText(widget.path);
-    } catch (_) {
-      return;
-    }
-    if (!mounted) return;
-    final local = _controller.text;
-    if (local == disk) {
-      _applyDiskText(disk);
-      return;
-    }
-    final merged = _threeWayMerge(
-      base: _savedContent,
-      local: local,
-      remote: disk,
-    );
-    _savedContent = disk;
-    _controller.text = merged;
-    if (!mounted) return;
-    final dirty = merged != disk;
-    setState(() {
-      _dirty = dirty;
-      _gotoHint = dirty ? '已合并外部改动，冲突行已标记，请检查保存' : null;
-    });
-    _workspace?.setDirty(widget.path, dirty);
-    _workspace?.rememberDiskStamp(widget.path);
-    _scheduleLocalIntegrityCheck(immediate: true);
-  }
-
-  /// 行级三向合并：base 与 local 相同的行视为未改，用 remote；否则保留 local。
-  /// 双边都改且不一致时插 <<<<<<< LOCAL / ======= / >>>>>>> DISK 标记，不静默丢任一边。
-  String _threeWayMerge({
-    required String base,
-    required String local,
-    required String remote,
-  }) {
-    final b = base.split('\n');
-    final l = local.split('\n');
-    final r = remote.split('\n');
-    final n = [b.length, l.length, r.length].reduce((a, v) => a > v ? a : v);
-    final out = <String>[];
-    for (var i = 0; i < n; i++) {
-      final bb = i < b.length ? b[i] : null;
-      final ll = i < l.length ? l[i] : null;
-      final rr = i < r.length ? r[i] : null;
-      if (ll == rr) {
-        if (ll != null) out.add(ll);
-        continue;
-      }
-      if (ll == bb) {
-        // 本地未改：用磁盘
-        if (rr != null) out.add(rr);
-        continue;
-      }
-      if (rr == bb) {
-        // 磁盘未改：保留本地
-        if (ll != null) out.add(ll);
-        continue;
-      }
-      // 双边都改且不一致：插冲突标记，两边都保留
-      out.add('<<<<<<< LOCAL');
-      if (ll != null) out.add(ll);
-      out.add('=======');
-      if (rr != null) out.add(rr);
-      out.add('>>>>>>> DISK');
-    }
-    return out.join('\n');
-  }
-
   @override
   void didUpdateWidget(covariant CodeEditorPane oldWidget) {
     super.didUpdateWidget(oldWidget);
@@ -280,431 +207,56 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
       _languageMode = builtinAllLanguages[_language.id];
       _seenContentEpoch = _workspace?.contentEpochOf(widget.path) ?? 0;
       _docVersion = 0;
+      // F11：LSP 版本号同步归零——新文件从版本 1 重新计数，否则沿用旧文件
+      // 的版本号，LSP didChange 增量同步会被服务端判为过期丢弃。
+      _syncLspVersion = 0;
       // 换文件必须重置“加载全部”开关，否则 A 文件点过加载全部后，
       // 打开另一大文件会静默整载（绕过大文件窗口化保护）。
       _largeFileExpanded = false;
+      // R-LARGE-EDIT-RESET：局部编辑态同口径重置——A 文件切“局部编辑”
+      // 后切到 B 大文件，只读开关状态残留（UI 状态错乱）。
+      _largeFileEditMode = false;
       _load();
     }
-  }
-
-  bool _onHardwareKey(KeyEvent event) {
-    final pressed = _gotoModifierPressed;
-    if (pressed != _gotoModifier) {
-      setState(() {
-        _gotoModifier = pressed;
-        if (pressed) {
-          _updateGotoTargetFromSelection();
-        } else {
-          _gotoLine = null;
-          _gotoStart = null;
-          _gotoEnd = null;
-          _gotoHint = null;
-        }
-      });
-    } else if (pressed) {
-      _updateGotoTargetFromSelection();
-    }
-    return false;
-  }
-
-  void _updateGotoTargetFromSelection() {
-    final selection = _controller.selection;
-    _setGotoTarget(selection.extentIndex, selection.extentOffset);
-  }
-
-  void _setGotoTarget(int line, int offset) {
-    if (line < 0 || line >= _controller.codeLines.length) {
-      if (_gotoLine != null) {
-        setState(() {
-          _gotoLine = null;
-          _gotoStart = null;
-          _gotoEnd = null;
-        });
-      }
-      return;
-    }
-    final text = _controller.codeLines[line].text;
-    if (text.isEmpty) {
-      if (_gotoLine != null) {
-        setState(() {
-          _gotoLine = null;
-          _gotoStart = null;
-          _gotoEnd = null;
-        });
-      }
-      return;
-    }
-    final clamped = offset.clamp(0, text.length);
-    final pattern = RegExp(r'[A-Za-z_\$][A-Za-z0-9_\$]*');
-    Match? hit;
-    for (final m in pattern.allMatches(text)) {
-      if (clamped >= m.start && clamped <= m.end) {
-        hit = m;
-        break;
-      }
-    }
-    if (hit == null) {
-      final left = (clamped - 1).clamp(0, text.length);
-      for (final m in pattern.allMatches(text)) {
-        if (left >= m.start && left < m.end) {
-          hit = m;
-          break;
-        }
-      }
-    }
-    if (hit == null) {
-      if (_gotoLine != null) {
-        setState(() {
-          _gotoLine = null;
-          _gotoStart = null;
-          _gotoEnd = null;
-        });
-      }
-      return;
-    }
-    if (_gotoLine == line && _gotoStart == hit.start && _gotoEnd == hit.end) {
-      return;
-    }
-    setState(() {
-      _gotoLine = line;
-      _gotoStart = hit!.start;
-      _gotoEnd = hit.end;
-    });
-  }
-
-  TextSpan _gotoSpanBuilder({
-    required BuildContext context,
-    required int index,
-    required CodeLine codeLine,
-    required TextSpan textSpan,
-    required TextStyle style,
-  }) {
-    // 只给「当前可跳转符号」加下划线，不是全文标识符。
-    if (!_gotoModifier ||
-        _gotoLine != index ||
-        _gotoStart == null ||
-        _gotoEnd == null) {
-      return textSpan;
-    }
-    final start = _gotoStart!;
-    final end = _gotoEnd!;
-    final accent = IdeColors.of(context).accent;
-
-    InlineSpan decorate(InlineSpan node, int base) {
-      if (node is! TextSpan) return node;
-      if (node.children != null && node.children!.isNotEmpty) {
-        var cursor = base;
-        final kids = <InlineSpan>[];
-        for (final child in node.children!) {
-          final len = _spanLength(child);
-          kids.add(decorate(child, cursor));
-          cursor += len;
-        }
-        return TextSpan(style: node.style, children: kids);
-      }
-      final text = node.text ?? '';
-      if (text.isEmpty) return node;
-      final nodeStart = base;
-      final nodeEnd = base + text.length;
-      if (end <= nodeStart || start >= nodeEnd) {
-        return TextSpan(text: text, style: node.style ?? style);
-      }
-      final localStart = (start - nodeStart).clamp(0, text.length);
-      final localEnd = (end - nodeStart).clamp(0, text.length);
-      if (localStart >= localEnd) {
-        return TextSpan(text: text, style: node.style ?? style);
-      }
-      final children = <InlineSpan>[];
-      if (localStart > 0) {
-        children.add(
-          TextSpan(
-            text: text.substring(0, localStart),
-            style: node.style ?? style,
-          ),
-        );
-      }
-      children.add(
-        TextSpan(
-          text: text.substring(localStart, localEnd),
-          style: (node.style ?? style).copyWith(
-            decoration: TextDecoration.underline,
-            decorationColor: accent,
-            color: accent,
-          ),
-        ),
-      );
-      if (localEnd < text.length) {
-        children.add(
-          TextSpan(text: text.substring(localEnd), style: node.style ?? style),
-        );
-      }
-      return TextSpan(style: node.style, children: children);
-    }
-
-    final painted = decorate(textSpan, 0);
-    return painted is TextSpan ? painted : TextSpan(children: [painted]);
-  }
-
-  int _spanLength(InlineSpan span) {
-    if (span is! TextSpan) return 0;
-    if (span.text != null) return span.text!.length;
-    var n = 0;
-    for (final c in span.children ?? const <InlineSpan>[]) {
-      n += _spanLength(c);
-    }
-    return n;
-  }
-
-  Future<void> jumpToDefinitionAtCursor({int? line, int? character}) async {
-    final workspace = WorkspaceScope.maybeOf(context);
-    final root = workspace?.rootPath;
-    if (root == null) {
-      setState(() => _gotoHint = '请先打开项目');
-      return;
-    }
-    if (_controller.codeLines.isEmpty) {
-      setState(() => _gotoHint = '空文件无法跳转');
-      return;
-    }
-
-    final selection = _controller.selection;
-    final maxLine = _controller.codeLines.length - 1;
-    final useLine = (line ?? _gotoLine ?? selection.extentIndex).clamp(
-      0,
-      maxLine,
-    );
-    final lineText = _controller.codeLines[useLine].text;
-    final useChar =
-        (character ??
-                ((_gotoStart != null && _gotoEnd != null)
-                    ? ((_gotoStart! + _gotoEnd!) ~/ 2)
-                    : selection.extentOffset))
-            .clamp(0, lineText.length);
-    final symbol =
-        (_gotoStart != null &&
-            _gotoEnd != null &&
-            _gotoLine == useLine &&
-            _gotoStart! < lineText.length &&
-            _gotoEnd! <= lineText.length)
-        ? lineText.substring(_gotoStart!, _gotoEnd!)
-        : BuiltinDefinition.identifierAt(lineText, useChar);
-    if (symbol == null || symbol.isEmpty) {
-      setState(() => _gotoHint = '未选中可跳转符号');
-      return;
-    }
-
-    setState(() => _gotoHint = '查找中…');
-    try {
-      // 点在定义本体 → 反向引用；否则 → 跳定义
-      final onDefinition =
-          SymbolIndex.instance.definitionAt(
-            filePath: widget.path,
-            name: symbol,
-            line: useLine,
-          ) !=
-          null;
-      if (onDefinition) {
-        final refs = SymbolIndex.instance.findReferences(
-          name: symbol,
-          currentPath: widget.path,
-          currentLine: useLine,
-        );
-        if (!mounted) return;
-        if (refs.isEmpty) {
-          setState(() => _gotoHint = '「$symbol」暂无引用');
-          return;
-        }
-        if (refs.length == 1) {
-          await _gotoLocation(workspace, refs.first, label: '引用');
-          return;
-        }
-        final chosen = await showDialog<LspLocation>(
-          context: context,
-          builder: (ctx) {
-            final colors = IdeColors.of(ctx);
-            final rootPath = root;
-            return AlertDialog(
-              backgroundColor: colors.panel,
-              title: Text(
-                '「$symbol」的引用（${refs.length}）',
-                style: TextStyle(color: colors.textPrimary, fontSize: 15),
-              ),
-              content: SizedBox(
-                width: 420,
-                height: 320,
-                child: ListView.separated(
-                  itemCount: refs.length,
-                  separatorBuilder: (_, _) =>
-                      Divider(height: 1, color: colors.border),
-                  itemBuilder: (context, i) {
-                    final r = refs[i];
-                    final rel = p.isWithin(rootPath, r.filePath)
-                        ? p.relative(r.filePath, from: rootPath)
-                        : r.filePath;
-                    return ListTile(
-                      dense: true,
-                      title: Text(
-                        rel,
-                        style: TextStyle(
-                          color: colors.textPrimary,
-                          fontSize: 12.5,
-                          fontFamily: 'Menlo',
-                        ),
-                      ),
-                      subtitle: Text(
-                        'L${r.line + 1}:${r.character + 1}',
-                        style: TextStyle(
-                          color: colors.textMuted,
-                          fontSize: 11,
-                          fontFamily: 'Menlo',
-                        ),
-                      ),
-                      onTap: () => Navigator.of(ctx).pop(r),
-                    );
-                  },
-                ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.of(ctx).pop(),
-                  child: const Text('取消'),
-                ),
-              ],
-            );
-          },
-        );
-        if (!mounted || chosen == null) {
-          setState(() => _gotoHint = null);
-          return;
-        }
-        await _gotoLocation(workspace, chosen, label: '引用');
-        return;
-      }
-
-      LspLocation? loc;
-      String via = '内置';
-
-      // 1) 优先 LSP（设置里可配命令路径）
-      final settings = SettingsStore.instance;
-      final spec = DefinitionService.instance.specForExtension(
-        p.extension(widget.path).toLowerCase(),
-      );
-      if (spec != null) {
-        final diagnosticsVersion = DiagnosticsScope.maybeOf(
-          context,
-        )?.contentVersionOf(widget.path);
-        final overrideCmd = settings.languageServerCommand(spec.id);
-        final client = await DefinitionService.instance.clientFor(
-          rootPath: root,
-          spec: spec,
-          commandOverride: overrideCmd,
-        );
-        if (!mounted) return;
-        if (client != null) {
-          final lspLang = spec.languageIds.contains(_language.id)
-              ? _language.id
-              : (spec.languageIds.isNotEmpty
-                    ? spec.languageIds.first
-                    : _language.id);
-          client.didChangeIncremental(
-            widget.path,
-            _controller.text,
-            version:
-                diagnosticsVersion ??
-                    _diagnostics?.contentVersionOf(widget.path) ??
-                1,
-            languageId: lspLang,
-          );
-          final locations = await client.definition(
-            filePath: widget.path,
-            line: useLine,
-            character: useChar,
-          );
-          if (locations.isNotEmpty) {
-            loc = locations.first;
-            via = spec.label;
-          }
-        }
-      }
-
-      // 2) 无 LSP / LSP 无结果 → 内置同文件 + 工作区粗搜
-      loc ??= await BuiltinDefinition.find(
-        rootPath: root,
-        currentPath: widget.path,
-        currentSource: _controller.text,
-        symbol: symbol,
-        currentLine: useLine,
-      );
-
-      if (!mounted) return;
-      if (loc == null) {
-        final hint = spec == null
-            ? '未找到「$symbol」定义（内置搜索）'
-            : '未找到「$symbol」定义。可在设置 → 语言服务器 配置 ${spec.label}';
-        setState(() => _gotoHint = hint);
-        return;
-      }
-
-      final sourceLabel = via == '内置'
-          ? (SymbolIndex.instance.symbolCount > 0 ? '内置索引' : '内置规则')
-          : via;
-      await _gotoLocation(workspace, loc, label: sourceLabel);
-    } catch (e) {
-      if (!mounted) return;
-      // LSP 失败时再试内置，避免直接崩
-      try {
-        final fallback = await BuiltinDefinition.find(
-          rootPath: root,
-          currentPath: widget.path,
-          currentSource: _controller.text,
-          symbol: symbol,
-          currentLine: useLine,
-        );
-        if (!mounted) return;
-        if (fallback != null) {
-          await _gotoLocation(workspace, fallback, label: '内置索引');
-          return;
-        }
-      } catch (_) {}
-      if (!mounted) return;
-      setState(() => _gotoHint = '跳转失败：$e');
-    }
-  }
-
-  Future<void> _gotoLocation(
-    WorkspaceController? workspace,
-    LspLocation loc, {
-    required String label,
-  }) async {
-    setState(() => _gotoHint = '已跳转（$label）');
-    workspace?.openFile(loc.filePath);
-    workspace?.revealPosition(loc.filePath, loc.line, loc.character);
-    if (loc.filePath == widget.path) {
-      await _applyRevealIfAny();
-    }
-    Future<void>.delayed(const Duration(seconds: 2), () {
-      if (!mounted) return;
-      if (_gotoHint?.startsWith('已跳转') == true) {
-        setState(() => _gotoHint = null);
-      }
-    });
   }
 
   @override
   void dispose() {
     // 未挂载脏取回：卸载时若脏则暂存内存稿并落侧车，关闭 tab 后仍可取回。
+    // F3：切换项目后本 pane 才被 dispose 时，controller 的 root 已切到新项目——
+    // 此时 stash 会把旧项目稿复活进新项目的内存稿，sidecar 会写进新项目目录。
+    // 仅当文件仍属于当前 root 才暂存；切换场景由 openFolder/closeWorkspace
+    // 清稿前统一 flushUnmountedDrafts 落旧 root 侧车兜底。
     if (_dirty) {
+      var belongsToCurrentRoot = false;
       try {
-        _workspace?.stashDraft(widget.path, _controller.text);
+        final root = _workspace?.rootPath;
+        belongsToCurrentRoot = root != null &&
+            (p.equals(root, widget.path) || p.isWithin(root, widget.path));
       } catch (_) {}
-      try {
-        unawaited(
-          _workspace?.persistDraftSidecar(widget.path, _controller.text),
-        );
-      } catch (_) {}
+      if (belongsToCurrentRoot) {
+        try {
+          _workspace?.stashDraft(widget.path, _controller.text);
+        } catch (_) {}
+        try {
+          unawaited(
+            _workspace?.persistDraftSidecar(widget.path, _controller.text),
+          );
+        } catch (_) {}
+      }
     }
     _signatureDebounce?.cancel();
+    _largeFileAppendDebounce?.cancel();
     _localCheckTimer?.cancel();
+    // T38：补全 debounce 与在途请求一并收——未 cancel 的 debounce 会触发
+    // 已 dispose 的 pane 再发网络请求（Closed client 报错噪声）。
+    _inlineDebounce?.cancel();
+    _inlineCompletions.invalidate();
+    // E3：服务随 pane 释放（取消在途流 + 关闭内部 http client），
+    // 此前无 dispose 路径，client 随 pane 泄漏。
+    try {
+      _inlineCompletions.dispose();
+    } catch (_) {}
     _diagnostics?.clearFile(widget.path);
     _workspace?.removeListener(_onWorkspaceChanged);
     _workspace?.unregisterSaveHandler(widget.path);
@@ -732,559 +284,29 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
     if (_gotoModifier) {
       _updateGotoTargetFromSelection();
     }
+    // T38：文本变化先取消旧建议（内容已变，旧 ghost 无意义），再 debounce
+    // 新请求。选区变化（光标移动/拖选）只重新测量 ghost 位置或撤销建议，
+    // 不重新发请求——否则每按一次方向键都打一次模型。
+    if (_inlineSuggestion != null) {
+      final sel = _controller.selection;
+      if (!sel.isCollapsed) {
+        _dismissInlineSuggestion();
+      } else {
+        _syncInlineCursorPoint();
+        return;
+      }
+    }
+    _scheduleInlineCompletion();
     _scheduleLocalIntegrityCheck();
   }
 
-  void _scheduleLocalIntegrityCheck({bool immediate = false}) {
-    _localCheckTimer?.cancel();
-    if (immediate) {
-      _runLocalIntegrityCheck();
-      return;
-    }
-    _localCheckTimer = Timer(const Duration(milliseconds: 400), () {
-      if (!mounted) return;
-      _runLocalIntegrityCheck();
-    });
-  }
-
-  void _runLocalIntegrityCheck() {
-    final store = _diagnostics ?? DiagnosticsScope.maybeOf(context);
-    if (store == null) return;
-    final version = store.bumpContentVersion(widget.path);
-    _docVersion = version;
-    final text = _controller.text;
-    final issues = LocalIntegrityChecker.analyze(
-      filePath: widget.path,
-      text: text,
-      languageId: _language.id,
-      contentVersion: version,
-    );
-    store.setForFileSource(
-      path: widget.path,
-      source: LocalIntegrityChecker.source,
-      diagnostics: issues,
-      contentVersion: version,
-    );
-    // JS/TS：用已下载的 tsc 做语义检查（consle 等），不依赖 LSP checkJs 通道。
-    _runLocalTscCheck(version: version, text: text);
-    _syncLspDocument(version: version);
-  }
-
-  Future<void> _runLocalTscCheck({
-    required int version,
-    required String text,
-  }) async {
-    if (!LocalTscChecker.supports(_language.id, widget.path)) return;
-    final store = _diagnostics ?? DiagnosticsScope.maybeOf(context);
-    if (store == null) return;
-    final issues = await LocalTscChecker.analyze(
-      filePath: widget.path,
-      text: text,
-      languageId: _language.id,
-      contentVersion: version,
-    );
-    if (!mounted) return;
-    // 文档已继续编辑则丢弃过期结果。
-    if (store.contentVersionOf(widget.path) != version) return;
-    store.setForFileSource(
-      path: widget.path,
-      source: LocalTscChecker.source,
-      diagnostics: issues,
-      contentVersion: version,
-    );
-  }
-
-  Future<bool> _ensureLanguagePackConsent(LanguageServerSpec spec) async {
-    final service = DefinitionService.instance;
-    if (!spec.autoInstall) return true;
-    // 已有二进制 / PATH 覆盖：无需询问。
-    final settings = SettingsStore.instance;
-    final overrideCmd = settings.languageServerCommand(spec.id);
-    if (overrideCmd != null && overrideCmd.trim().isNotEmpty) return true;
-    final present = await BundledLanguageServers.instance.binaryPathIfPresent(
-      spec.id,
-    );
-    if (present != null) return true;
-    // PATH 上已有命令也视为可用，不再下载。
-    final onPath = await service.isAvailable(spec, ensureBundled: false);
-    if (onPath) return true;
-
-    final consent = service.packConsent(spec);
-    if (consent == true) return true;
-    if (consent == false) return false;
-    if (!mounted) return false;
-
-    final consentId = spec.id == 'html-via-ts' ? 'typescript' : spec.id;
-    if (_promptingPackIds.contains(consentId)) return false;
-    _promptingPackIds.add(consentId);
-    try {
-      final ok = await showDialog<bool>(
-        context: context,
-        barrierDismissible: false,
-        builder: (ctx) {
-          final colors = IdeColors.of(ctx);
-          return AlertDialog(
-            backgroundColor: colors.panel,
-            title: Text('下载语言包？', style: TextStyle(color: colors.textPrimary)),
-            content: Text(
-              '检测到 ${spec.label} 尚未安装。\n'
-              '下载后将保存到应用支持目录，用于代码诊断与跳转。\n'
-              '不会修改你的项目文件（不写 jsconfig/tsconfig）。\n\n'
-              '${spec.installHint}',
-              style: TextStyle(color: colors.textMuted, fontSize: 13),
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.of(ctx).pop(false),
-                child: const Text('暂不下载'),
-              ),
-              FilledButton(
-                onPressed: () => Navigator.of(ctx).pop(true),
-                child: const Text('下载'),
-              ),
-            ],
-          );
-        },
-      );
-      await service.setPackConsent(spec, ok == true);
-      if (ok == true && mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('正在下载 ${spec.label}…')));
-        final path = await BundledLanguageServers.instance.ensureInstalled(
-          consentId,
-          force: false,
-        );
-        if (!mounted) return path != null;
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              path != null
-                  ? '${spec.label} 已就绪'
-                  : (BundledLanguageServers.instance.lastErrorFor(consentId) ??
-                        '下载失败'),
-            ),
-          ),
-        );
-        // 下载完成后立刻补跑本地 tsc（首次打开时语言包可能尚未就绪）。
-        if (path != null) {
-          final store = _diagnostics ?? DiagnosticsScope.maybeOf(context);
-          final version = store?.contentVersionOf(widget.path) ?? _docVersion;
-          _runLocalTscCheck(
-            version: version <= 0 ? 1 : version,
-            text: _controller.text,
-          );
-        }
-        return path != null;
-      }
-      return false;
-    } finally {
-      _promptingPackIds.remove(consentId);
-    }
-  }
-
-  Future<void> _syncLspDocument({required int version}) async {
-    final root = _workspace?.rootPath;
-    if (root == null) return;
-    final settings = SettingsStore.instance;
-    final spec = DefinitionService.instance.specForExtension(
-      p.extension(widget.path).toLowerCase(),
-    );
-    if (spec == null) return;
-    final overrideCmd = settings.languageServerCommand(spec.id);
-    // 首次打开：弹窗询问是否下载语言包（Zed 式按需，不预置进安装包）。
-    final allowed = await _ensureLanguagePackConsent(spec);
-    if (!mounted) return;
-    if (!allowed) {
-      final consent = DefinitionService.instance.packConsent(spec);
-      if (consent == false) {
-        final store = _diagnostics ?? DiagnosticsScope.maybeOf(context);
-        store?.setForFileSource(
-          path: widget.path,
-          source: 'lsp:${spec.id}',
-          diagnostics: [
-            IdeDiagnostic(
-              filePath: widget.path,
-              startLine: 0,
-              startChar: 0,
-              endLine: 0,
-              endChar: 1,
-              severity: DiagnosticSeverity.info,
-              message: '已跳过 ${spec.label} 语言包；可在设置中重新下载',
-              source: 'lsp:${spec.id}',
-            ),
-          ],
-          contentVersion: store.contentVersionOf(widget.path),
-        );
-      }
-      return;
-    }
-    final client = await DefinitionService.instance.clientFor(
-      rootPath: root,
-      spec: spec,
-      commandOverride: overrideCmd,
-    );
-    if (client == null) {
-      if (!mounted) return;
-      final err = DefinitionService.instance.lastStartError;
-      if (err != null && err.isNotEmpty) {
-        // 写一条可见诊断，避免「装了但完全没反馈」。
-        // mounted 已守卫后同步取 scope：同一帧内安全，后续回调不再碰 context。
-        final fallbackStore =
-            _diagnostics ?? DiagnosticsScope.maybeOf(context);
-        fallbackStore?.setForFileSource(
-          path: widget.path,
-          source: 'lsp:${spec.id}',
-          diagnostics: [
-            IdeDiagnostic(
-              filePath: widget.path,
-              startLine: 0,
-              startChar: 0,
-              endLine: 0,
-              endChar: 1,
-              severity: DiagnosticSeverity.warning,
-              message: '语言服务未启动：$err',
-              source: 'lsp:${spec.id}',
-            ),
-          ],
-          contentVersion: fallbackStore.contentVersionOf(widget.path),
-        );
-      }
-      return;
-    }
-    if (!mounted) return;
-    final lspLang = spec.languageIds.contains(_language.id)
-        ? _language.id
-        : (spec.languageIds.isNotEmpty ? spec.languageIds.first : _language.id);
-    client.ensureDiagnosticsHandler((path, diagnostics) {
-      final store = _diagnostics;
-      if (store == null) return;
-      // 当前文件：用回调注册时的文档版本写入，迟到包（旧版本回包）由
-      // store 侧丢弃，不再按到达时版本覆盖新编辑后的诊断。
-      // 非当前文件（同 server 多文件）：到达时版本即最新，无需快照。
-      final versionNow = path == widget.path
-          ? _syncLspVersion
-          : store.contentVersionOf(path);
-      final clamped = diagnostics
-          .map(
-            (d) => _clampDiagnostic(
-              d,
-              path == widget.path ? _controller.text : null,
-            ),
-          )
-          .toList(growable: false);
-      store.setForFileSource(
-        path: path,
-        source: 'lsp:${spec.id}',
-        diagnostics: clamped,
-        contentVersion: versionNow,
-      );
-    });
-    // 同步最新文本；若上面安装较慢，用当前文档版本。
-    // mounted 已守卫后同步取值，同一帧内不再跨 async gap。
-    // 快照本次同步版本：诊断回调按此版本写入，迟到包由 store 丢弃。
-    final latestStore = _diagnostics ?? DiagnosticsScope.maybeOf(context);
-    final latestVersion = latestStore?.contentVersionOf(widget.path) ?? version;
-    _syncLspVersion = latestVersion <= 0 ? 1 : latestVersion;
-    client.didChangeIncremental(
-      widget.path,
-      _controller.text,
-      version: latestVersion <= 0 ? 1 : latestVersion,
-      languageId: lspLang,
-    );
-  }
-
-  IdeDiagnostic _clampDiagnostic(IdeDiagnostic d, String? text) {
-    if (text == null || text.isEmpty) return d;
-    final lines = text.split('\n');
-    final maxLine = (lines.length - 1).clamp(0, 1 << 30);
-    final startLine = d.startLine.clamp(0, maxLine);
-    final endLine = d.endLine.clamp(0, maxLine);
-    final startChar = d.startChar.clamp(0, lines[startLine].length);
-    final endChar = d.endChar.clamp(0, lines[endLine].length);
-    if (startLine == d.startLine &&
-        endLine == d.endLine &&
-        startChar == d.startChar &&
-        endChar == d.endChar) {
-      return d;
-    }
-    return d.copyWith(
-      startLine: startLine,
-      startChar: startChar,
-      endLine: endLine,
-      endChar: endChar,
-    );
-  }
-
-  Future<void> _applyRevealIfAny() async {
-    final workspace = WorkspaceScope.maybeOf(context);
-    if (workspace == null) return;
-    final target = workspace.consumeReveal(widget.path);
-    if (target == null) return;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      if (_controller.codeLines.isEmpty) return;
-      final maxLine = _controller.codeLines.length - 1;
-      final line = target.line.clamp(0, maxLine);
-      final text = _controller.codeLines[line].text;
-      final offset = target.character.clamp(0, text.length);
-      _controller.selection = CodeLineSelection.collapsed(
-        index: line,
-        offset: offset,
-      );
-      _controller.makeCursorCenterIfInvisible();
-      _focusNode.requestFocus();
-    });
-  }
-
-  Future<void> _load() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-      _dirty = false;
-      _isLargeFile = false;
-      _largeFileEditMode = false;
-      _gotoLine = null;
-      _gotoStart = null;
-      _gotoEnd = null;
-    });
-
-    try {
-      final stat = await File(widget.path).stat();
-      final isLarge = stat.size > _largeFileBytes;
-      final windowed = isLarge && !_largeFileExpanded;
-      String content;
-      if (windowed) {
-        // 流式只读前 N 行即停，避免超大文件先全量读入内存。
-        try {
-          content = await _readHeadLines(
-            widget.path,
-            _largeFileWindowLines,
-          );
-        } catch (_) {
-          // 非 UTF-8（latin1/UTF-16）等解码失败时退回全量读再截断。
-          final full = await _readText(widget.path);
-          content = full.split('\n').take(_largeFileWindowLines).join('\n');
-        }
-      } else {
-        content = await _readText(widget.path);
-      }
-      if (!mounted) return;
-      // 未挂载脏取回：内存稿优先，其次磁盘侧车，最后才用磁盘内容；大文件窗口化逻辑不动。
-      var effective = content;
-      var restoredDraft = false;
-      final draftWorkspace = WorkspaceScope.maybeOf(context);
-      final memDraft = draftWorkspace?.takeDraft(widget.path);
-      if (memDraft != null) {
-        effective = memDraft;
-        restoredDraft = true;
-      } else {
-        try {
-          final sidecar = await draftWorkspace?.readDraftSidecar(widget.path);
-          if (sidecar != null) {
-            effective = sidecar;
-            restoredDraft = true;
-          }
-        } catch (_) {}
-      }
-      if (!mounted) return;
-      _savedContent = content;
-      _controller.text = effective;
-      setState(() {
-        _loading = false;
-        _dirty = restoredDraft;
-        _isLargeFile = stat.size > _largeFileBytes;
-      });
-      if (isLarge && !_largeFileExpanded && mounted) {
-        setState(() => _gotoHint = '大文件窗口化：仅加载前 $_largeFileWindowLines 行，保存前请先加载全部或确认局部编辑。');
-      }
-      final workspace = WorkspaceScope.maybeOf(context);
-      workspace?.setDirty(widget.path, restoredDraft);
-      workspace?.rememberDiskStamp(widget.path);
-      workspace?.clearOverwriteConfirm(widget.path);
-      _scheduleLocalIntegrityCheck(immediate: true);
-      await _applyRevealIfAny();
-    } catch (error) {
-      if (!mounted) return;
-      setState(() {
-        _loading = false;
-        _error = '$error';
-      });
-    }
-  }
-
-  Future<bool> save() async {
-    if (widget.readOnly || _loading || _error != null || _saving) {
-      return false;
-    }
-    if (_isLargeFile && !_largeFileExpanded) {
-      // R4-A1 窗口态一律禁存：此前局部编辑模式放行保存，doSave 把仅
-      // 2000 行窗口文本覆盖原文件致尾部丢失（对标 Cursor 8MiB 截断丢数据
-      // https://forum.cursor.com/t/agent-strreplace-truncates-files-8-mib-silent-data-loss/166573）。
-      // 现窗口态必须先加载全部，局部编辑键只放行只读浏览不放行保存。
-      if (mounted) {
-        ScaffoldMessenger.maybeOf(context)?.showSnackBar(
-          const SnackBar(content: Text('大文件窗口化：仅加载前2000行，保存会截断丢数据，请先点加载全部')),
-        );
-      }
-      return false;
-    }
-    if (!_dirty) return true;
-
-    // 保存前冲突检测：自动保存/Agent/外部在加载后改过磁盘则转冲突，
-    // 不静默覆盖。手动保存同样走此门禁（此前仅自动保存跳过冲突文件）。
-    final workspace = WorkspaceScope.maybeOf(context);
-    if (workspace != null &&
-        (workspace.hasConflict(widget.path) ||
-            workspace.diskChangedSinceStamp(widget.path))) {
-      workspace.markConflict(widget.path);
-      if (mounted) {
-        ScaffoldMessenger.maybeOf(context)?.showSnackBar(
-          const SnackBar(content: Text('磁盘已被外部修改，已转冲突抉择，不覆盖保存')),
-        );
-      }
-      return false;
-    }
-    // 待覆盖确认：冲突选"保留本地"后下次手动保存前再确认一次。
-    if (workspace != null && workspace.needsOverwriteConfirm(widget.path)) {
-      final ok = await showDialog<bool>(
-        context: context,
-        builder: (ctx) => AlertDialog(
-          title: const Text('覆盖磁盘改动？'),
-          content: const Text('磁盘已有外部改动，上次你选择了保留本地。确定用本地覆盖磁盘吗？'),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(false),
-              child: const Text('取消'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.of(ctx).pop(true),
-              child: const Text('覆盖保存'),
-            ),
-          ],
-        ),
-      );
-      if (ok != true) return false;
-      workspace.clearOverwriteConfirm(widget.path);
-    }
-
-    setState(() => _saving = true);
-    // R3-02：编辑器落盘进 Agent 写链——与 Agent 写同键串行，避免手工保存
-    // 与 Agent 写并发互盖；tmp 唯一随机后缀防同微秒互盖。
-    final saveText = _controller.text;
-    final savePath = widget.path;
-    Future<bool> doSave() async {
-      // 原子写：tmp+flush+rename，避免与 Agent/自动保存并发时半写；
-      // 写后更新磁盘戳，避免外部监听把自写误判为冲突。
-      final target = File(savePath);
-      final rand = DateTime.now().microsecondsSinceEpoch.toRadixString(36);
-      final tmp = File('$savePath.$rand-${saveText.hashCode.toRadixString(36)}.tmp');
-      await tmp.writeAsString(saveText, encoding: utf8, flush: true);
-      try {
-        await tmp.rename(savePath);
-      } catch (_) {
-        await target.writeAsString(saveText, encoding: utf8, flush: true);
-        try {
-          if (await tmp.exists()) await tmp.delete();
-        } catch (_) {}
-      }
-      return true;
-    }
-
-    try {
-      await AgentTools.serializeFileWrites([savePath], doSave);
-      if (!mounted) return true;
-      // R4-07：保存文本一致——用落盘快照 saveText，不用回读 _controller.text，
-      // 保存中击键此前误标已保存致脏检查漏检。
-      _savedContent = saveText;
-      setState(() {
-        _dirty = false;
-        _saving = false;
-      });
-      final workspace = WorkspaceScope.maybeOf(context);
-      workspace?.setDirty(widget.path, false);
-      workspace?.rememberDiskStamp(widget.path);
-      // 保存成功清侧车：内存稿与磁盘稿都不再需要。
-      try {
-        workspace?.takeDraft(widget.path);
-      } catch (_) {}
-      try {
-        // ignore: discarded_futures
-        workspace?.clearDraftSidecar(widget.path);
-      } catch (_) {}
-      // 保存后增量更新符号索引
-      SymbolIndex.instance.reindexFile(widget.path, content: _controller.text);
-      await widget.onSaved?.call(widget.path);
-      return true;
-    } catch (error) {
-      if (!mounted) return false;
-      setState(() => _saving = false);
-      ScaffoldMessenger.maybeOf(
-        context,
-      )?.showSnackBar(SnackBar(content: Text('保存失败：$error')));
-      return false;
-    }
-  }
-
-  void requestFocus() {
-    _focusNode.requestFocus();
-  }
-
-  /// 按需注册当前语言 + 必要子语言（参考 re_highlight：只传需要的 languages）。
-  /// 全量 builtinAllLanguages 会在每次 build 构造巨大 Map，大文件首开明显变慢。
-  Map<String, CodeHighlightThemeMode> _buildHighlightLanguages() {
-    final primary = _language.id;
-    final cached = _cachedHighlightLanguages;
-    if (cached != null && _cachedHighlightLanguageId == primary) {
-      return cached;
-    }
-
-    final languages = <String, CodeHighlightThemeMode>{};
-    void put(String id) {
-      final mode = builtinAllLanguages[id];
-      if (mode == null) return;
-      languages[id] = CodeHighlightThemeMode(mode: mode);
-    }
-
-    put(primary);
-    if (_languageMode != null) {
-      languages[primary] = CodeHighlightThemeMode(mode: _languageMode!);
-    }
-
-    // HTML/XML/Markdown 等含嵌套语言时补上子语言，避免 script/style 发黑
-    switch (primary) {
-      case 'xml':
-      case 'html':
-      case 'vue':
-      case 'svelte':
-        put('javascript');
-        put('typescript');
-        put('css');
-        put('scss');
-        put('xml');
-        break;
-      case 'markdown':
-        put('xml');
-        put('javascript');
-        put('typescript');
-        put('json');
-        put('bash');
-        put('dart');
-        put('python');
-        put('css');
-        break;
-      case 'php':
-        put('xml');
-        put('javascript');
-        put('css');
-        break;
-      default:
-        break;
-    }
-    _cachedHighlightLanguageId = primary;
-    _cachedHighlightLanguages = languages;
-    return languages;
-  }
+  /// S5-9 测试钩子：距底阈值内是否应自动追加（纯判定便于单测）。
+  @visibleForTesting
+  static bool shouldAutoAppendForTest({
+    required double pixels,
+    required double maxScrollExtent,
+  }) =>
+      maxScrollExtent > 0 && maxScrollExtent - pixels < 200;
 
   @override
   Widget build(BuildContext context) {
@@ -1359,6 +381,19 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
+                  // S5-9：窗口分页追加：仅窗口态、未到尾时可见，到尾隐藏。
+                  if (!_largeFileExpanded && !_largeFileReachedEnd)
+                    TextButton(
+                      onPressed: _largeFileAppending
+                          ? null
+                          : () {
+                              // ignore: discarded_futures
+                              _appendLargeFileWindow();
+                            },
+                      child: Text(
+                        _largeFileAppending ? '加载中…' : '加载下一2000行',
+                      ),
+                    ),
                   TextButton(
                     // 加载全部：置 expanded 后重载整文件，再次保存即放行。
                     onPressed: widget.readOnly || _largeFileExpanded
@@ -1427,23 +462,29 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 Expanded(
-                  child: Listener(
-                    onPointerDown: (event) {
-                      if (!_gotoModifierPressed) return;
-                      // 跟光标位置：先刷新目标词，再跳转
-                      _updateGotoTargetFromSelection();
-                      final line =
-                          _gotoLine ?? _controller.selection.extentIndex;
-                      final character =
-                          (_gotoStart != null && _gotoEnd != null)
-                          ? ((_gotoStart! + _gotoEnd!) ~/ 2)
-                          : _controller.selection.extentOffset;
-                      jumpToDefinitionAtCursor(
-                        line: line,
-                        character: character,
-                      );
+                  // S5-9：滚动近窗口末尾自动追加下一页（窗口态才监听）。
+                  child: NotificationListener<ScrollNotification>(
+                    onNotification: (notification) {
+                      _onLargeFileScroll(notification);
+                      return false;
                     },
-                    child: CodeAutocomplete(
+                    child: Listener(
+                      onPointerDown: (event) {
+                        if (!_gotoModifierPressed) return;
+                        // 跟光标位置：先刷新目标词，再跳转
+                        _updateGotoTargetFromSelection();
+                        final line =
+                            _gotoLine ?? _controller.selection.extentIndex;
+                        final character =
+                            (_gotoStart != null && _gotoEnd != null)
+                                ? ((_gotoStart! + _gotoEnd!) ~/ 2)
+                                : _controller.selection.extentOffset;
+                        jumpToDefinitionAtCursor(
+                          line: line,
+                          character: character,
+                        );
+                      },
+                      child: CodeAutocomplete(
                       viewBuilder: (context, notifier, onSelected) {
                         return IdeCodeAutocompleteListView(
                           notifier: notifier,
@@ -1455,39 +496,41 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
                         languageMode: _languageMode,
                         controller: _controller,
                       ),
-                      child: CodeEditor(
-                        controller: _controller,
-                        focusNode: _focusNode,
-                        readOnly:
-                            widget.readOnly ||
-                            (_isLargeFile && !_largeFileEditMode),
-                        autofocus: false,
-                        findController: _findController,
-                        findBuilder: (context, controller, readonly) =>
-                            _CodeFindBar(controller: controller),
-                        wordWrap: _wordWrap,
-                        padding: const EdgeInsets.only(left: 4, right: 12),
-                        style: CodeEditorStyle(
-                          fontSize: 12.5,
-                          fontFamily: 'Menlo',
-                          fontHeight: 1.55,
-                          textColor: colors.textPrimary,
-                          backgroundColor: colors.panelElevated,
-                          selectionColor: colors.accent.withValues(alpha: 0.28),
-                          cursorColor: colors.accent,
-                          cursorLineColor: colors.panelHover,
-                          codeTheme: languages.isEmpty
-                              ? null
-                              : CodeHighlightTheme(
-                                  languages: languages,
-                                  theme: highlightTheme,
-                                ),
-                        ),
-                        indicatorBuilder:
-                            (context, editingController, chunkController, notifier) {
-                          final store =
-                              _diagnostics ?? DiagnosticsScope.maybeOf(context);
-                          return Container(
+                      child: Stack(
+                        children: [
+                          CodeEditor(
+                            controller: _controller,
+                            focusNode: _focusNode,
+                            readOnly:
+                                widget.readOnly ||
+                                (_isLargeFile && !_largeFileEditMode),
+                            autofocus: false,
+                            findController: _findController,
+                            findBuilder: (context, controller, readonly) =>
+                                _CodeFindBar(controller: controller),
+                            wordWrap: _wordWrap,
+                            padding: const EdgeInsets.only(left: 4, right: 12),
+                            style: CodeEditorStyle(
+                              fontSize: 12.5,
+                              fontFamily: 'Menlo',
+                              fontHeight: 1.55,
+                              textColor: colors.textPrimary,
+                              backgroundColor: colors.panelElevated,
+                              selectionColor: colors.accent.withValues(alpha: 0.28),
+                              cursorColor: colors.accent,
+                              cursorLineColor: colors.panelHover,
+                              codeTheme: languages.isEmpty
+                                  ? null
+                                  : CodeHighlightTheme(
+                                      languages: languages,
+                                      theme: highlightTheme,
+                                    ),
+                            ),
+                            indicatorBuilder:
+                                (context, editingController, chunkController, notifier) {
+                              final store =
+                                  _diagnostics ?? DiagnosticsScope.maybeOf(context);
+                              return Container(
                             color: colors.panel,
                             child: Row(
                               mainAxisSize: MainAxisSize.min,
@@ -1514,6 +557,7 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
                                             widget.path,
                                           ) ??
                                           const <int, DiagnosticSeverity>{},
+                                      colors: IdeColors.of(context),
                                     ),
                                   ),
                                 ),
@@ -1530,8 +574,27 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
                                 },
                               ),
                         },
+                          ),
+                          // T38：ghost-text 覆盖层——Stack 第二层，吃
+                          // IgnorePointer，不挡编辑器点击/选区/滚动。
+                          // InlineGhostText 自带 Positioned（left/top 定位），
+                          // 此前外层再包一层 Positioned 形成双重 ParentData
+                          // （debug 渲染即抛 Competing ParentDataWidgets，
+                          // 建议从未真正上屏）——E2 回归暴露后去除外层，
+                          // 光标坐标经 left/top 传入。
+                          if (_inlineSuggestion != null &&
+                              _inlineSuggestion!.isNotEmpty &&
+                              _inlineCursorPoint != null)
+                            InlineGhostText(
+                              text: _inlineSuggestion!,
+                              left: _inlineCursorPoint!.dx,
+                              top: _inlineCursorPoint!.dy,
+                              baseline: _inlineBaseline,
+                            ),
+                        ],
                       ),
                     ),
+                  ),
                   ),
                 ),
               if (_showMinimap)
@@ -1548,273 +611,5 @@ class CodeEditorPaneState extends State<CodeEditorPane> {
         ],
       ),
     );
-  }
-
-  Future<void> _requestSignatureHelp() async {
-    final workspace = _workspace ?? WorkspaceScope.maybeOf(context);
-    final root = workspace?.rootPath;
-    if (root == null) {
-      setState(() => _signatureHint = '请先打开项目');
-      return;
-    }
-    final selection = _controller.selection;
-    // R4-A6 空文件守卫：空文档 codeLines 为空时 length-1==-1，
-    // clamp(0,-1) 抛 RangeError。此前空文件点签名即崩。
-    if (_controller.codeLines.isEmpty) {
-      setState(() => _signatureHint = '空文件无签名');
-      return;
-    }
-    final line = selection.extentIndex.clamp(
-      0,
-      _controller.codeLines.length - 1,
-    );
-    final lineText = _controller.codeLines[line].text;
-    final character = selection.extentOffset.clamp(0, lineText.length);
-    final spec = DefinitionService.instance.specForExtension(
-      p.extension(widget.path).toLowerCase(),
-    );
-    if (spec == null) {
-      setState(() => _signatureHint = '当前文件类型无语言服务');
-      return;
-    }
-    setState(() => _signatureHint = '请求签名中…');
-    try {
-      final client = await DefinitionService.instance.clientFor(
-        rootPath: root,
-        spec: spec,
-      );
-      if (client == null) {
-        if (!mounted) return;
-        setState(() => _signatureHint = DefinitionService.instance.lastStartError ?? '语言服务未启动');
-        return;
-      }
-      final help = await client.signatureHelp(
-        filePath: widget.path,
-        line: line,
-        character: character,
-      );
-      if (!mounted) return;
-      final signatures = (help?['signatures'] as List?) ?? const [];
-      final active = (help?['activeSignature'] as num?)?.toInt() ?? 0;
-      final item = active >= 0 && active < signatures.length ? signatures[active] as Map : null;
-      final label = '${item?['label'] ?? ''}'.trim();
-      setState(() => _signatureHint = label.isEmpty ? '无可用签名' : label);
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _signatureHint = '签名请求失败：$e');
-    }
-  }
-}
-
-class _EditorMinimap extends StatelessWidget {
-  const _EditorMinimap({required this.controller, required this.textColor});
-
-  final CodeLineEditingController controller;
-  final Color textColor;
-
-  @override
-  Widget build(BuildContext context) {
-    return ListenableBuilder(
-      listenable: controller,
-      builder: (context, _) {
-        final total = controller.codeLines.length;
-        final start = (controller.selection.extentIndex - 80).clamp(0, total);
-        final end = (controller.selection.extentIndex + 160).clamp(0, total);
-        final lines = [for (var i = start; i < end; i++) controller.codeLines[i]];
-        return Container(
-          color: Theme.of(context).colorScheme.surfaceContainerHighest.withValues(alpha: 0.35),
-          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 8),
-          child: SingleChildScrollView(
-            child: Text(
-              lines.map((e) => e.text).join('\n'),
-              style: TextStyle(color: textColor, fontSize: 5, height: 1.1),
-            ),
-          ),
-        );
-      },
-    );
-  }
-}
-
-class _CodeFindBar extends StatelessWidget implements PreferredSizeWidget {
-  const _CodeFindBar({required this.controller});
-
-  final CodeFindController controller;
-
-  @override
-  Size get preferredSize => const Size.fromHeight(42);
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      color: Theme.of(context).colorScheme.surface,
-      child: Row(
-        children: [
-          Expanded(
-            child: TextField(
-              controller: controller.findInputController,
-              focusNode: controller.findInputFocusNode,
-              autofocus: true,
-              decoration: const InputDecoration(
-                hintText: '查找',
-                isDense: true,
-                border: InputBorder.none,
-              ),
-              onSubmitted: (_) => controller.nextMatch(),
-            ),
-          ),
-          if (controller.value?.replaceMode == true)
-            SizedBox(
-              width: 130,
-              child: TextField(
-                controller: controller.replaceInputController,
-                focusNode: controller.replaceInputFocusNode,
-                decoration: const InputDecoration(
-                  hintText: '替换为',
-                  isDense: true,
-                  border: InputBorder.none,
-                ),
-              ),
-            ),
-          IconButton(
-            tooltip: '上一个',
-            icon: const Icon(Icons.keyboard_arrow_up, size: 18),
-            onPressed: controller.previousMatch,
-          ),
-          IconButton(
-            tooltip: '下一个',
-            icon: const Icon(Icons.keyboard_arrow_down, size: 18),
-            onPressed: controller.nextMatch,
-          ),
-          if (controller.value?.replaceMode == true)
-            IconButton(
-              tooltip: '全部替换',
-              icon: const Icon(Icons.find_replace, size: 18),
-              onPressed: controller.replaceAllMatches,
-            ),
-          IconButton(
-            tooltip: '关闭',
-            icon: const Icon(Icons.close, size: 18),
-            onPressed: controller.close,
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-/// 流式读取文件前 [maxLines] 行后立即取消订阅，不全量读入内存。
-/// 仅支持 UTF-8（含 BOM 剥离）；解码失败由调用方退回 _readText。
-Future<String> _readHeadLines(String path, int maxLines) {
-  final completer = Completer<String>();
-  final lines = <String>[];
-  late final StreamSubscription<String> sub;
-  sub = File(path)
-      .openRead()
-      .transform(utf8.decoder)
-      .transform(const LineSplitter())
-      .listen(
-        (line) {
-          if (lines.isEmpty && line.startsWith('\uFEFF')) {
-            line = line.substring(1);
-          }
-          lines.add(line);
-          if (lines.length >= maxLines) {
-            // ignore: discarded_futures
-            sub.cancel();
-            if (!completer.isCompleted) completer.complete(lines.join('\n'));
-          }
-        },
-        onDone: () {
-          if (!completer.isCompleted) completer.complete(lines.join('\n'));
-        },
-        onError: (Object e) {
-          if (!completer.isCompleted) completer.completeError(e);
-        },
-        cancelOnError: true,
-      );
-  return completer.future;
-}
-
-Future<String> _readText(String path) async {
-  final bytes = await File(path).readAsBytes();
-  if (bytes.isEmpty) return '';
-
-  if (bytes.length >= 3 &&
-      bytes[0] == 0xEF &&
-      bytes[1] == 0xBB &&
-      bytes[2] == 0xBF) {
-    return utf8.decode(bytes.sublist(3));
-  }
-  if (bytes.length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) {
-    return _decodeUtf16(bytes.sublist(2), littleEndian: true);
-  }
-  if (bytes.length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) {
-    return _decodeUtf16(bytes.sublist(2), littleEndian: false);
-  }
-
-  try {
-    return utf8.decode(bytes);
-  } catch (_) {
-    return latin1.decode(bytes);
-  }
-}
-
-String _decodeUtf16(List<int> bytes, {required bool littleEndian}) {
-  final codeUnits = <int>[];
-  for (var i = 0; i + 1 < bytes.length; i += 2) {
-    final unit = littleEndian
-        ? (bytes[i] | (bytes[i + 1] << 8))
-        : (bytes[i + 1] | (bytes[i] << 8));
-    codeUnits.add(unit);
-  }
-  return String.fromCharCodes(codeUnits);
-}
-
-class _DiagnosticGutterPainter extends CustomPainter {
-  // repaints 只触发重绘不触发重建：re_editor 的 indicator notifier 在
-  // 布局期通知，AnimatedBuilder 的 setState 会报 "Build scheduled during
-  // frame"。经 CustomPainter 的 repaint 监听只走 paint 阶段。
-  _DiagnosticGutterPainter({
-    required Listenable? repaints,
-    required this.notifier,
-    required this.severitiesOf,
-  }) : super(repaint: repaints);
-
-  final ValueNotifier<CodeIndicatorValue?> notifier;
-  final Map<int, DiagnosticSeverity> Function() severitiesOf;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final value = notifier.value;
-    final severities = severitiesOf();
-    if (value == null || severities.isEmpty) return;
-    final paint = Paint()..style = PaintingStyle.fill;
-    for (final para in value.paragraphs) {
-      final severity = severities[para.index];
-      if (severity == null) continue;
-      paint.color = _colorOf(severity);
-      final cy = para.top + para.height / 2;
-      canvas.drawCircle(Offset(size.width / 2, cy), 3, paint);
-    }
-  }
-
-  Color _colorOf(DiagnosticSeverity severity) {
-    switch (severity) {
-      case DiagnosticSeverity.error:
-        return const Color(0xFFE35D6A);
-      case DiagnosticSeverity.warning:
-        return const Color(0xFFE3A008);
-      case DiagnosticSeverity.info:
-        return const Color(0xFF6C8CFF);
-      case DiagnosticSeverity.hint:
-        return const Color(0xFF9A9AA0);
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant _DiagnosticGutterPainter oldDelegate) {
-    // 内容变化经 repaint listenable 驱动；此处仅在 painter 语义变化时重建。
-    return oldDelegate.notifier != notifier;
   }
 }

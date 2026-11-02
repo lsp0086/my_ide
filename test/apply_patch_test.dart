@@ -7,7 +7,28 @@ import 'package:my_ide/ai/agent_tools.dart';
 import 'package:my_ide/ai/approval_gate.dart';
 import 'package:my_ide/ai/provider_config.dart';
 import 'package:my_ide/ai/tool_registry.dart';
+import 'package:my_ide/version/checkpoint_store.dart';
 import 'package:path/path.dart' as p;
+
+/// 读取 lib 源码：主文件与同名 `_` 前缀的 part 文件（库拆分后按整库断言）。
+Future<String> readLibSource(String relPath) async {
+  final base = File('lib/$relPath');
+  var out = await base.readAsString();
+  final stem = relPath.split('/').last.replaceAll('.dart', '');
+  final parts = base.parent
+      .listSync()
+      .whereType<File>()
+      .where((f) {
+        final name = f.uri.pathSegments.last;
+        return name.startsWith('${stem}_') && name.endsWith('.dart');
+      })
+      .toList()
+    ..sort((a, b) => a.path.compareTo(b.path));
+  for (final f in parts) {
+    out += await f.readAsString();
+  }
+  return out;
+}
 
 void main() {
   late Directory workspace;
@@ -39,6 +60,19 @@ void main() {
     expect(await File(p.join(workspace.path, 'a.txt')).readAsString(), 'AAA');
     expect(await File(p.join(workspace.path, 'c.txt')).readAsString(), 'ccc');
     expect(await File(p.join(workspace.path, 'b.txt')).exists(), isFalse);
+  });
+
+  test('E3: create 到已存在路径显式拒绝，不覆盖原文件', () async {
+    // 复现（Cline 4.1.19 对齐）：Add File 语义落到已存在路径此前可能
+    // 静默覆盖；现规划期即拒绝，原文件保持不动。
+    final result = await tools.execute('apply_patch', {
+      'patches': [
+        {'path': 'a.txt', 'create': true, 'newText': 'evil'},
+      ],
+    });
+    expect(result.ok, isFalse);
+    expect(result.output, contains('已存在'));
+    expect(await File(p.join(workspace.path, 'a.txt')).readAsString(), 'aaa');
   });
 
   test('S8: delete 失败回滚可恢复原文件', () async {
@@ -272,9 +306,7 @@ void main() {
       // 直接读源码断言（构造 EPERM 的 chmod 法在 root/CI 下 flaky，
       // 且 write_file 前还有 _isWriteLinkTarget 先行拦截，行为已由
       // p0 TOCTOU/外链用例覆盖）。校验：flutter analyze 通过。
-      final src = await File(
-        'lib/ai/agent_tools.dart',
-      ).readAsString().catchError((_) => '');
+      final src = await readLibSource('ai/agent_tools.dart').catchError((_) => '');
       // 仅当单测在仓库根下运行时才断言，否则跳过（CI 路径不同不误报）。
       if (src.isEmpty || !src.contains('_isOutsideAfterRealpath')) return;
       final idx = src.indexOf('bool _isOutsideAfterRealpath');
@@ -395,7 +427,7 @@ void main() {
   });
 
   test('R4-1 归一命中计数器：精确/模糊/多命中', () {
-    // 复现：第4轮复查debugFuzzyMatchCountForTest零调用。
+    // 复现：复查 debugFuzzyMatchCountForTest 零调用。
     // 覆盖：精确单命中=1、双命中=2（>1即拒）、模糊空白归一命中、零命中=0。
     final t = AgentTools(rootPath: workspace.path);
     expect(t.debugFuzzyMatchCountForTest('foo\nbar\n', 'foo'), 1);
@@ -405,7 +437,7 @@ void main() {
   });
 
   test('write乐观锁字节口径：中文内容不误报长度漂移', () async {
-    // 复现：第1轮R2-1，expected.length字符数比probe.length字节数，
+    // 复现：R2-1，expected.length字符数比probe.length字节数，
     // 6个中文=6字符/18字节必误报“长度 6→18”。现按utf8字节比对。
     final t = AgentTools(rootPath: workspace.path);
     await File(p.join(workspace.path, 'cjk.txt')).writeAsString('中文内容测试12');
@@ -432,7 +464,7 @@ void main() {
   test('补丁journal可读：半落盘残留可提示人工检查', () async {
     // 复现：只有写/清无读，kill半落盘重启无人消费。修复：读出受影响清单。
     final t = AgentTools(rootPath: workspace.path);
-    expect(await t.readPatchJournalForTest(), isEmpty);
+    expect(await t.readPatchJournal(), isEmpty);
     final journal = File(p.join(workspace.path, '.my_ide', 'patch-journal.json'));
     await journal.parent.create(recursive: true);
     await journal.writeAsString(
@@ -442,7 +474,7 @@ void main() {
       }),
       flush: true,
     );
-    expect(await t.readPatchJournalForTest(), ['a.txt', 'b.txt']);
+    expect(await t.readPatchJournal(), ['a.txt', 'b.txt']);
     // 成功提交清journal：残留清单回到空。
     final ok = await t.execute('apply_patch', {
       'patches': [
@@ -450,6 +482,102 @@ void main() {
       ],
     });
     expect(ok.ok, isTrue);
-    expect(await t.readPatchJournalForTest(), isEmpty);
+    expect(await t.readPatchJournal(), isEmpty);
+  });
+
+  // B1-10：写入前 hunk 级采纳/拒绝（部分应用=各接受 hunk 顺序套用的
+  // 字节级结果；未接受 hunk 不落盘但停在可回退版本节点，红 N 仍可退）。
+  group('B1-10 写入前 hunk 级采纳', () {
+    // 三段分离变更：10 行基线，AI 一次写入改动 2/6/10 三行。
+    const base = 'l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n';
+    const diff =
+        '--- a/a.txt\n'
+        '+++ b/a.txt\n'
+        '@@ -1,3 +1,3 @@\n'
+        ' l1\n'
+        '-l2\n'
+        '+L2\n'
+        ' l3\n'
+        '@@ -5,3 +5,3 @@\n'
+        ' l5\n'
+        '-l6\n'
+        '+L6\n'
+        ' l7\n'
+        '@@ -9,2 +9,2 @@\n'
+        ' l9\n'
+        '-l10\n'
+        '+L10\n';
+
+    test('parseDiffHunksForTest：三块解析、头不合法跳过、\\ No newline 不占行', () {
+      final hunks = CheckpointStore.parseDiffHunksForTest(diff);
+      expect(hunks, hasLength(3));
+      expect(hunks[0].oldStart, 1);
+      expect(hunks[0].oldLines, ['l1', 'l2', 'l3']);
+      expect(hunks[0].newLines, ['l1', 'L2', 'l3']);
+      expect(hunks[2].oldStart, 9);
+      // 坏头整块跳过不编造行号。
+      final bad = CheckpointStore.parseDiffHunksForTest(
+        '@@ -x,y +z,w @@\n-a\n+b\n',
+      );
+      expect(bad, isEmpty);
+      // “\ No newline at end of file” 标记行不占行。
+      final nonl = CheckpointStore.parseDiffHunksForTest(
+        '@@ -1,1 +1,1 @@\n-a\n+b\n\\ No newline at end of file\n',
+      );
+      expect(nonl, hasLength(1));
+      expect(nonl.single.oldLines, ['a']);
+      expect(nonl.single.newLines, ['b']);
+    });
+
+    test('applySelectedHunksForTest：部分应用字节级=各接受 hunk 顺序套用', () {
+      final merged = CheckpointStore.applySelectedHunksForTest(
+        base,
+        CheckpointStore.parseDiffHunksForTest(diff),
+        {0, 2},
+      );
+      expect(merged, 'l1\nL2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nL10\n');
+      // 全选=AI 完整写入结果。
+      final all = CheckpointStore.applySelectedHunksForTest(
+        base,
+        CheckpointStore.parseDiffHunksForTest(diff),
+        {0, 1, 2},
+      );
+      expect(all, 'l1\nL2\nl3\nl4\nl5\nL6\nl7\nl8\nl9\nL10\n');
+    });
+
+    test('applySelectedHunksForTest：全拒=原样、越界忽略、CRLF 原样保持', () {
+      final hunks = CheckpointStore.parseDiffHunksForTest(diff);
+      // 空勾选/全拒。
+      expect(
+        CheckpointStore.applySelectedHunksForTest(base, hunks, const {}),
+        base,
+      );
+      // 越界/负下标被忽略（不抛错）。
+      expect(
+        CheckpointStore.applySelectedHunksForTest(base, hunks, {7, -1}),
+        base,
+      );
+      // CRLF：hunk 体行携带 \r 时字节级保持，不归一化行尾。
+      const crlfBase = 'a\r\nb\r\nc\r\n';
+      const crlfDiff =
+          '@@ -1,2 +1,2 @@\n a\r\n-b\r\n+B\r\n@@ -3,1 +3,1 @@\n-c\r\n+C\r\n';
+      final crlf = CheckpointStore.applySelectedHunksForTest(
+        crlfBase,
+        CheckpointStore.parseDiffHunksForTest(crlfDiff),
+        {0},
+      );
+      expect(crlf, 'a\r\nB\r\nc\r\n');
+      // 纯插入块（oldCount==0）插在 oldStart 之后。
+      const insBase = 'x\ny\n';
+      const insDiff = '@@ -1,0 +2,1 @@\n+ins\n';
+      expect(
+        CheckpointStore.applySelectedHunksForTest(
+          insBase,
+          CheckpointStore.parseDiffHunksForTest(insDiff),
+          {0},
+        ),
+        'x\nins\ny\n',
+      );
+    });
   });
 }

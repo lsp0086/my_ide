@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:my_ide/ai/agent_browser_tools.dart';
 import 'package:my_ide/ai/agent_client.dart';
+import 'package:my_ide/ai/agent_computer_tools.dart';
 import 'package:my_ide/ai/agent_profiles.dart';
 import 'package:my_ide/ai/agent_runner.dart';
 import 'package:my_ide/ai/agent_tool_schemas.dart';
@@ -30,6 +31,46 @@ import 'package:my_ide/skills/skill_manager.dart';
 import 'package:my_ide/version/checkpoint_store.dart';
 import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
+
+/// 读取 lib 源码：主文件与同名 `_` 前缀的 part 文件（库拆分后按整库断言）。
+Future<String> readLibSource(String relPath) async {
+  final base = File('lib/$relPath');
+  var out = await base.readAsString();
+  final stem = relPath.split('/').last.replaceAll('.dart', '');
+  final parts = base.parent
+      .listSync()
+      .whereType<File>()
+      .where((f) {
+        final name = f.uri.pathSegments.last;
+        return name.startsWith('${stem}_') && name.endsWith('.dart');
+      })
+      .toList()
+    ..sort((a, b) => a.path.compareTo(b.path));
+  for (final f in parts) {
+    out += await f.readAsString();
+  }
+  return out;
+}
+
+/// 同源同步版：主文件与同名 `_` 前缀 part 文件拼接（同步测试用）。
+String readLibSourceSync(String relPath) {
+  final base = File('lib/$relPath');
+  var out = base.readAsStringSync();
+  final stem = relPath.split('/').last.replaceAll('.dart', '');
+  final parts = base.parent
+      .listSync()
+      .whereType<File>()
+      .where((f) {
+        final name = f.uri.pathSegments.last;
+        return name.startsWith('${stem}_') && name.endsWith('.dart');
+      })
+      .toList()
+    ..sort((a, b) => a.path.compareTo(b.path));
+  for (final f in parts) {
+    out += f.readAsStringSync();
+  }
+  return out;
+}
 
 void main() {
   late Directory first;
@@ -62,10 +103,9 @@ void main() {
         {'id': 'second', 'content': '第二个项目', 'status': 'doing'},
       ],
     });
-    final firstResult = await AgentTools(rootPath: first.path).execute(
-      'todo_write',
-      {},
-    );
+    final firstResult = await AgentTools(
+      rootPath: first.path,
+    ).execute('todo_write', {});
     expect(firstResult.output, contains('第一个项目'));
     expect(firstResult.output, isNot(contains('第二个项目')));
   });
@@ -91,9 +131,7 @@ void main() {
         'newText': 'base-A-B',
       }),
     ]);
-    final content = await File(
-      p.join(first.path, 'shared.txt'),
-    ).readAsString();
+    final content = await File(p.join(first.path, 'shared.txt')).readAsString();
     // B 必须等到 A 落盘后才读到 base-A，否则 oldText 不匹配直接失败；
     // 无论调度顺序，最终要么 base-A-B，要么其中一个明确失败重试，不静默互盖。
     expect(
@@ -188,9 +226,7 @@ void main() {
 
   test('todo 并发写入串行不互盖（双增量都保留）', () async {
     final tools = AgentTools(rootPath: first.path);
-    await tools.execute('todo_write', {
-      'todos': [],
-    });
+    await tools.execute('todo_write', {'todos': []});
     await Future.wait([
       tools.execute('todo_write', {
         'todos': [
@@ -207,13 +243,15 @@ void main() {
 
     final file = File(p.join(first.path, '.my_ide', 'todos.json'));
     final decoded = jsonDecode(await file.readAsString()) as List;
-    final ids = decoded
-        .map((e) => '${(e as Map)['id'] ?? ''}')
-        .toSet();
+    final ids = decoded.map((e) => '${(e as Map)['id'] ?? ''}').toSet();
     expect(ids, containsAll({'a', 'b'}));
-    final entries = await Directory(p.join(first.path, '.my_ide')).list().toList();
+    final entries = await Directory(
+      p.join(first.path, '.my_ide'),
+    ).list().toList();
     expect(
-      entries.where((entry) => p.basename(entry.path).startsWith('todos.json.tmp-')),
+      entries.where(
+        (entry) => p.basename(entry.path).startsWith('todos.json.tmp-'),
+      ),
       isEmpty,
     );
   });
@@ -221,7 +259,7 @@ void main() {
   test('todo 链超时仍串行不互盖：后排等前排不并发进fn', () async {
     // 复现：网络盘卡住时连续两次todo_write，旧口径超时放行进fn与前排
     // load→merge→save并发互盖丢todo。现fail-closed只告警仍串行等。
-    final src = await File('lib/ai/agent_tools.dart').readAsString();
+    final src = await readLibSource('ai/agent_tools.dart');
     expect(src.contains('仍串行等待避免互盖'), isTrue);
     final tools = AgentTools(rootPath: first.path);
     await tools.execute('todo_write', {'todos': []});
@@ -247,11 +285,14 @@ void main() {
   test('R11R4 todo锁表有界：压测后自动清key不泄漏', () async {
     final tools = AgentTools(rootPath: first.path);
     await Future.wait(
-      List.generate(10, (i) => tools.execute('todo_write', {
-        'todos': [
-          {'id': 't$i', 'content': '锁表压测 $i', 'status': 'pending'},
-        ],
-      })),
+      List.generate(
+        10,
+        (i) => tools.execute('todo_write', {
+          'todos': [
+            {'id': 't$i', 'content': '锁表压测 $i', 'status': 'pending'},
+          ],
+        }),
+      ),
     );
     expect(AgentTools.todoWriteChainLengthForTest(), 0);
   });
@@ -296,9 +337,7 @@ void main() {
     });
 
     test('R12R10 超预算文件占位可观测（源码口径断言）', () async {
-      final src = await File(
-        'lib/ai/subagent_runtime.dart',
-      ).readAsString();
+      final src = await File('lib/ai/subagent_runtime.dart').readAsString();
       expect(src, contains('unpreloadedPlaceholderForTest(files)'));
       expect(src, contains('--- \$f ---（未预载）'));
     });
@@ -382,9 +421,11 @@ void main() {
 
   group('子Agent允许集纯函数', () {
     test('readOnly-blocked-allowedTools三层收紧', () {
-      final out = SubagentRuntime.allowedForTest(
-        ['read_file', 'browser_click', 'search_text'],
-      );
+      final out = SubagentRuntime.allowedForTest([
+        'read_file',
+        'browser_click',
+        'search_text',
+      ]);
       expect(out, contains('read_file'));
       expect(out, isNot(contains('browser_click')));
       final tight = SubagentRuntime.allowedForTest(
@@ -415,9 +456,10 @@ void main() {
 
     test('供给执行同口径：未来browser工具不进供给', () {
       // 供给侧与allowedForTest同为前缀拒：readOnly含未来browser即滤掉。
-      final out = SubagentRuntime.allowedForTest(
-        ['read_file', 'browser_future_z'],
-      );
+      final out = SubagentRuntime.allowedForTest([
+        'read_file',
+        'browser_future_z',
+      ]);
       expect(out, ['read_file']);
       expect(SubagentRuntime.isDeniedForTest('browser_future_z'), isTrue);
     });
@@ -427,7 +469,10 @@ void main() {
       final line = SubagentRuntime.skillLineForTest(tools);
       expect(line, contains('等共 100 个'));
       expect(line, isNot(contains('tool_99')));
-      expect(SubagentRuntime.skillLineForTest({'read_file'}), contains('read_file'));
+      expect(
+        SubagentRuntime.skillLineForTest({'read_file'}),
+        contains('read_file'),
+      );
       expect(SubagentRuntime.skillLineForTest(const {}), isEmpty);
     });
   });
@@ -438,10 +483,12 @@ void main() {
       final root = await Directory.systemTemp.createTemp('r1-lock-');
       try {
         await File(p.join(root.path, 'real.txt')).writeAsString('v0');
-        await Link(p.join(root.path, 'alias.txt')).create(
-          p.join(root.path, 'real.txt'),
-        );
+        await Link(
+          p.join(root.path, 'alias.txt'),
+        ).create(p.join(root.path, 'real.txt'));
         final tools = AgentTools(rootPath: root.path);
+        // R1-10 read-before-write：覆盖已存在（链接指向存在）文件须先读。
+        await tools.execute('read_file', {'path': 'alias.txt'});
         // 别名写即真实写：_write 经 _resolve(realpath) 落同一文件。
         final w = await tools.execute('write_file', {
           'path': 'alias.txt',
@@ -462,14 +509,12 @@ void main() {
   group('runParallel 尾批次占位', () {
     test('非正taskTimeout视为未设置：零/负不熔断', () async {
       for (final d in [Duration.zero, const Duration(seconds: -1)]) {
-        final review = await runParallel(
-          [FanoutTask(id: 't', task: 'task')],
-          (t) async {
-            await Future<void>.delayed(const Duration(milliseconds: 10));
-            return AgentToolResult(ok: true, output: 'done');
-          },
-          taskTimeout: d,
-        );
+        final review = await runParallel([FanoutTask(id: 't', task: 'task')], (
+          t,
+        ) async {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+          return AgentToolResult(ok: true, output: 'done');
+        }, taskTimeout: d);
         expect(review.results.length, 1);
         expect(review.results.first.ok, isTrue);
         expect(review.results.first.output, 'done');
@@ -514,6 +559,11 @@ void main() {
       expect(review.results.first.ok, isFalse);
       expect(review.results.first.output, contains('300ms'));
       expect(review.results.first.output.contains('60s'), isFalse);
+      // R18-08：单任务超时占位同样带 timedOut:true——整批超时占位此前已
+      // 结构化标记，单分支超时只回文本，调用方（Runner spawnTimedOut
+      // 判定）对单任务超时判不出。文本保留，仅补结构化标记。
+      expect(review.results.first.timedOut, isTrue);
+      expect(review.results.first.interrupted, isFalse);
     });
 
     test('R4-A1 整批超时熔断：多批串行超限停发新批回占位', () async {
@@ -532,10 +582,7 @@ void main() {
         overallTimeout: const Duration(milliseconds: 100),
       );
       expect(review.results.length, 6);
-      expect(
-        review.results.every((r) => r.timedOut),
-        isTrue,
-      );
+      expect(review.results.every((r) => r.timedOut), isTrue);
       // 整批占位不选优：best 应为失败态，不拼占位文本。
       expect(review.best.ok, isFalse);
     });
@@ -555,6 +602,26 @@ void main() {
       expect(review.results.length, 1);
       expect(review.results.first.timedOut, isTrue);
       expect(review.best.ok, isFalse);
+    });
+
+    test('取消感知分支整批超时：缺失回填按超时定性不误记用户中断', () async {
+      // 复现：取消感知分支超时熔断后缺失项统一回填"用户中断，已取消。"
+      // 且 timedOut=false——非用户取消的超时被误定性，
+      // 调用方 spawnTimedOut 判定失效、占位被当"无结果/用户拒绝"。
+      final review = await runParallel(
+        [FanoutTask(id: 'ct1', task: 'slow')],
+        (t) async {
+          await Future<void>.delayed(const Duration(seconds: 5));
+          return AgentToolResult(ok: true, output: 'done');
+        },
+        shouldCancel: () => false,
+        taskTimeout: const Duration(seconds: 5),
+        overallTimeout: const Duration(milliseconds: 50),
+      );
+      expect(review.results.length, 1);
+      expect(review.results.first.timedOut, isTrue);
+      expect(review.results.first.output, contains('超时'));
+      expect(review.results.first.output.contains('用户中断'), isFalse);
     });
 
     test('混合批顺序与 asked 顺序一致', () async {
@@ -598,10 +665,9 @@ void main() {
 
   group('取消即停可测', () {
     test('allowedForTest三层收紧回归', () {
-      expect(
-        SubagentRuntime.allowedForTest(['read_file', 'browser_click']),
-        ['read_file'],
-      );
+      expect(SubagentRuntime.allowedForTest(['read_file', 'browser_click']), [
+        'read_file',
+      ]);
     });
   });
 
@@ -642,29 +708,42 @@ void main() {
 
   test('LSP 新增方法未启动时空容错不抛错', () async {
     final client = LspClient(command: 'none', args: const []);
-    expect(await client.references(filePath: 'a.ts', line: 0, character: 0),
-        isEmpty);
-    expect(await client.completion(filePath: 'a.ts', line: 0, character: 0),
-        isEmpty);
     expect(
-        await client.rename(
-            filePath: 'a.ts', line: 0, character: 0, newName: 'b'),
-        isNull);
+      await client.references(filePath: 'a.ts', line: 0, character: 0),
+      isEmpty,
+    );
+    expect(
+      await client.completion(filePath: 'a.ts', line: 0, character: 0),
+      isEmpty,
+    );
+    expect(
+      await client.rename(
+        filePath: 'a.ts',
+        line: 0,
+        character: 0,
+        newName: 'b',
+      ),
+      isNull,
+    );
     expect(await client.format(filePath: 'a.ts'), isEmpty);
     expect(
-        await client.codeAction(
-            filePath: 'a.ts', startLine: 0, endLine: 0),
-        isEmpty);
+      await client.codeAction(filePath: 'a.ts', startLine: 0, endLine: 0),
+      isEmpty,
+    );
     expect(await client.workspaceSymbol('foo'), isEmpty);
-    expect(await client.hover(filePath: 'a.ts', line: 0, character: 0),
-        isNull);
+    expect(await client.hover(filePath: 'a.ts', line: 0, character: 0), isNull);
   });
 
   test('symbol_index 无注入时回退正则引用查询', () async {
+    final prev = SymbolIndex.instance.queryReferencesLsp;
+    addTearDown(() {
+      SymbolIndex.instance.queryReferencesLsp = prev;
+    });
     SymbolIndex.instance.queryReferencesLsp = null;
     expect(
-        SymbolIndex.instance.findReferences(name: 'missing-symbol-xyz'),
-        isEmpty);
+      SymbolIndex.instance.findReferences(name: 'missing-symbol-xyz'),
+      isEmpty,
+    );
     final viaAsync = await SymbolIndex.instance.findReferencesAsync(
       name: 'missing-symbol-xyz',
       filePath: 'a.dart',
@@ -675,13 +754,17 @@ void main() {
   });
 
   test('symbol_index 注入 LSP references 优先返回', () async {
-    SymbolIndex.instance.queryReferencesLsp = ({
-      required String filePath,
-      required String name,
-      required int line,
-      required int character,
-    }) async =>
-        [LspLocation(filePath: filePath, line: 7, character: 3)];
+    final prev = SymbolIndex.instance.queryReferencesLsp;
+    addTearDown(() {
+      SymbolIndex.instance.queryReferencesLsp = prev;
+    });
+    SymbolIndex.instance.queryReferencesLsp =
+        ({
+          required String filePath,
+          required String name,
+          required int line,
+          required int character,
+        }) async => [LspLocation(filePath: filePath, line: 7, character: 3)];
     final out = await SymbolIndex.instance.findReferencesAsync(
       name: 'foo',
       filePath: 'a.dart',
@@ -690,7 +773,6 @@ void main() {
     );
     expect(out.length, 1);
     expect(out.first.line, 7);
-    SymbolIndex.instance.queryReferencesLsp = null;
   });
 
   test('symbol_index 两遍扫描：跨文件引用与符号结果完整', () async {
@@ -707,11 +789,13 @@ void main() {
     // 注意 dart 规则 ^\s*ident\s*\( 会把裸调用行误提为定义，
     // 故引用行用 var 赋值形态避开，保证 Zebra 仅在 z_last 定义。
     for (var i = 0; i < 40; i++) {
-      await File('${root.path}/a${i.toString().padLeft(2, '0')}.dart')
-          .writeAsString('use$i() {\n  var v$i = Zebra();\n}\n');
+      await File(
+        '${root.path}/a${i.toString().padLeft(2, '0')}.dart',
+      ).writeAsString('use$i() {\n  var v$i = Zebra();\n}\n');
     }
-    await File('${root.path}/z_last.dart')
-        .writeAsString('class Zebra {\n  roam() {}\n}\n');
+    await File(
+      '${root.path}/z_last.dart',
+    ).writeAsString('class Zebra {\n  roam() {}\n}\n');
     await SymbolIndex.instance.bindProject(root.path);
     expect(SymbolIndex.instance.indexing, isFalse);
     expect(SymbolIndex.instance.symbolCount, greaterThanOrEqualTo(42));
@@ -785,12 +869,18 @@ void main() {
   test('模型预设解析出 OpenAI 兼容地址', () {
     expect(AiProviderConfig.ollamaPreset().apiBase, contains('11434/v1'));
     expect(AiProviderConfig.lmstudioPreset().apiBase, contains('1234/v1'));
-    expect(AiProviderConfig.geminiOpenAiPreset().apiBase,
-        contains('v1beta/openai'));
-    expect(AiProviderConfig.deepseekPreset().apiBase,
-        contains('api.deepseek.com/v1'));
-    expect(AiProviderConfig.qwenPreset().apiBase,
-        contains('compatible-mode/v1'));
+    expect(
+      AiProviderConfig.geminiOpenAiPreset().apiBase,
+      contains('v1beta/openai'),
+    );
+    expect(
+      AiProviderConfig.deepseekPreset().apiBase,
+      contains('api.deepseek.com/v1'),
+    );
+    expect(
+      AiProviderConfig.qwenPreset().apiBase,
+      contains('compatible-mode/v1'),
+    );
   });
 
   test('profile 绑定按 provider id 解析完整配置与模型元数据', () {
@@ -878,7 +968,8 @@ void main() {
   test('@引用解析与展开', () async {
     final mentions = parseAtMentions('@file a.dart @problems @symbol Foo');
     expect(mentions.length, 3);
-    expect(listChips().length, 5);
+    // file/folder/problems/symbol/diff/terminal/url/skill 八种 chip。
+    expect(listChips().length, 8);
     final out = await resolveAtMentions(
       'hi @problems',
       readDiagnostics: (_) async => 'diag line',
@@ -1148,7 +1239,10 @@ void main() {
       });
       expect(r.ok, isFalse);
       expect(r.output, contains('多次'));
-      expect(await File(p.join(dir.path, 'a.txt')).readAsString(), 'foo\nfoo\n');
+      expect(
+        await File(p.join(dir.path, 'a.txt')).readAsString(),
+        'foo\nfoo\n',
+      );
     });
 
     test('edit重复块预览层同样拒绝', () async {
@@ -1182,10 +1276,10 @@ void main() {
   group('占位选优/MCP安全/WebDAV放宽回归', () {
     test('全重复批best.ok为false不拼占位', () async {
       // 首个dup真实执行（失败），第二个为占位：best应为真实失败而非占位。
-      final review = await runParallel(
-        [FanoutTask(id: 'dup', task: 't1'), FanoutTask(id: 'dup', task: 't2')],
-        (t) async => AgentToolResult(ok: false, output: 'real-fail'),
-      );
+      final review = await runParallel([
+        FanoutTask(id: 'dup', task: 't1'),
+        FanoutTask(id: 'dup', task: 't2'),
+      ], (t) async => AgentToolResult(ok: false, output: 'real-fail'));
       expect(review.results.length, 2);
       expect(review.best.ok, isFalse);
       expect(review.best.output, contains('real-fail'));
@@ -1199,6 +1293,23 @@ void main() {
       );
       expect(review.best.ok, isFalse);
       expect(review.best.output.contains('用户中断，已取消'), isFalse);
+    });
+
+    test('A2 复读占位文案的正常结果不被误剔（精确匹配非 contains）', () async {
+      // 复现：旧 isInterrupted/isPlaceholder 按输出 contains 占位文案定性，
+      // 子代理摘要引用"用户中断，已取消"等文案即被当占位剔除选优失真。
+      // 现结构化字段优先 + 整条精确匹配兜底，引用形态不误剔。
+      final review = await runParallel(
+        [FanoutTask(id: 'q1', task: 't1'), FanoutTask(id: 'q2', task: 't2')],
+        (t) async => t.id == 'q1'
+            ? AgentToolResult(
+                ok: true,
+                output: '子代理正常调研摘要：上游服务对超时请求会返回"用户中断，已取消。"占位文案，需要甄别。',
+              )
+            : AgentToolResult(ok: false, output: '真实失败信息'),
+      );
+      expect(review.best.ok, isTrue, reason: '引用占位文案的正常结果不得被当占位剔除');
+      expect(review.best.output, contains('正常调研摘要'));
     });
 
     test('MCP env含NODE_OPTIONS即不安全', () {
@@ -1257,18 +1368,18 @@ void main() {
       // R3-浏览器写入口同样拒：reload/geolocate/switch/screenshot 穿透，
       // 新增 browser_ 前缀兜底。
       expect(
-        ToolRegistry.isSandboxBlockedToolForTest(
-            'read-only', 'browser_reload'),
+        ToolRegistry.isSandboxBlockedToolForTest('read-only', 'browser_reload'),
         isTrue,
       );
       expect(
         ToolRegistry.isSandboxBlockedToolForTest(
-            'read-only', 'browser_geolocate'),
+          'read-only',
+          'browser_geolocate',
+        ),
         isTrue,
       );
       expect(
-        ToolRegistry.isSandboxBlockedToolForTest(
-            'read-only', 'browser_switch'),
+        ToolRegistry.isSandboxBlockedToolForTest('read-only', 'browser_switch'),
         isTrue,
       );
       expect(
@@ -1395,15 +1506,13 @@ void main() {
         isTrue,
       );
       expect(
-        ToolRegistry.containsPrivateLiteralForTest(
-          "fetch('http://[::1]/x')",
-        ),
+        ToolRegistry.containsPrivateLiteralForTest("fetch('http://[::1]/x')"),
         isTrue,
       );
     });
 
     test('hook哈希32字符：源码口径', () async {
-      final src = await File('lib/ai/agent_runner.dart').readAsString();
+      final src = await readLibSource('ai/agent_runner.dart');
       expect(src.contains('substring(0, 32)'), isTrue);
       expect(src.contains('substring(0, 16)'), isFalse);
     });
@@ -1420,16 +1529,129 @@ void main() {
         ],
       });
       expect(first.ok, isTrue);
-      // 模拟外部窗口改盘：直接调第二次写入不同内容会被合并；
-      // 双方同改路径需构造 stale 基线，此处验证冲突分支可达性：
-      // 调用方改 t1，盘上同时被外部改——通过连续两次不同写入模拟。
+      // 真实stale基线：外部窗口直接改盘（内存基线仍是orig），
+      // 调用方基于旧基线再改同一项→双方同改冲突分支。
+      final todoFile = File(p.join(dir.path, '.my_ide', 'todos.json'));
+      await todoFile.writeAsString(
+        jsonEncode([
+          {'id': 't1', 'content': 'external-change', 'status': 'completed'},
+        ]),
+        flush: true,
+      );
       final tools2 = AgentTools(rootPath: dir.path);
       final r = await tools2.execute('todo_write', {
         'todos': [
           {'id': 't1', 'content': 'caller-change', 'status': 'doing'},
         ],
       });
-      expect(r.ok, isTrue);
+      expect(r.ok, isFalse);
+      expect(r.output, contains('已被修改'));
+      // 冲突不盖盘：盘上外部改动保留。
+      final kept = jsonDecode(await todoFile.readAsString()) as List<dynamic>;
+      expect((kept.single as Map)['content'], 'external-change');
+    });
+
+    group('R1-10 read-before-write 前置检查', () {
+      test('覆盖已存在文件未先读被拒；读取后放行；新文件直放', () async {
+        final dir = await Directory.systemTemp.createTemp('rbw-');
+        addTearDown(() async {
+          if (await dir.exists()) await dir.delete(recursive: true);
+        });
+        final tools = AgentTools(rootPath: dir.path);
+        await File(p.join(dir.path, 'x.txt')).writeAsString('旧内容');
+        // 未先读 → 明确拒绝。
+        final rejected = await tools.execute('write_file', {
+          'path': 'x.txt',
+          'content': '新内容',
+        });
+        expect(rejected.ok, isFalse);
+        expect(rejected.output, contains('请先 read 该文件再写'));
+        expect(await File(p.join(dir.path, 'x.txt')).readAsString(), '旧内容');
+        // 先 read 再写 → 放行。
+        expect(
+          (await tools.execute('read_file', {'path': 'x.txt'})).ok,
+          isTrue,
+        );
+        final ok = await tools.execute('write_file', {
+          'path': 'x.txt',
+          'content': '新内容',
+        });
+        expect(ok.ok, isTrue);
+        // 本会话刚写过的路径视作已知基线，连续覆写不再要求重读。
+        final again = await tools.execute('write_file', {
+          'path': 'x.txt',
+          'content': '再写',
+        });
+        expect(again.ok, isTrue);
+        // 新建文件直放（无盲写风险）。
+        final fresh = await tools.execute('write_file', {
+          'path': 'new.txt',
+          'content': '全新',
+        });
+        expect(fresh.ok, isTrue);
+        // 另一会话无读记录，覆盖同文件仍被拒（台账按会话隔离）。
+        final other = await tools.execute('write_file', {
+          'path': 'x.txt',
+          'content': '他会话',
+        }, sessionId: 'sess-other');
+        expect(other.ok, isFalse);
+        expect(other.output, contains('请先 read 该文件再写'));
+      });
+
+      test('最近20步窗口外需重新读取', () async {
+        final dir = await Directory.systemTemp.createTemp('rbw-win-');
+        addTearDown(() async {
+          if (await dir.exists()) await dir.delete(recursive: true);
+        });
+        final tools = AgentTools(rootPath: dir.path);
+        await File(p.join(dir.path, 'w.txt')).writeAsString('v0');
+        expect(
+          (await tools.execute('read_file', {'path': 'w.txt'})).ok,
+          isTrue,
+        );
+        // 窗口内（<20 步）覆写放行。
+        for (var i = 0; i < 19; i++) {
+          await tools.execute('list_files', {'path': '.'});
+        }
+        expect(
+          (await tools.execute('write_file', {
+            'path': 'w.txt',
+            'content': 'v1',
+          })).ok,
+          isTrue,
+        );
+        // 连续 21 步其它工具后再写：超出窗口要求重读。
+        for (var i = 0; i < 21; i++) {
+          await tools.execute('list_files', {'path': '.'});
+        }
+        final stale = await tools.execute('write_file', {
+          'path': 'w.txt',
+          'content': 'v2',
+        });
+        expect(stale.ok, isFalse);
+        expect(stale.output, contains('请先 read 该文件再写'));
+      });
+
+      test('写台账按会话分桶：registry区内写透传sessionId（源码口径）', () async {
+        // 复现：tool_registry 区内写 tools.execute 漏传 sessionId——
+        // read-before-write 台账记进 '' 桶：真实会话基线丢失（防盲覆盖
+        // 第二层守卫失效，仅剩 expectedContent 兜底），且 '' 桶无清理路径
+        // 缓慢累积。修复：区内写与区外写同口径透传 sessionId。
+        // ignore: avoid_slow_async_io
+        final src = await readLibSource('ai/tool_registry.dart');
+        expect(
+          src.contains(
+            'tools.execute(toolName, guardedArgs, sessionId: sessionId)',
+          ),
+          isTrue,
+          reason: '区内写必须透传 sessionId',
+        );
+        expect(
+          src.contains('tools.executeApprovedWrite(toolName, guardedArgs)'),
+          isFalse,
+          reason: '区外写旧的无 sessionId 调用应已消除',
+        );
+      });
     });
 
     test('ACI失配带近似行建议', () async {
@@ -1450,6 +1672,59 @@ void main() {
       expect(r.output, contains('最接近'));
     });
 
+    test('read_file语义锚定：按anchor行取回整个函数/类块', () async {
+      // 复现：offset/limit 切片看栈追踪对应实现要多轮往返。
+      // 修复：anchor 按缩进锚定返回包含该行的整个函数/类块。
+      final dir = await Directory.systemTemp.createTemp('anchor-b5-');
+      addTearDown(() async {
+        if (await dir.exists()) await dir.delete(recursive: true);
+      });
+      final src = [
+        'class Foo {',
+        '  int bar() {',
+        '    return 1;',
+        '  }',
+        '',
+        '  int baz() {',
+        '    // deep line',
+        '    return 2;',
+        '  }',
+        '}',
+        '',
+        'void main() {',
+        '  print(Foo().baz());',
+        '}',
+      ].join('\n');
+      await File(p.join(dir.path, 'a.dart')).writeAsString(src);
+      final tools = AgentTools(rootPath: dir.path);
+      // 锚定块内任意行（deep line，0-based 行 6）→ 取回整个 baz 方法。
+      final r = await tools.execute('read_file', {
+        'path': 'a.dart',
+        'anchor': 6,
+      });
+      expect(r.ok, isTrue, reason: r.output);
+      expect(r.output, contains('缩进锚定块 5-8'));
+      expect(r.output, contains('int baz() {'));
+      expect(r.output, contains('return 2;'));
+      // 不包含相邻方法/类外内容。
+      expect(r.output.contains('int bar()'), isFalse);
+      expect(r.output.contains('void main()'), isFalse);
+      // 锚定空行归属下个非空行（0-based 行 4 空行 → baz 块）。
+      final r2 = await tools.execute('read_file', {
+        'path': 'a.dart',
+        'anchor': 4,
+      });
+      expect(r2.ok, isTrue);
+      expect(r2.output, contains('int baz() {'));
+      // 越界显错。
+      final r3 = await tools.execute('read_file', {
+        'path': 'a.dart',
+        'anchor': 999,
+      });
+      expect(r3.ok, isFalse);
+      expect(r3.output, contains('anchor 越界'));
+    });
+
     test('坏key保留条目：改他条不丢坏条密文', () async {
       // 强制设备密钥文件路径：macOS 走钥匙串、Linux CI 缺 secret-tool /
       // Windows 凭据后端失败均回退 _deviceKeyFile → getApplicationSupport
@@ -1466,7 +1741,8 @@ void main() {
         } catch (_) {}
       });
       SharedPreferences.setMockInitialValues({
-        'aiProviders': '[{"id":"p1","name":"P1","baseUrl":"https://x","fullUrl":false,"token":"enc:v5:bad:bad:bad"},{"id":"p2","name":"P2","baseUrl":"https://y","fullUrl":false,"token":"plain2"}]',
+        'aiProviders':
+            '[{"id":"p1","name":"P1","baseUrl":"https://x","fullUrl":false,"token":"enc:v5:bad:bad:bad"},{"id":"p2","name":"P2","baseUrl":"https://y","fullUrl":false,"token":"plain2"}]',
       });
       final store = await SettingsStore.init();
       final raw = store.providersRaw;
@@ -1488,14 +1764,15 @@ void main() {
     });
 
     test('Hook哈希真sha256口径', () async {
-      final src = await File('lib/ai/agent_runner.dart').readAsString();
+      final src = await readLibSource('ai/agent_runner.dart');
       expect(src.contains('R5-H1'), isTrue);
       expect(src.contains('sha256.convert(bytes)'), isTrue);
     });
 
     test('单坏key迁移不崩整列', () async {
       SharedPreferences.setMockInitialValues({
-        'aiProviders': '[{"id":"p1","name":"P1","baseUrl":"https://x","fullUrl":false,"token":"enc:v5:bad:bad:bad"},{"id":"p2","name":"P2","baseUrl":"https://y","fullUrl":false,"token":"plain2"}]',
+        'aiProviders':
+            '[{"id":"p1","name":"P1","baseUrl":"https://x","fullUrl":false,"token":"enc:v5:bad:bad:bad"},{"id":"p2","name":"P2","baseUrl":"https://y","fullUrl":false,"token":"plain2"}]',
       });
       final store = await SettingsStore.init();
       final decoded = await store.providersDecrypted();
@@ -1504,5 +1781,113 @@ void main() {
       final p2 = decoded.firstWhere((e) => e['id'] == 'p2');
       expect(p2['token'], 'plain2');
     });
+  });
+
+  group('read_file 单行超长钳制', () {
+    test('>2000字符截断并注明总长', () async {
+      final dir = await Directory.systemTemp.createTemp('read-clamp-');
+      final tools = AgentTools(rootPath: dir.path);
+      try {
+        // 单行压缩文件：512KB 内整行此前直灌上下文。
+        final bigLine = 'a' * 5000;
+        final content = '{"k":"$bigLine"}';
+        await File(p.join(dir.path, 'one.json')).writeAsString(content);
+        final r = await tools.execute('read_file', {'path': 'one.json'});
+        expect(r.ok, isTrue, reason: r.output);
+        expect(r.output, contains('本行超长已截断'));
+        expect(r.output, contains('总长 ${content.length} 字符'));
+        // 输出不再整行回传：远小于原行长度。
+        expect(r.output.length, lessThan(content.length));
+        // 短行文件不受影响。
+        await File(p.join(dir.path, 'small.txt')).writeAsString('a\nb\n');
+        final r2 = await tools.execute('read_file', {'path': 'small.txt'});
+        expect(r2.ok, isTrue);
+        expect(r2.output, isNot(contains('本行超长已截断')));
+        expect(r2.output, contains('a\nb'));
+      } finally {
+        try {
+          await tools.disposeBackgroundTasks();
+        } catch (_) {}
+        try {
+          await dir.delete(recursive: true);
+        } catch (_) {}
+      }
+    });
+  });
+
+  group('computer 工具超时杀进程', () {
+    test(
+      'timeout=1s 执行 sleep 60：超时返回 124 且不悬挂',
+      () async {
+        final tools = AgentComputerTools();
+        final sw = Stopwatch()..start();
+        final r = await tools.runForTest('/bin/sleep', const [
+          '60',
+        ], timeout: const Duration(seconds: 1));
+        sw.stop();
+        expect(r.exitCode, 124);
+        expect(r.err, contains('已熔断'));
+        expect(
+          sw.elapsed,
+          lessThan(const Duration(seconds: 5)),
+          reason: '超时后必须及时返回（进程被 kill）',
+        );
+      },
+      timeout: const Timeout(Duration(seconds: 15)),
+    );
+
+    test('源码口径：_run 用 Process.start+kill', () {
+      final src = readLibSourceSync('ai/agent_computer_tools.dart');
+      final idx = src.indexOf('proc = await Process.start(exe, args);');
+      expect(idx, greaterThanOrEqualTo(0));
+      final body = src.substring(idx, idx + 900);
+      expect(body.contains('kill'), isTrue);
+    });
+  });
+
+  group('回收站恢复跨盘 fail-closed', () {
+    test('半拷贝不删源（源码口径）', () async {
+      final src = await readLibSource('ai/agent_tools.dart');
+      expect(src.contains('回收站恢复不完整（大小不一致）'), isTrue);
+    });
+  });
+
+  group('写链 canonical 键归一', () {
+    test('alias 与 real 同串行（行为口径）', () async {
+      final dir = await Directory.systemTemp.createTemp('filekey-');
+      try {
+        final real = File(p.join(dir.path, 'real.txt'));
+        await real.writeAsString('a');
+        final k1 = AgentTools.canonicalFileKeyForTest(real.path);
+        final k2 = AgentTools.canonicalFileKeyForTest(real.path);
+        expect(k1.isNotEmpty, isTrue);
+        expect(k1, k2);
+        expect(AgentTools.canonicalFileKeyForTest('  '), '');
+      } finally {
+        try {
+          await dir.delete(recursive: true);
+        } catch (_) {}
+      }
+    });
+  });
+
+  test('T36 spawn_subagent 暴露 async 参数，poll_task 描述提 spawnId', () {
+    Map<String, dynamic> fnOf(String name) => Map<String, dynamic>.from(
+      (AgentToolSchemas.base().firstWhere(
+            (t) => '${(t['function'] as Map)['name']}' == name,
+          )['function']
+          as Map),
+    );
+
+    final spawn =
+        (fnOf('spawn_subagent')['parameters'] as Map)['properties'] as Map;
+    final async_ = spawn['async'] as Map;
+    expect(async_['type'], 'boolean');
+    expect('${async_['description']}', contains('poll_task'));
+
+    // 默认不阻塞：未传 async 时 schema 不强制，Runner 侧 async 默认 false。
+    expect((fnOf('spawn_subagent')['parameters'] as Map)['required'], ['task']);
+    // poll_task 描述须提 spawnId，否则模型不知异步 id 从哪取回。
+    expect('${fnOf('poll_task')['description']}', contains('spawnId'));
   });
 }

@@ -5,10 +5,17 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 
+import '../diagnostics/app_logger.dart';
 import '../settings/secret_vault.dart';
 import '../settings/settings_store.dart';
 import 'mcp_client.dart';
 import 'mcp_config.dart';
+import 'mcp_managed_policy.dart';
+
+part 'mcp_manager_load.dart';
+part 'mcp_manager_servers.dart';
+
+part 'mcp_manager_queries.dart';
 
 /// 全局 MCP 管理：配置落盘、连接生命周期、工具聚合。
 class McpManager extends ChangeNotifier {
@@ -22,6 +29,56 @@ class McpManager extends ChangeNotifier {
   final Map<String, String> _lastFailure = {};
   bool _loaded = false;
 
+  /// G-R2-14：托管策略（工作区 .my_ide/mcp-managed.json）——deny 优先
+  /// 且用户不可覆盖；未设置/未托管时为 null，行为零变化。
+  McpManagedPolicy? _managedPolicy;
+  String? _managedRoot;
+  bool _managedLoaded = false;
+  Future<void>? _managedReload;
+
+  /// 分域 part 桥接：extension 内不可直接调用受 @protected 的 notifyListeners。
+  void notifyMcpChanged() => notifyListeners();
+
+  /// 工作区根接入：项目打开/切换（ide_shell）与设置面板打开时注入，
+  /// 触发策略重载并广播（面板启用开关态随策略刷新）。
+  set managedWorkspaceRoot(String? root) {
+    final next = (root == null || root.trim().isEmpty) ? null : root.trim();
+    if (next == _managedRoot && _managedLoaded) return;
+    _managedRoot = next;
+    _managedLoaded = false;
+    _managedPolicy = null;
+    _managedReload = _reloadManagedPolicy();
+  }
+
+  Future<void> _reloadManagedPolicy() async {
+    // 规则1自检修复：进入时快照 root，await 后校验——快速连续切工作区时
+    // 旧 reload 晚于新 reload 完成，会把陈旧 _managedPolicy 回写覆盖新策略
+    // （陈旧 root 的旧数据回灌）。
+    final rootSnapshot = _managedRoot;
+    final policy = await McpManagedPolicy.loadFor(rootSnapshot);
+    if (!identical(rootSnapshot, _managedRoot)) return;
+    _managedPolicy = policy;
+    _managedLoaded = true;
+    notifyListeners();
+  }
+
+  /// G-R2-14：托管拒绝判定（连接前校验/开关双闸共用口径）。
+  /// 未托管返回 null 放行；denied 命中或 allowManagedOnly 清单外返回原因。
+  String? managedRejectionFor(String serverName) =>
+      _managedPolicy?.rejectionFor(serverName);
+
+  McpManagedPolicy? get managedPolicyForTest => _managedPolicy;
+
+  /// D14 测试可见：连接代际（remove 后不得删键，只递增）。
+  @visibleForTesting
+  int? connectGenForTest(String id) => _connectGen[id];
+
+  /// 测试钩子：等待策略重载完成（setter 为 fire-and-forget）。
+  @visibleForTesting
+  Future<void> managedPolicyLoadedForTest() async {
+    await _managedReload;
+  }
+
   List<McpServerConfig> get servers => List.unmodifiable(_servers);
 
   String statusOf(String id) => _status[id] ?? 'idle';
@@ -31,164 +88,6 @@ class McpManager extends ChangeNotifier {
   McpSession? sessionOf(String id) => _sessions[id];
 
   /// R7：聚合已连接服务器的 resources（serverId -> 列表）。
-  Future<Map<String, List<Map<String, dynamic>>>> listAllResources() async {
-    final out = <String, List<Map<String, dynamic>>>{};
-    // 快照后遍历：await 间隙 upsert/remove 改 _servers 会抛 ConcurrentModificationError。
-    for (final s in List<McpServerConfig>.from(_servers)) {
-      if (!s.enabled) continue;
-      final session = _sessions[s.id];
-      if (session == null || !session.connected) continue;
-      try {
-        final list = await session.listResources();
-        if (list.isNotEmpty) out[s.id] = list;
-      } catch (_) {}
-    }
-    return out;
-  }
-
-  /// R7：聚合已连接服务器的 prompts（serverId -> 列表）。
-  Future<Map<String, List<Map<String, dynamic>>>> listAllPrompts() async {
-    final out = <String, List<Map<String, dynamic>>>{};
-    for (final s in List<McpServerConfig>.from(_servers)) {
-      if (!s.enabled) continue;
-      final session = _sessions[s.id];
-      if (session == null || !session.connected) continue;
-      try {
-        final list = await session.listPrompts();
-        if (list.isNotEmpty) out[s.id] = list;
-      } catch (_) {}
-    }
-    return out;
-  }
-
-  List<McpToolDef> get allTools {
-    final out = <McpToolDef>[];
-    // 快照后遍历：与 listAllResources/listAllPrompts 同理，await 间隙
-    // upsert/remove 改 _servers 会抛 ConcurrentModificationError。
-    for (final s in List<McpServerConfig>.from(_servers)) {
-      if (!s.enabled) continue;
-      final session = _sessions[s.id];
-      if (session == null || !session.connected) continue;
-      for (final t in session.tools) {
-        if (s.disabledTools.contains(t.name)) continue;
-        out.add(t);
-      }
-    }
-    return out;
-  }
-
-  /// per-tool 开关：禁用/启用某 server 的单个原生工具名。
-  Future<void> setToolEnabled(
-    String serverId,
-    String toolName, {
-    required bool enabled,
-  }) async {
-    final idx = _servers.indexWhere((e) => e.id == serverId);
-    if (idx < 0) return;
-    if (enabled) {
-      _servers[idx].disabledTools.remove(toolName);
-    } else {
-      _servers[idx].disabledTools.add(toolName);
-    }
-    await _persist();
-    notifyListeners();
-  }
-
-  bool isToolEnabled(String serverId, String toolName) {
-    for (final s in _servers) {
-      if (s.id != serverId) continue;
-      return !s.disabledTools.contains(toolName);
-    }
-    return true;
-  }
-
-  /// server 级分级查询：read/write/network，供执行审批分流。
-  McpToolLevel levelOfServerId(String serverId) {
-    for (final s in _servers) {
-      if (s.id == serverId) return s.toolLevel;
-    }
-    return McpToolLevel.write;
-  }
-
-  /// qualifiedName 反查 serverId（按 safeToken/原名匹配）。
-  /// 碰撞时按原名精确命中优先：恶意 import 服务器用 `a_b` 影子
-  /// 可信 `a b`（同 safeToken）时，原名调用仍路由到可信方，
-  /// 而非插入序先胜者。无原名精确命中时返回 null（调用方拒绝），
-  /// 不做 safeToken 模糊兜底：模糊路由会把调用送到同前缀的恶意方。
-  String? serverIdOfQualified(String qualifiedName) {
-    final split = McpToolDef.splitQualifiedName(qualifiedName);
-    if (split == null) return null;
-    for (final s in _servers) {
-      if (s.name == split.serverKey) return s.id;
-    }
-    return null;
-  }
-
-  String? toolNameOfQualified(String qualifiedName) =>
-      McpToolDef.splitQualifiedName(qualifiedName)?.toolName;
-
-  /// 工具数/token 预算过滤：超预算时按“名含任务关键词”优先，其余按原序截断，
-  /// 不再全量注入 prompt。query 为本轮用户文本。
-  /// R2-08：按server独立截断——此前cap取全局最小单server maxTools，
-  /// 一恶意maxTools=1即拖死全局。现各server独立按自家maxTools截断后合并。
-  List<McpToolDef> filteredToolsForPrompt(String query, {int? budget}) {
-    final all = allTools;
-    final globalCap = (budget ?? 40).clamp(1, 200);
-    if (all.length <= globalCap) return all;
-    final byServer = <String, List<McpToolDef>>{};
-    for (final t in all) {
-      (byServer[t.serverId] ??= []).add(t);
-    }
-    int serverCapOf(String serverId) {
-      for (final s in _servers) {
-        if (s.id == serverId) return s.maxTools.clamp(1, 200);
-      }
-      return globalCap;
-    }
-    final q = query.toLowerCase();
-    final keywords = q
-        .split(RegExp(r'[^a-z0-9\u4e00-\u9fa5_]+'))
-        .where((e) => e.length >= 2)
-        .toSet();
-    int score(McpToolDef t) {
-      final hay = '${t.serverName} ${t.name} ${t.description}'.toLowerCase();
-      var s = 0;
-      for (final k in keywords) {
-        if (hay.contains(k)) s += k.length >= 4 ? 2 : 1;
-      }
-      return s;
-    }
-
-    final ranked = List<McpToolDef>.from(all)
-      ..sort((a, b) => score(b).compareTo(score(a)));
-    // R2-08：各server独立按自家cap取后合并，再按全局cap封顶。
-    final picked = <McpToolDef>[];
-    final perServerRanked = <String, List<McpToolDef>>{};
-    for (final t in ranked) {
-      (perServerRanked[t.serverId] ??= []).add(t);
-    }
-    for (final e in perServerRanked.entries) {
-      picked.addAll(e.value.take(serverCapOf(e.key)));
-    }
-    picked.sort((a, b) => score(b).compareTo(score(a)));
-    return picked.take(globalCap).toList(growable: false);
-  }
-
-  /// safeToken 碰撞告警：`a b` 与原生 `a_b` 会生成同名工具，需提示改名。
-  List<String> safeTokenCollisions() {
-    final seen = <String, String>{};
-    final out = <String>[];
-    for (final s in _servers) {
-      final token = McpToolDef.safeToken(s.name);
-      final prev = seen[token];
-      if (prev != null && prev != s.name) {
-        out.add('MCP 服务器名冲突：「$prev」与「${s.name}」映射为同一工具前缀 $token，请改名');
-      } else {
-        seen[token] = s.name;
-      }
-    }
-    return out;
-  }
 
   Future<void> ensureLoaded() async {
     if (_loaded) return;
@@ -208,71 +107,6 @@ class McpManager extends ChangeNotifier {
 
   Future<void>? _loadFuture;
 
-  Future<void> _ensureLoadedInner() async {
-    final raw = SettingsStore.instance.getString('mcpServers') ?? '[]';
-    // 备份恢复（webdav）直写 store，绕过 importRaw 的 enabled=false 门禁，
-    // 且其 _safeRestoreMcp 无 command 白名单校验。此处用持久化快照比对识别
-    // 外部写入：不一致即判定为恢复注入，本批一律 enabled=false（与 importRaw
-    // 口径一致），用户在设置页逐个启用（setEnabled→connect）即明示同意。
-    // 快照缺失视为首次启动/旧版本升级，不误禁存量配置。
-    // 轮次1：'__writing__' 哨兵 = 上次自身持久化中断（数据已写快照未写）
-    // ——按正常加载处理并回写快照，防止窗口期外部恢复绕过门禁。
-    final snapshotRaw = SettingsStore.instance.getString('mcpServersSnapshot');
-    final selfPersistInterrupted = snapshotRaw == '__writing__';
-    final restoredExternally = !selfPersistInterrupted &&
-        snapshotRaw != null &&
-        snapshotRaw != raw;
-    try {
-      final list = jsonDecode(raw) as List;
-      _servers
-        ..clear()
-        ..addAll(list.whereType<Map>().map(
-              (e) => McpServerConfig.fromJson(
-                  _decodeSecrets(Map<String, dynamic>.from(e))),
-            ));
-      if (restoredExternally) {
-        for (final s in _servers) {
-          s.enabled = false;
-        }
-      }
-    } catch (_) {
-      _servers.clear();
-    }
-    final runtime = SettingsStore.instance.getString('mcpRuntimeState');
-    if (runtime != null) {
-      try {
-        final decoded = jsonDecode(runtime);
-        final failures = decoded is Map ? decoded['failures'] : null;
-        if (failures is Map) {
-          _lastFailure.addAll(failures.map((k, v) => MapEntry('$k', '$v')));
-          for (final entry in _lastFailure.entries) {
-            _status[entry.key] = 'error: ${entry.value}';
-          }
-        }
-      } catch (_) {}
-    }
-    notifyListeners();
-    if (restoredExternally || selfPersistInterrupted) {
-      try {
-        // 立即回写：落盘禁用态并刷新快照，避免下次启动重复走恢复分支。
-        // 轮次1：哨兵场景同样回写消除 '__writing__'，防止窗口期外部
-        // 恢复在无快照校验下绕过门禁。
-        await _persist();
-      } catch (_) {
-        // 回写失败不阻断加载：内存禁用已生效，下次启动重走恢复分支。
-      }
-    }
-    for (final s in List<McpServerConfig>.from(_servers)) {
-      if (s.enabled) {
-        // ignore: unawaited_futures
-        connect(s.id);
-      }
-    }
-    // 同步解码遇到 v4 即后台重加密迁移，不阻塞启动连接。
-    // ignore: unawaited_futures
-    migrateMcpSecretsToDeviceKey();
-  }
-
   Future<void> _persistRuntimeState() async {
     // R1-T1同口径：单测未初始化时不落盘，只保内存态。
     if (SettingsStore.maybeInstance == null) return;
@@ -285,7 +119,26 @@ class McpManager extends ChangeNotifier {
     );
   }
 
-  Future<void> _persist() async {
+  /// D3：持久化单飞队列（仿 SettingsStore._serializedWrite）——_persist
+  /// 三次 setString（哨兵→数据→快照）非原子，此前并发 _persist 交错执行
+  /// 会落盘 snapshot≠raw 的中间态，下次启动全部 server 被误判"恢复注入"
+  /// 强制禁用。现同一时刻仅一个写体运行，后到写排队等前序完成。
+  Future<void>? _pendingPersist;
+
+  Future<T> _serializedPersist<T>(Future<T> Function() action) {
+    final prev = _pendingPersist;
+    final Future<void> waited = prev == null
+        ? Future<void>.value()
+        // 前序写失败不阻断后续写。
+        : prev.then<void>((_) {}, onError: (Object _) {});
+    final next = waited.then((_) => action());
+    _pendingPersist = next.then<void>((_) {}, onError: (Object _) {});
+    return next;
+  }
+
+  Future<void> _persist() => _serializedPersist(_persistLocked);
+
+  Future<void> _persistLocked() async {
     // R1-T1：单测/未初始化时SettingsStore.instance抛Null check，
     // 此前upsert/remove直调_persist即崩。守卫后仅改内存+通知，
     // 不落盘（调用方ensureLoaded后正常路径仍落盘）。
@@ -325,10 +178,13 @@ class McpManager extends ChangeNotifier {
     // snapshot≠raw，下次启动全部服务器被误判"恢复注入"强制禁用。
     // '__writing__' 哨兵标记上次为自身持久化中断，加载侧按正常加载
     // 处理并回写快照消除哨兵；外部直写（webdav 恢复）不带哨兵仍被识别。
+    // R-PERSIST-WIN：顺序为"哨兵 → 数据 → 快照"——旧顺序是
+    // 哨兵 → 快照 → 数据，在"快照已写、数据未写"窗口崩溃时
+    // snapshot≠raw 被误判为外部恢复注入、全部 server 强制禁用。
+    // 新顺序下该窗口的 snapshot 仍是 '__writing__' 哨兵，加载侧据此
+    // 判 selfPersistInterrupted=按正常加载并回写快照消除哨兵。
     await SettingsStore.instance.setString('mcpServersSnapshot', '__writing__');
     await SettingsStore.instance.setString('mcpServers', encodedJson);
-    // 快照与数据同写：加载侧比对不一致即判定为备份恢复等外部直写，
-    // 强制恢复批 enabled=false（见 _ensureLoadedInner）。
     await SettingsStore.instance.setString('mcpServersSnapshot', encodedJson);
   }
 
@@ -400,90 +256,6 @@ class McpManager extends ChangeNotifier {
     }
   }
 
-  Future<void> upsert(McpServerConfig config) async {
-    // 毒配置门禁（OpenClaw policy-is-code）：含 shell 元字符/穿越的 stdio
-    // command 不得落盘直跑，强制禁用由用户逐个启用即明示同意。
-    if (config.transport == McpTransportType.stdio &&
-        !isSafeStdioConfig(config)) {
-      config.enabled = false;
-    }
-    final idx = _servers.indexWhere((e) => e.id == config.id);
-    if (idx >= 0) {
-      _servers[idx] = config;
-    } else {
-      _servers.add(config);
-    }
-    await _persist();
-    notifyListeners();
-  }
-
-  Future<void> remove(String id) async {
-    await disconnect(id);
-    _connectGen.remove(id);
-    // 轮次1：已删服务器残留状态键清理——此前 _status/_lastFailure/
-    // _connectFailCount 留 idle/错误键，重装同 id 或 UI 读取时显示旧状态。
-    _status.remove(id);
-    _lastFailure.remove(id);
-    _connectFailCount.remove(id);
-    await _persistRuntimeState();
-    final removed = _servers.where((e) => e.id == id).toList();
-    _servers.removeWhere((e) => e.id == id);
-    for (final server in removed) {
-      await _cleanupInstallDirectory(server);
-    }
-    await _persist();
-    notifyListeners();
-  }
-
-  Future<void> _cleanupInstallDirectory(McpServerConfig server) async {
-    final dir = server.installDirectory?.trim();
-    if (dir == null || dir.isEmpty) return;
-    if (server.transport != McpTransportType.stdio) return;
-    try {
-      // 托管目录删除加固：相对路径/父目录穿越直接拒绝，避免误删工作区；
-      // 非绝对路径一律不删。realpath 消 symlink 后再判：预埋链接指向
-      // 工作区根时 startsWith 仍可绕过，必须按真实路径校验。
-      // T8 收敛到托管父目录：外部 JSON 可控 installDirectory + 本地进程
-      // 可种 marker 即组合成任意目录删除；此处只允许应用托管根下两层目录，
-      // 家目录/系统前缀/托管根外一律 fail-closed 不删。
-      final managedRoot = await _managedInstallRoot();
-      if (managedRoot.isEmpty) return;
-      final type = FileSystemEntity.typeSync(dir, followLinks: false);
-      if (type == FileSystemEntityType.link) return;
-      final realDir = Directory(dir).resolveSymbolicLinksSync();
-      if (!realDir.startsWith('/')) return;
-      final normalized = p.normalize(Directory(realDir).absolute.path);
-      if (normalized == managedRoot ||
-          !p.isWithin(managedRoot, normalized) ||
-          p.relative(normalized, from: managedRoot).split(Platform.pathSeparator).length != 2) {
-        return;
-      }
-      if (_isSystemPrefix(normalized)) return;
-      // HOME 缺失 fail-closed：此前 HOME 为空即跳过家目录检查直接删。
-      final home = Platform.environment['HOME'];
-      if (home == null || home.isEmpty) return;
-      final directory = Directory(realDir);
-      if (!await directory.exists()) return;
-      final marker = File('${directory.path}/.my_ide_mcp_managed');
-      if (!await marker.exists()) return;
-      // 仅删标记目录自身内容，目录不存在/标记缺失即停，不做递归上溯。
-      await directory.delete(recursive: true);
-    } catch (_) {}
-  }
-
-  /// 应用托管根：~/.cache/my_ide/mcp-installs（macOS/Linux），
-  /// HOME 缺失返回空由调用方 fail-closed。
-  Future<String> _managedInstallRoot() async {
-    try {
-      final home = Platform.environment['HOME'];
-      if (home == null || home.isEmpty) return '';
-      final realHome = p.normalize(Directory(home).resolveSymbolicLinksSync());
-      return p.normalize(p.join(realHome, '.cache', 'my_ide', 'mcp-installs'));
-    } catch (_) {
-      return '';
-    }
-  }
-
   static bool _isSystemPrefix(String normalized) {
     const blocked = {
       '/',
@@ -521,6 +293,12 @@ class McpManager extends ChangeNotifier {
   static const allowedStdioCommands = {
     'npx',
     'uvx',
+    'uv',
+    // S4-9：pip/pip3/npm（npm exec）同为已知包管理器启动器——纳入白名单
+    // 后由下方位置参数包名审计承接（裸包名/scoped 未钉版本仍判不安全）。
+    'pip',
+    'pip3',
+    'npm',
     'python',
     'python3',
     'node',
@@ -531,6 +309,34 @@ class McpManager extends ChangeNotifier {
 
   static bool isAllowedStdioCommandForTest(String command) =>
       allowedStdioCommands.contains(command.trim().toLowerCase());
+
+  /// S4-9：包管理器启动器（npx/uvx/uv/pip/pip3/npm，npm exec 同属 npm）。
+  /// 其位置参数一律按包名审计；node/python/docker 等位置参数是脚本路径/
+  /// 容器参数，不做包名审计。
+  static const _packageLauncherCommands = {
+    'npx',
+    'uvx',
+    'uv',
+    'pip',
+    'pip3',
+    'npm',
+  };
+
+  /// S4-9：已知带值 flag——其值（路径/仓库地址/包说明）不当包名审计，
+  /// flag 与其值一并跳过。`--flag=value` 内联形态只跳过自身。
+  static const _launcherValueFlags = {
+    // npm/npx
+    '-p', '--package', '-c', '--call', '--registry', '--cache',
+    '--userconfig', '--workspace',
+    // uv/uvx
+    '--from', '--with', '--python', '--index-url', '--find-links',
+    // pip
+    '-r', '--requirement', '-t', '--target', '--prefix', '-i',
+    '--extra-index-url', '--src',
+  };
+
+  /// S4-9：pip/npm 的子命令（install/exec/i）不是包名，不参与审计。
+  static const _launcherSubcommands = {'install', 'exec', 'i'};
 
   static bool isSafeStdioConfig(McpServerConfig cfg) {
     final command = cfg.command.trim();
@@ -543,26 +349,33 @@ class McpManager extends ChangeNotifier {
     }
     // R2-M1：args同审——此前只审command不审args，
     // npx -y evil-pkg无元字符即放行，供应链包即RCE。
-    // 轮次1：包名投毒检查落地——此前 startsWith('@') && contains(' ')
-    // 形同虚设（合法 @scope/pkg 无空格永不命中）。现按 -y/--yes 位置
-    // 解析后续包名：非作用域包名且未钉版本（无 pkg@ver 形态）即判
-    // 不安全（与注释宣称口径一致），走禁用+用户明示启用。
-    var expectPackage = false;
-    for (final a in cfg.args) {
-      if (a.length > 512) return false;
-      if (a.contains(RegExp('[;&|<>`\$()\n\r]'))) return false;
-      final t = a.trim();
-      if (t == '-y' || t == '--yes') {
-        expectPackage = true;
-        continue;
-      }
-      if (expectPackage) {
-        if (t.startsWith('-')) continue;
-        final isScoped = t.startsWith('@') && t.contains('/');
-        final isPinned = RegExp(r'@[0-9][^@\s]*$').hasMatch(t);
-        if (!isScoped && !isPinned) return false;
-        expectPackage = false;
-        continue;
+    // S4-9：包管理器启动器（npx/uvx/uv/pip/pip3/npm）全部位置参数按
+    // 包名审计：位置参数必须是钉版本包名（npm `pkg@ver`、scoped
+    // `@scope/pkg@ver`，pip `pkg==ver`），scoped 未钉版本的 `@scope/name`
+    // 同样不放行。跳过已知带值 flag 及其值与 install/exec 子命令。
+    if (_packageLauncherCommands.contains(command.toLowerCase())) {
+      var subcommandSeen = false;
+      var skipValue = false;
+      for (final a in cfg.args) {
+        if (a.length > 512) return false;
+        if (a.contains(RegExp('[;&|<>`\$()\n\r]'))) return false;
+        final t = a.trim();
+        if (skipValue) {
+          skipValue = false;
+          continue;
+        }
+        if (t.startsWith('-')) {
+          if (t.contains('=')) continue; // --flag=value：值内联，只跳自身
+          if (_launcherValueFlags.contains(t)) skipValue = true;
+          continue;
+        }
+        if (!subcommandSeen && _launcherSubcommands.contains(t)) {
+          continue; // pip/npm 子命令，不消费审计资格
+        }
+        subcommandSeen = true;
+        // 位置参数 = 包名：必须钉版本（@ver / ==ver），scoped 未钉不放行。
+        final pinned = RegExp(r'(@[0-9][^@\s]*|==[0-9][^=\s]*)$').hasMatch(t);
+        if (!pinned) return false;
       }
     }
     // R2-M1：env白名单——NODE_OPTIONS=--require evil同理RCE。
@@ -588,6 +401,19 @@ class McpManager extends ChangeNotifier {
   Future<void> setEnabled(String id, bool enabled) async {
     final idx = _servers.indexWhere((e) => e.id == id);
     if (idx < 0) return;
+    // G-R2-14：启用开关闸——托管拒绝的 server 用户不可启用（deny 优先，
+    // 用户不可覆盖）；保持禁用并落状态说明，不发起连接。
+    if (enabled) {
+      final denial = managedRejectionFor(_servers[idx].name);
+      if (denial != null) {
+        _servers[idx].enabled = false;
+        _status[id] = 'error: $denial';
+        _lastFailure[id] = denial;
+        await _persist();
+        notifyListeners();
+        return;
+      }
+    }
     _servers[idx].enabled = enabled;
     await _persist();
     notifyListeners();
@@ -610,6 +436,11 @@ class McpManager extends ChangeNotifier {
       );
       if (existing >= 0) {
         item.id = _servers[existing].id;
+        // E4：替换条目同样断开在途 session——防旧进程跑旧命令、
+        // 毒配置（enabled=false）不生效；下次调用按新配置重连。
+        if (_sessions.containsKey(item.id)) {
+          await disconnect(item.id);
+        }
         _servers[existing] = item;
       } else {
         if (item.id.trim().isEmpty) {
@@ -620,16 +451,30 @@ class McpManager extends ChangeNotifier {
     }
     await _persist();
     notifyListeners();
+    // E12：safeTokenCollisions 接线到导入后告警（此前无调用方）。
+    _warnTokenCollisions();
     return imported;
   }
 
+  /// E12：safeToken 碰撞告警落日志——`a b` 与原生 `a_b` 会生成同名工具
+  /// 前缀，路由歧义需用户改名。
+  void _warnTokenCollisions() {
+    final collisions = safeTokenCollisions();
+    if (collisions.isEmpty) return;
+    AppLogger.instance
+        .warn('MCP', '检测到 MCP 工具名冲突：${collisions.join('；')}');
+  }
+
   /// 默认脱敏导出：env/headers 打码，防复制分享泄漏密钥。
+  /// E12：exportRawWithSecrets（完整导出含密钥）零引用死代码已删，
+  /// 防误用泄漏密钥；脱敏导出为唯一导出通道。
   String exportRaw() => McpConfigImporter.exportRedactedJson(_servers);
 
-  /// 完整导出（含密钥）：仅用于本地备份，勿分享。
-  String exportRawWithSecrets() => McpConfigImporter.exportJson(_servers);
-
   final Map<String, Future<void>> _connecting = {};
+  // S4-7：connect 命中在途旧 future 的登记——旧 inner 因代际失配弃权时，
+  // 命中者（新调用方）拿到的只是旧 future 的完成信号，无人接力则白等且
+  // 无连接。命中时置标，弃权点消费后由弃权方代为重连。
+  final Map<String, bool> _connectRelay = {};
   // R3-T2：连续失败计数——坏server三轮退避仍失败即+1，成功清零，
   // >=5自动禁用熔断，不再常驻烧token。
   final Map<String, int> _connectFailCount = {};
@@ -641,23 +486,57 @@ class McpManager extends ChangeNotifier {
   Future<void> connect(String id) {
     // 同 server 并发 connect 合并：此前 disconnect+connect 交错可删掉
     // 对方刚存的新 session，泄漏旧连接。
-    return _connecting.putIfAbsent(id, () => _connectInner(id)).whenComplete(
-      () => _connecting.remove(id),
-    );
+    final existing = _connecting[id];
+    if (existing != null) {
+      // S4-7：命中在途旧 future——登记待接力；旧 inner 因代际失配弃权时
+      // 由其代为重连，命中方才不是白等一场。
+      _connectRelay[id] = true;
+      return existing.whenComplete(() {
+        if (identical(_connecting[id], existing)) _connecting.remove(id);
+      });
+    }
+    final fut = _connectInner(id);
+    _connecting[id] = fut;
+    return fut.whenComplete(() {
+      if (identical(_connecting[id], fut)) _connecting.remove(id);
+    });
+  }
+
+  /// S4-7：旧 inner 代际失配弃权时的接力重启。仅当确有调用方命中过本
+  /// 在途 future（_connectRelay 置标）才代为重连——纯 disconnect/禁用
+  /// 推进的代际尊重断开意图，不复活连接。延迟到事件循环执行：whenComplete
+  /// 的 _connecting.remove（微任务）先跑，代启 connect 落到空档新建
+  /// inner，不会命中本（已完成）future，防自旋环。
+  void _relayConnectIfRequested(String id) {
+    if (_connectRelay.remove(id) != true) return;
+    Future<void>.delayed(Duration.zero, () {
+      if (_connecting.containsKey(id)) return;
+      // ignore: unawaited_futures
+      connect(id);
+    });
   }
 
   Future<void> _connectInner(String id) async {
     final gen = (_connectGen[id] ?? 0) + 1;
     _connectGen[id] = gen;
     final idx = _servers.indexWhere((e) => e.id == id);
-    if (idx < 0) return;
+    if (idx < 0) {
+      // 规则1自检修复：非弃权退出同样清接力标记——残留 true 会被之后某次
+      // 无关的代际弃权误消费，触发一次多余 connect。
+      _connectRelay.remove(id);
+      return;
+    }
     final cfg = _servers[idx];
     // 入口复检：禁用中的 server 不再发起连接。
-    if (!cfg.enabled) return;
+    if (!cfg.enabled) {
+      _connectRelay.remove(id);
+      return;
+    }
     // R3-T2：连续失败熔断——此前坏server每次ensureLoaded/connect都三轮退避，
     // 常驻烧token。现连续失败>=5即自动禁用，需用户手动启用才再试。
     final fails = _connectFailCount[id] ?? 0;
     if (fails >= 5) {
+      _connectRelay.remove(id);
       _servers[idx].enabled = false;
       _status[id] = 'error: 连续失败已熔断，需手动启用';
       // 轮次1：熔断一并持久化禁用态——此前仅落 runtime state（failures），
@@ -671,8 +550,22 @@ class McpManager extends ChangeNotifier {
     // 第6轮R6-1：同样持久化禁用态——此前仅落runtime state，重启后enabled
     // 仍true自动重连再拒（与连续失败熔断持久化同口径收敛）。
     if (cfg.transport == McpTransportType.stdio && !isSafeStdioConfig(cfg)) {
+      _connectRelay.remove(id);
       _status[id] = 'error: 不安全 stdio 命令已拒绝';
       _lastFailure[id] = '不安全 stdio 命令已拒绝';
+      _servers[idx].enabled = false;
+      await _persist();
+      await _persistRuntimeState();
+      notifyListeners();
+      return;
+    }
+    // G-R2-14：托管白名单连接前校验——denied 命中或 allowManagedOnly
+    // 清单外拒绝连接，并持久化禁用态（deny 优先，用户重试不可绕过）。
+    final managedDenial = managedRejectionFor(cfg.name);
+    if (managedDenial != null) {
+      _connectRelay.remove(id);
+      _status[id] = 'error: $managedDenial';
+      _lastFailure[id] = managedDenial;
       _servers[idx].enabled = false;
       await _persist();
       await _persistRuntimeState();
@@ -689,9 +582,16 @@ class McpManager extends ChangeNotifier {
             Duration(seconds: 1 << (attempt - 1)));
       }
       // 退避期间若被禁用/删除/新一轮 connect，旧代际直接放弃，不再复活。
-      if (_connectGen[id] != gen) return;
+      if (_connectGen[id] != gen) {
+        // S4-7：弃权前接力——有调用方命中本 future 在等时代为重连。
+        _relayConnectIfRequested(id);
+        return;
+      }
       final cur = _servers.indexWhere((e) => e.id == id);
-      if (cur < 0 || !_servers[cur].enabled) return;
+      if (cur < 0 || !_servers[cur].enabled) {
+        _connectRelay.remove(id);
+        return;
+      }
       final session = McpSession(_servers[cur].copy());
       try {
         // R7-F1：连接包30s超时——此前无timeout，hang住即槽位永占，
@@ -701,6 +601,8 @@ class McpManager extends ChangeNotifier {
           try {
             await session.disconnect();
           } catch (_) {}
+          // S4-7：连接成功但代际失配弃权——有命中方在等时代为重连。
+          _relayConnectIfRequested(id);
           return;
         }
         // 旧 session 不在存新之前断：先存新再断旧，避免并发 disconnect
@@ -717,6 +619,8 @@ class McpManager extends ChangeNotifier {
         _status[id] = 'connected';
         _lastFailure.remove(id);
         _connectFailCount.remove(id);
+        // S4-7：正常连上即清接力标记——防残留标记被后续弃权误消费。
+        _connectRelay.remove(id);
         await _persistRuntimeState();
         notifyListeners();
         // 先存新再断旧：disconnect 并发时 remove 的是旧引用，不误删新 session。
@@ -730,10 +634,16 @@ class McpManager extends ChangeNotifier {
       }
     }
     _sessions.remove(id);
-    _status[id] = 'error: $lastErr';
-    _lastFailure[id] = '$lastErr';
+    // D6：失败摘要脱敏后才进 _status/_lastFailure——_lastFailure 会
+    // 经 _persistRuntimeState 落盘 prefs，异常串携带的凭据（如 HTTP
+    // 网关回显 Authorization 头）不得原样持久化。
+    final errText = McpSession.redactSecrets('$lastErr');
+    _status[id] = 'error: $errText';
+    _lastFailure[id] = errText;
     // R3-T2同口径：三轮退避仍失败即+1，成功已清零。
     _connectFailCount[id] = (_connectFailCount[id] ?? 0) + 1;
+    // 规则1自检修复：失败退出清接力标记（同上，防残留误消费）。
+    _connectRelay.remove(id);
     await _persistRuntimeState();
     notifyListeners();
   }
@@ -780,17 +690,9 @@ class McpManager extends ChangeNotifier {
     }
     final serverKey = split.serverKey;
     final toolName = split.toolName;
-    // 快照后遍历：await session.callTool 间隙 _servers 被改会抛并发修改。
-    // 仅原名精确命中：safeToken 模糊兜底会把调用送到同前缀恶意方，
-    // 与 serverIdOfQualified 同口径（无精确命中即拒绝）。
-    McpServerConfig? exact;
-    for (final s in List<McpServerConfig>.from(_servers)) {
-      if (!s.enabled) continue;
-      if (s.name == serverKey) {
-        exact ??= s;
-      }
-    }
-    final s = exact;
+    // D1：路由改走 _resolveServerByQualifiedKey——含空格/中文 server 名
+    // 按 safeToken 命中、碰撞按原名精确消歧、仍歧义拒绝并告警。
+    final s = _resolveServerByQualifiedKey(serverKey, enabledOnly: true);
     if (s == null) {
       return McpCallResult(ok: false, output: '未找到 MCP 服务器：$serverKey');
     }

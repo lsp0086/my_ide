@@ -2,46 +2,21 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io' show HttpDate;
 import 'dart:math';
+// BytesBuilder 的规范位置：dart:io 的转出口已标 deprecated。
+import 'dart:typed_data' show BytesBuilder;
 
 import 'package:http/http.dart' as http;
 
+import '../diagnostics/app_logger.dart';
 import 'provider_config.dart';
 import 'stream_budget.dart';
 
-class AgentToolCall {
-  AgentToolCall({
-    required this.id,
-    required this.name,
-    required this.arguments,
-  });
-
-  final String id;
-  final String name;
-  final Map<String, dynamic> arguments;
-}
-
-class AgentStreamEvent {
-  AgentStreamEvent({
-    this.content,
-    this.reasoning,
-    this.toolCall,
-    this.done = false,
-    this.promptTokens,
-    this.completionTokens,
-    this.totalTokens,
-    this.responseId,
-  });
-
-  final String? content;
-  final String? reasoning;
-  final AgentToolCall? toolCall;
-  final bool done;
-  final int? promptTokens;
-  final int? completionTokens;
-  final int? totalTokens;
-  /// Responses 多轮复用：response.completed 里服务端的 response.id。
-  final String? responseId;
-}
+part 'agent_client_models.dart';
+part 'agent_client_retry.dart';
+part 'agent_client_openai.dart';
+part 'agent_client_responses.dart';
+part 'agent_client_anthropic.dart';
+part 'agent_client_util.dart';
 
 /// 流式客户端：默认 OpenAI 兼容；Anthropic 走独立 Messages 路径，不改动原 OpenAI 逻辑。
 class AgentClient {
@@ -50,6 +25,10 @@ class AgentClient {
 
   final http.Client _http;
   final Set<String> _abortedSessions = {};
+  // S1-6：取消标记/重置时间戳——attempt0 只摘"早于本轮重置"的陈旧标记，
+  // 发送前新点的取消（晚于重置）不得被吞。
+  final Map<String, DateTime> _abortAt = {};
+  final Map<String, DateTime> _abortResetAt = {};
 
   /// 中断指定会话的流式请求：仅按会话标记中断，不关闭/重建共享连接，
   /// R1-07：此前 abort('') close+重建共享 http.Client，误伤并行会话在途流。
@@ -57,9 +36,11 @@ class AgentClient {
   void abort({String sessionId = ''}) {
     if (sessionId.isEmpty) {
       _abortedSessions.add('');
+      _abortAt[''] = DateTime.now();
       return;
     }
     _abortedSessions.add(sessionId);
+    _abortAt[sessionId] = DateTime.now();
   }
 
   bool isAborted(String sessionId) =>
@@ -67,19 +48,158 @@ class AgentClient {
 
   /// 新一轮开始前调用：上一轮 abort 后若尚未成功请求，允许重建连接，
   /// 避免“中断一次就永久 StateError”。运行时机由 Runner.run 入口调用。
+  /// R1-2：空 key 不再全局 clear——此前请求成功路径 resetAbort('')
+  /// 把并行会话的取消标记一并洗掉（B 已取消仍继续烧 token）；
+  /// 空 key 只摘除全局标记自身。
+  /// S1-6：重置时记录时间戳——_sendWithRetry attempt0 只摘早于该时间戳的
+  /// 陈旧标记；重置后新点的取消保留，发送前快速失败不被吞。
   void resetAbort({String sessionId = ''}) {
-    if (sessionId.isEmpty) {
-      _abortedSessions.clear();
-      return;
-    }
     _abortedSessions.remove(sessionId);
+    _abortAt.remove(sessionId);
+    _abortResetAt[sessionId] = DateTime.now();
+  }
+
+  // A22：resetAllAbort 已删除（全库零调用，“无参全清”由 resetGlobalAbort
+  // 只摘 '' 标记的口径覆盖，不再整库 clear 误伤并行会话）。
+
+  /// A1：仅摘除全局标记 `''`（无参 abort 遗留），不动各会话独立标记。
+  /// 此前 resetAllAbort 全库零调用：一次全局取消后 `''` 永久残留，
+  /// isAborted 对所有会话永真——网络错被当用户中断、重试全失效。
+  /// 新 run 入口调用即可，并行会话各自的 per-session 标记不受影响。
+  void resetGlobalAbort() {
+    _abortedSessions.remove('');
+    _abortAt.remove('');
   }
 
   /// 非 2xx 时的额外重试次数（不含首次）。默认 5；0 表示不重试。
   int maxRetries;
 
+  /// 连接/流式预算工厂：生产恒为默认预算；测试覆写以缩短 connectTimeout，
+  /// 免去 15s 真实等待（A3 孤儿响应排干的回归测试用）。
+  StreamBudget createStreamBudget() => StreamBudget();
+
   /// 对齐 Continue：相对 apiBase 拼对话端点。
   String chatUrl(AiProviderConfig provider) => provider.chatUrl;
+
+  // ── G2-6 供应商连通性预检（来源 OpenHands pre-flight validation）──
+
+  /// 非流式预检：按协议发一条最小请求，只验连接/鉴权/限流，
+  /// 复用 authHeaders（含自定义头与鉴权头），不走流式重试与退避。
+  /// 返回 (ok, message)：message 面向 UI 展示，已脱敏+截断，不含 key 原文。
+  Future<(bool ok, String message)> pingProvider(
+    AiProviderConfig provider, {
+    Duration timeout = const Duration(seconds: 15),
+  }) async {
+    final deadline = DateTime.now().add(timeout);
+    final Uri url;
+    try {
+      url = Uri.parse(provider.chatUrl);
+    } catch (_) {
+      // baseUrl 非法（半截 URL/缺协议）与拒连同口径提示。
+      return (false, '无法连接（检查网络/baseUrl）');
+    }
+    // Responses 的 max_output_tokens 服务端下限 16：传 1 必 400。
+    final body = provider.isResponses
+        ? <String, dynamic>{
+            'input': 'ping',
+            'max_output_tokens': 16,
+          }
+        : <String, dynamic>{
+            'max_tokens': 1,
+            'messages': [
+              {'role': 'user', 'content': 'ping'}
+            ],
+          };
+    final modelId = _pingModelId(provider);
+    if (modelId != null) body['model'] = modelId;
+
+    final request = http.Request('POST', url);
+    request.headers['Content-Type'] = 'application/json';
+    request.headers['Accept'] = 'application/json';
+    request.headers.addAll(provider.authHeaders());
+    request.body = jsonEncode(body);
+
+    final sendFuture = _http.send(request);
+    http.StreamedResponse response;
+    try {
+      response = await sendFuture.timeout(deadline.difference(DateTime.now()));
+    } on TimeoutException {
+      // 仿 A3：Future.timeout 不取消底层请求，排干孤儿响应防连接泄漏。
+      unawaited(_drainOrphan(sendFuture));
+      return (false, '连接超时');
+    } catch (_) {
+      // SocketException（拒连/DNS 失败）与 package:http 的
+      // ClientException 等网络层错误同口径。
+      unawaited(_drainOrphan(sendFuture));
+      return (false, '无法连接（检查网络/baseUrl）');
+    }
+
+    final status = response.statusCode;
+    if (status >= 200 && status < 300) {
+      // 2xx：只验状态码；排干响应体释放连接，不回显内容。
+      try {
+        await response.stream.drain<void>()
+            .timeout(const Duration(seconds: 5));
+      } catch (_) {}
+      return (true, '连接成功');
+    }
+    // 非 2xx：读 ≤4KB 供摘要；总 deadline 兜底防服务端慢滴拖住。
+    var rawBody = '';
+    try {
+      final builder = BytesBuilder(copy: false);
+      await for (final chunk
+          in response.stream.timeout(deadline.difference(DateTime.now()))) {
+        builder.add(chunk);
+        if (builder.length >= 4096 || DateTime.now().isAfter(deadline)) break;
+      }
+      rawBody = utf8.decode(builder.takeBytes(), allowMalformed: true);
+    } on TimeoutException {
+      return (false, '连接超时');
+    } catch (_) {
+      // 读体失败不掩盖状态码判定：按空摘要继续。
+    }
+    if (status == 401 || status == 403) {
+      return (false, '鉴权失败（key 无效或无权限）');
+    }
+    if (status == 404) {
+      return (false, '接口路径不存在（检查 baseUrl）');
+    }
+    if (status == 429) {
+      return (false, '触发限流（key 有效但配额紧张）');
+    }
+    final summary = _pingBodySummary(rawBody, provider);
+    return (false, summary.isEmpty ? 'HTTP $status' : 'HTTP $status：$summary');
+  }
+
+  /// G2-6：ping 请求模型 id——优先首个已启用模型，其次首个模型；
+  /// 均无时不发 model 字段（仅验连通/鉴权，模型问题由真实对话暴露）。
+  static String? _pingModelId(AiProviderConfig provider) {
+    for (final m in provider.models) {
+      final id = m.id.trim();
+      if (m.enabled && id.isNotEmpty) return id;
+    }
+    for (final m in provider.models) {
+      final id = m.id.trim();
+      if (id.isNotEmpty) return id;
+    }
+    return null;
+  }
+
+  /// G2-6：错误响应体摘要——先过日志同款脱敏，再按字面量抹除本供应商
+  /// key（防非 sk 形态密钥被服务端回显进 UI），最后截断 ≤200 字符。
+  static String _pingBodySummary(String body, AiProviderConfig provider) {
+    var s = AppLogger.redactSensitiveText(body).trim();
+    final key = AiProviderConfig.normalizeApiKey(provider.token);
+    for (final secret in <String>{provider.token.trim(), key}) {
+      if (secret.length >= 6) {
+        s = s.replaceAll(secret, '<redacted>');
+      }
+    }
+    if (s.length > 200) {
+      s = '${s.substring(0, 200)}…';
+    }
+    return s.trim();
+  }
 
   /// 模型自定义参数合并进 body：key/value 均非空才生效；
   /// 结构字段（model/messages/input/tools 等）不允许覆盖，避免破坏协议。
@@ -145,102 +265,18 @@ class AgentClient {
   Future<void> Function(Duration duration) delayFn =
       (d) => Future<void>.delayed(d);
 
-  Future<void> _backoffDelay(int attempt, {http.BaseResponse? response}) async {
-    // C5a：Retry-After（秒或 HTTP 日期）→ 精确等待该时长，上限 30s。
+  /// A3：排干孤儿响应体释放连接。5s 上限防悬挂；排干本身让连接可复用，
+  /// 超时放弃等待后订阅随流结束自行收尾。
+  static Future<void> _drainOrphan(
+    Future<http.StreamedResponse> sendFuture,
+  ) async {
     try {
-      final raw = response?.headers['retry-after']?.trim();
-      if (raw != null && raw.isNotEmpty) {
-        var ms = -1;
-        final secs = int.tryParse(raw);
-        if (secs != null && secs >= 0) {
-          ms = secs * 1000;
-        } else {
-          // Retry-After 日期为 RFC 1123 格式（HttpDate），DateTime.tryParse
-          // 只认 ISO8601 解析不了；ISO 串再由 tryParse 兜底。
-          var date = DateTime.now();
-          var parsed = false;
-          try {
-            date = HttpDate.parse(raw);
-            parsed = true;
-          } catch (_) {}
-          if (!parsed) {
-            final iso = DateTime.tryParse(raw);
-            if (iso != null) {
-              date = iso;
-              parsed = true;
-            }
-          }
-          if (parsed) {
-            ms = date.difference(DateTime.now()).inMilliseconds;
-          }
-        }
-        if (ms >= 0) {
-          await delayFn(Duration(milliseconds: ms.clamp(0, 30000)));
-          return;
-        }
-      }
-    } catch (_) {}
-    // C5b：503/529 过载 → 指数退避 1s 起步、上限 8s；其余（429 无
-    // Retry-After、网络错等）沿用 400ms 起步、上限 5s。均带 ±25% jitter。
-    final status = response?.statusCode;
-    final overloaded = status == 503 || status == 529;
-    final base = overloaded ? 1000 : 400;
-    final cap = overloaded ? 8000 : 5000;
-    final ms = (base * (1 << attempt)).clamp(base, cap);
-    final jitter = (ms * 0.25).round();
-    final delayed =
-        ms - jitter + (jitter > 0 ? _random.nextInt(jitter * 2 + 1) : 0);
-    await delayFn(Duration(milliseconds: delayed.clamp(0, 30000)));
-  }
-
-  /// 发送流式请求：仅 429/5xx/网络错重试+指数退避，401/400 直接抛；
-  /// abort 后不再重试，始终复用初次 body/headers；全部失败后抛出最后一次错误。
-  Future<http.StreamedResponse> _sendWithRetry(
-    http.Request seed, {
-    StreamBudget? budget,
-    String sessionId = '',
-  }) async {
-    final limit = budget ?? StreamBudget();
-    final rounds = maxRetries < 0 ? 0 : maxRetries;
-    Object? lastError;
-    for (var attempt = 0; attempt <= rounds; attempt++) {
-      if (isAborted(sessionId)) throw StateError('请求已被用户中断');
-      final req = http.Request(seed.method, seed.url);
-      req.headers.addAll(seed.headers);
-      req.bodyBytes = seed.bodyBytes;
+      final r = await sendFuture;
       try {
-        final response = await _http.send(req).timeout(limit.connectTimeout);
-        if (response.statusCode >= 200 && response.statusCode < 300) {
-          resetAbort(sessionId: sessionId);
-          return response;
-        }
-        final err = await _readErrorBody(response.stream, limit);
-        lastError = Exception('HTTP ${response.statusCode}: $err');
-        // 401/400 为请求错误，重试无意义，直接抛。
-        if (response.statusCode == 401 ||
-            response.statusCode == 400 ||
-            response.statusCode == 403 ||
-            response.statusCode == 404) {
-          break;
-        }
-        if (attempt >= rounds) break;
-        if (isAborted(sessionId)) throw StateError('请求已被用户中断');
-        await _backoffDelay(attempt, response: response);
-      } catch (e) {
-        if (isAborted(sessionId) || e is StateError) rethrow;
-        lastError = e;
-        if (attempt >= rounds) break;
-        if (isAborted(sessionId)) throw StateError('请求已被用户中断');
-        await _backoffDelay(attempt);
-      }
-    }
-    throw lastError ?? Exception('HTTP 请求失败');
+        await r.stream.drain<void>().timeout(const Duration(seconds: 5));
+      } catch (_) {}
+    } catch (_) {}
   }
-
-  /// 兼容保留：真源已迁移到 AgentToolSchemas.base()，此处不再维护定义。
-  /// 仅返回空列表，避免旧调用方误用过时子集；新代码请直接用 AgentToolSchemas。
-  @Deprecated('改用 AgentToolSchemas.base()，此处仅兼容保留')
-  List<Map<String, dynamic>> buildTools() => const [];
 
   Stream<AgentStreamEvent> streamChat({
     required AiProviderConfig provider,
@@ -248,6 +284,9 @@ class AgentClient {
     required List<Map<String, dynamic>> messages,
     List<Map<String, dynamic>>? tools,
     bool toolChoiceAuto = true,
+    // R1-2：透传会话 id——取消标记按会话摘除，不误清并行会话；
+    // S1-6：成功路径不再 resetAbort，标记由 run 入口统一清理。
+    String sessionId = '',
   }) {
     return streamChatWithTools(
       provider: provider,
@@ -255,6 +294,7 @@ class AgentClient {
       messages: messages,
       tools: tools,
       toolChoiceAuto: toolChoiceAuto,
+      sessionId: sessionId,
     );
   }
 
@@ -298,965 +338,27 @@ class AgentClient {
     );
   }
 
-  /// 原有 OpenAI Chat Completions 路径，保持行为不变。
-  Stream<AgentStreamEvent> _streamOpenAi({
-    required AiProviderConfig provider,
-    required AiModelOption model,
-    required List<Map<String, dynamic>> messages,
-    List<Map<String, dynamic>>? tools,
-    bool toolChoiceAuto = true,
-    String sessionId = '',
-  }) async* {
-    final url = Uri.parse(provider.chatCompletionsUrl);
-    final body = <String, dynamic>{
-      'model': model.id,
-      'messages': messages,
-      'stream': true,
-      'stream_options': {'include_usage': true},
-    };
-    if (tools != null && tools.isNotEmpty) {
-      body['tools'] = tools;
-      if (toolChoiceAuto) body['tool_choice'] = 'auto';
-    }
-    final effort = AgentClient.openAiEffort(model);
-    if (effort != null) {
-      body['reasoning_effort'] = effort;
-    }
-    AgentClient.applyCustomParams(body, model);
-
-    final request = http.Request('POST', url);
-    request.headers['Content-Type'] = 'application/json';
-    request.headers['Accept'] = 'text/event-stream';
-    request.headers.addAll(provider.authHeaders());
-    request.body = jsonEncode(body);
-
-    // 非 2xx 静默重试，始终复用上面这份初次请求内容
-    final response = await _sendWithRetry(request, sessionId: sessionId);
-
-    final budget = StreamBudget();
-    final toolBuffers = <int, Map<String, dynamic>>{};
-    await for (var line in _sseLines(response.stream, budget)) {
-        if (line.isEmpty) continue;
-        if (line.startsWith('data:')) {
-          line = line.substring(5).trimLeft();
-        }
-        if (line == '[DONE]') {
-          for (final entry in toolBuffers.entries) {
-            final buf = entry.value;
-            // 空名工具不 yield：与 Responses/Anthropic 口径对齐，
-            // 否则空参幻觉 tool 会进入下游执行。
-            if ('${buf['name'] ?? ''}'.isEmpty) continue;
-            yield AgentStreamEvent(
-              toolCall: AgentToolCall(
-                id: '${buf['id'] ?? 'call_${entry.key}'}',
-                name: '${buf['name'] ?? ''}',
-                arguments: _parseArgs('${buf['arguments'] ?? '{}'}'),
-              ),
-            );
-          }
-          yield AgentStreamEvent(done: true);
-          return;
-        }
-        Map<String, dynamic> data;
-        try {
-          data = jsonDecode(line) as Map<String, dynamic>;
-        } catch (e) {
-          if (e is StateError || e is TimeoutException) rethrow;
-          continue;
-        }
-        try {
-          final usage = data['usage'] as Map<String, dynamic>?;
-          if (usage != null) {
-            // total 缺失回退为 prompt+completion 之和，不留 null 误导预算。
-            final prompt = (usage['prompt_tokens'] as num?)?.toInt();
-            final completion = (usage['completion_tokens'] as num?)?.toInt();
-            yield AgentStreamEvent(
-              promptTokens: prompt,
-              completionTokens: completion,
-              totalTokens: (usage['total_tokens'] as num?)?.toInt() ??
-                  ((prompt ?? 0) + (completion ?? 0)),
-            );
-          }
-          final choices = data['choices'] as List?;
-          if (choices == null || choices.isEmpty) continue;
-          final choice = choices.first as Map<String, dynamic>;
-          final delta = choice['delta'] as Map<String, dynamic>? ?? {};
-          final content = delta['content'];
-          if (content is String && content.isNotEmpty) {
-            yield AgentStreamEvent(content: content);
-          }
-          final reasoning = delta['reasoning_content'] ??
-              delta['reasoning'] ??
-              delta['thinking'];
-          if (reasoning is String && reasoning.isNotEmpty) {
-            yield AgentStreamEvent(reasoning: reasoning);
-          }
-          final toolCalls = delta['tool_calls'] as List?;
-          if (toolCalls != null) {
-            for (final tc in toolCalls) {
-              final m = tc as Map<String, dynamic>;
-              final rawIndex = (m['index'] as num?)?.toInt();
-              // 索引碰撞修复：无 index 的 tool_call 不再全归 0 互拼参数，
-              // 按 id 分桶，缺省用负序号独立缓冲，避免幻觉空参循环。
-              // 显式 index>=0 仍按协议复用（同 index 即同 tool_call 续包）。
-              var index = rawIndex ?? -1;
-              if (index < 0) {
-                final callId = '${m['id'] ?? ''}';
-                if (callId.isNotEmpty) {
-                  final existing = toolBuffers.entries.where(
-                    (e) => '${e.value['id'] ?? ''}' == callId,
-                  );
-                  if (existing.isNotEmpty) {
-                    index = existing.first.key;
-                  } else {
-                    // 负序号分配后必须确认未被占用：hash 碰撞即另找空位，
-                    // 此前直接覆盖旧桶致参数互拼。
-                    // R1-Hash：换稳定DJB2——此前String.hashCode进程随机，
-                    // 跨进程日志/回放无法对齐。
-                    var candidate = -(_stableHash(callId) & 0x3fffffff) - 1;
-                    while (toolBuffers.containsKey(candidate)) {
-                      candidate -= 1;
-                    }
-                    index = candidate;
-                  }
-                } else {
-                  var candidate = -(toolBuffers.length + 1);
-                  while (toolBuffers.containsKey(candidate)) {
-                    candidate -= 1;
-                  }
-                  index = candidate;
-                }
-              }
-              final buf = toolBuffers.putIfAbsent(
-                  index, () => {'arguments': ''});
-              if (m['id'] != null) buf['id'] = m['id'];
-              final fn = m['function'] as Map<String, dynamic>?;
-              if (fn != null) {
-                if (fn['name'] != null) buf['name'] = fn['name'];
-                if (fn['arguments'] != null) {
-                  buf['arguments'] =
-                      '${buf['arguments'] ?? ''}${fn['arguments']}';
-                  budget.checkToolArgs(_utf8Length('${buf['arguments']}'));
-                }
-              }
-            }
-          }
-        } catch (e) {
-          // 预算类错误（工具参数/行缓冲超限）必须上抛中断流，
-          // 不能当“非 JSON 行”吞掉，否则限额被绕过。
-          if (e is StateError || e is TimeoutException) rethrow;
-          // 忽略非 JSON 行
-        }
-    }
-    for (final entry in toolBuffers.entries) {
-      final buf = entry.value;
-      // R1-08：异常尾刷同样过滤空名工具——此前仅[DONE]分支过滤，
-      // 此处未过滤，空参幻觉tool可进下游审批/执行。与三通道口径对齐。
-      if ('${buf['name'] ?? ''}'.isEmpty) continue;
-      yield AgentStreamEvent(
-        toolCall: AgentToolCall(
-          id: '${buf['id'] ?? 'call_${entry.key}'}',
-          name: '${buf['name'] ?? ''}',
-          arguments: _parseArgs('${buf['arguments'] ?? '{}'}'),
-        ),
-      );
-    }
-    yield AgentStreamEvent(done: true);
-  }
-
-  /// OpenAI Responses API：内部 OpenAI 风格 messages/tools 转成 responses input/tools。
-  /// 端点 `{apiBase}/responses`，流式 SSE 事件按 `type` 分流文本/推理/工具/用量。
-  Stream<AgentStreamEvent> _streamResponses({
-    required AiProviderConfig provider,
-    required AiModelOption model,
-    required List<Map<String, dynamic>> messages,
-    List<Map<String, dynamic>>? tools,
-    bool toolChoiceAuto = true,
-    String? previousResponseId,
-    String sessionId = '',
-  }) async* {
-    final url = Uri.parse(provider.responsesUrl);
-    final body = <String, dynamic>{
-      'model': model.id,
-      'input': _toResponsesInput(messages),
-      'stream': true,
-    };
-    // previous_response_id 与完整历史互斥：有 id 时调用方必须只传入增量 input。
-    if (previousResponseId != null && previousResponseId.isNotEmpty) {
-      body['previous_response_id'] = previousResponseId;
-    }
-    final responsesTools = _toResponsesTools(
-      tools,
-      webSearch: provider.responsesWebSearch,
-      codeInterpreter: provider.responsesCodeInterpreter,
-    );
-    if (responsesTools.isNotEmpty) {
-      body['tools'] = responsesTools;
-      final choice = provider.responsesToolChoice.trim().toLowerCase();
-      if (!toolChoiceAuto || choice == 'none' || choice == 'required') {
-        body['tool_choice'] =
-            choice == 'none' || choice == 'required' ? choice : 'auto';
-      } else if (toolChoiceAuto) {
-        body['tool_choice'] = 'auto';
-      }
-    }
-    final effort = _responsesEffort(model);
-    if (effort != null) {
-      body['reasoning'] = {'effort': effort};
-    }
-    // 后台长任务：服务端异步执行，客户端按流式收结果，不改 Runner 轮询逻辑。
-    if (provider.responsesBackground) {
-      body['background'] = true;
-    }
-    AgentClient.applyCustomParams(body, model);
-
-    final request = http.Request('POST', url);
-    request.headers['Content-Type'] = 'application/json';
-    request.headers['Accept'] = 'text/event-stream';
-    request.headers.addAll(provider.authHeaders());
-    request.body = jsonEncode(body);
-
-    final response = await _sendWithRetry(request, sessionId: sessionId);
-
-    // output_index -> {call_id, name, arguments}
-    final budget = StreamBudget();
-    final toolBuffers = <int, Map<String, dynamic>>{};
-    await for (var line in _sseLines(response.stream, budget)) {
-        if (line.isEmpty) continue;
-        if (line.startsWith(':')) continue;
-        if (line.startsWith('event:')) continue;
-        if (line.startsWith('data:')) {
-          line = line.substring(5).trimLeft();
-        }
-        if (line == '[DONE]') {
-          for (final entry in toolBuffers.entries) {
-            final buf = entry.value;
-            if ('${buf['name'] ?? ''}'.isEmpty) continue;
-            yield AgentStreamEvent(
-              toolCall: AgentToolCall(
-                id: '${buf['call_id'] ?? buf['id'] ?? 'call_${entry.key}'}',
-                name: '${buf['name'] ?? ''}',
-                arguments: _parseArgs('${buf['arguments'] ?? '{}'}'),
-              ),
-            );
-          }
-          yield AgentStreamEvent(done: true);
-          return;
-        }
-        Map<String, dynamic> data;
-        try {
-          data = jsonDecode(line) as Map<String, dynamic>;
-        } catch (_) {
-          continue;
-        }
-        final type = '${data['type'] ?? ''}';
-        if (type == 'response.output_text.delta') {
-          final delta = data['delta'];
-          if (delta is String && delta.isNotEmpty) {
-            yield AgentStreamEvent(content: delta);
-          }
-          continue;
-        }
-        if (type.contains('reasoning') && type.endsWith('.delta')) {
-          final delta = data['delta'];
-          if (delta is String && delta.isNotEmpty) {
-            yield AgentStreamEvent(reasoning: delta);
-          }
-          continue;
-        }
-        if (type == 'response.function_call_arguments.delta') {
-          final index = (data['output_index'] as num?)?.toInt() ?? 0;
-          // R1-Delta：无桶delta建暂存桶——此前added未到先到delta即continue丢弃，
-          // 服务端重排/丢added即工具调用静默丢失。现建桶+缺added标记，
-          // done时带警告yield，计数进预算。
-          var buf = toolBuffers[index];
-          if (buf == null) {
-            buf = <String, dynamic>{
-              'call_id': 'call_$index',
-              'name': '',
-              'arguments': '',
-              '__missingAdded': true,
-            };
-            toolBuffers[index] = buf;
-          }
-          final delta = data['delta'];
-          if (delta is String) {
-            buf['arguments'] = '${buf['arguments'] ?? ''}$delta';
-            budget.checkToolArgs(_utf8Length('${buf['arguments']}'));
-          }
-          continue;
-        }
-        if (type == 'response.output_item.added') {
-          final item = data['item'] as Map<String, dynamic>?;
-          if (item != null && '${item['type']}' == 'function_call') {
-            final index = (data['output_index'] as num?)?.toInt() ?? 0;
-            // R2-D1：added合并暂存delta——此前直接覆盖整桶，
-            // 乱序delta→added时暂存参数被清空。现保留已有arguments，
-            // item自带arguments优先，无则沿用暂存，并清missing标记。
-            final prev = toolBuffers[index];
-            final prevArgs = '${prev?['arguments'] ?? ''}';
-            final itemArgs = '${item['arguments'] ?? ''}';
-            toolBuffers[index] = {
-              'call_id': '${item['call_id'] ?? item['id'] ?? prev?['call_id'] ?? 'call_$index'}',
-              'name': '${item['name'] ?? prev?['name'] ?? ''}',
-              'arguments': itemArgs.isNotEmpty ? itemArgs : prevArgs,
-            };
-          }
-          continue;
-        }
-        if (type == 'response.output_item.done') {
-          final item = data['item'] as Map<String, dynamic>?;
-          if (item != null && '${item['type']}' == 'function_call') {
-            final index = (data['output_index'] as num?)?.toInt() ?? 0;
-            final buf = toolBuffers.remove(index);
-            final name =
-                '${item['name'] ?? buf?['name'] ?? ''}';
-            if (name.isEmpty) continue;
-            final argsRaw =
-                '${item['arguments'] ?? buf?['arguments'] ?? '{}'}';
-            yield AgentStreamEvent(
-              toolCall: AgentToolCall(
-                id:
-                    '${item['call_id'] ?? item['id'] ?? buf?['call_id'] ?? 'call_$index'}',
-                name: name,
-                arguments: _parseArgs(argsRaw),
-              ),
-            );
-          }
-          continue;
-        }
-        if (type == 'response.completed' || type == 'response.incomplete') {
-          final resp = data['response'] as Map<String, dynamic>?;
-          final usage = resp?['usage'] as Map<String, dynamic>?;
-          final respId = resp?['id'] is String
-              ? resp!['id'] as String
-              : (data['response_id'] is String
-                  ? data['response_id'] as String
-                  : null);
-          if (usage != null) {
-            yield AgentStreamEvent(
-              promptTokens:
-                  (usage['input_tokens'] as num?)?.toInt(),
-              completionTokens:
-                  (usage['output_tokens'] as num?)?.toInt(),
-              totalTokens: (usage['total_tokens'] as num?)?.toInt(),
-              responseId: respId,
-            );
-          } else if (respId != null) {
-            yield AgentStreamEvent(responseId: respId);
-          }
-          for (final entry in toolBuffers.entries) {
-            final buf = entry.value;
-            if ('${buf['name'] ?? ''}'.isEmpty) continue;
-            yield AgentStreamEvent(
-              toolCall: AgentToolCall(
-                id: '${buf['call_id'] ?? 'call_${entry.key}'}',
-                name: '${buf['name'] ?? ''}',
-                arguments: _parseArgs('${buf['arguments'] ?? '{}'}'),
-              ),
-            );
-          }
-          toolBuffers.clear();
-          yield AgentStreamEvent(done: true, responseId: respId);
-          return;
-        }
-        if (type == 'response.failed') {
-          final err = data['response'] ?? data['error'];
-          throw Exception('Responses stream error: $err');
-        }
-    }
-    for (final entry in toolBuffers.entries) {
-      final buf = entry.value;
-      if ('${buf['name'] ?? ''}'.isEmpty) continue;
-      yield AgentStreamEvent(
-        toolCall: AgentToolCall(
-          id: '${buf['call_id'] ?? 'call_${entry.key}'}',
-          name: '${buf['name'] ?? ''}',
-          arguments: _parseArgs('${buf['arguments'] ?? '{}'}'),
-        ),
-      );
-    }
-    yield AgentStreamEvent(done: true);
-  }
-
-  /// Anthropic Messages API：把内部 OpenAI 风格 messages/tools 转成 Anthropic 再请求。
-  Stream<AgentStreamEvent> _streamAnthropic({
-    required AiProviderConfig provider,
-    required AiModelOption model,
-    required List<Map<String, dynamic>> messages,
-    List<Map<String, dynamic>>? tools,
-    String sessionId = '',
-  }) async* {
-    final converted = _toAnthropicMessages(messages);
-    final body = <String, dynamic>{
-      'model': model.id,
-      'messages': converted.messages,
-      'max_tokens': _anthropicMaxTokens(model),
-      'stream': true,
-    };
-    if (converted.system != null && converted.system!.isNotEmpty) {
-      // prompt caching：system 段打断点，历史摘要不再每轮全量计费。
-      body['system'] = [
-        {
-          'type': 'text',
-          'text': converted.system,
-          'cache_control': {'type': 'ephemeral'},
-        },
-      ];
-    }
-    final anthropicTools = _toAnthropicTools(tools);
-    if (anthropicTools.isNotEmpty) {
-      body['tools'] = anthropicTools;
-    }
-    // 思考档位沿用现有字段；Anthropic 侧暂作透传标记，不改 OpenAI 的 reasoning_effort。
-    if (model.supportsThinking &&
-        model.thinkingLevel != null &&
-        model.thinkingLevel!.isNotEmpty) {
-      body['thinking'] = {
-        'type': 'enabled',
-        'budget_tokens': _thinkingBudget(model.thinkingLevel!),
-      };
-      // 预算必须小于 max_tokens：钳制到 max_tokens-1（至少 1024），不无脑 +1024 超上限。
-      var budget = body['thinking']['budget_tokens'] as int;
-      var maxTokens = body['max_tokens'] as int;
-      if (budget >= maxTokens) {
-        budget = (maxTokens - 1).clamp(1024, 16000);
-        maxTokens = (budget + 1024).clamp(2048, 32000);
-        body['thinking']['budget_tokens'] = budget;
-        body['max_tokens'] = maxTokens;
-      }
-    }
-    // max_tokens 由上下文长度推导，自定义参数不覆盖结构字段。
-    AgentClient.applyCustomParams(body, model);
-
-    final url = Uri.parse(provider.messagesUrl);
-    final request = http.Request('POST', url);
-    request.headers['Content-Type'] = 'application/json';
-    request.headers['Accept'] = 'text/event-stream';
-    request.headers.addAll(provider.authHeaders());
-    request.body = jsonEncode(body);
-
-    // 非 2xx 静默重试，始终复用上面这份初次请求内容
-    final response = await _sendWithRetry(request, sessionId: sessionId);
-
-    // index -> partial tool_use（Anthropic content_block 语义：index 复用即新块，
-    // 不能无条件 putIfAbsent 互拼；先到 content_block_stop 再复用才安全）。
-    final budget = StreamBudget();
-    final toolBuffers = <int, Map<String, dynamic>>{};
-    // 已结算 index：stop 后复用同 index 表示新一轮 tool_use，
-    // 此前 putIfAbsent 会把新块 partial 拼到旧残留致幻觉空参循环。
-    final settledIndexes = <int>{};
-    String? eventName;
-    await for (var line in _sseLines(response.stream, budget)) {
-        if (line.isEmpty) {
-          eventName = null;
-          continue;
-        }
-        if (line.startsWith('event:')) {
-          eventName = line.substring(6).trim();
-          continue;
-        }
-        if (!line.startsWith('data:')) continue;
-        final dataStr = line.substring(5).trimLeft();
-        if (dataStr.isEmpty || dataStr == '[DONE]') continue;
-        Map<String, dynamic> data;
-        try {
-          data = jsonDecode(dataStr) as Map<String, dynamic>;
-        } catch (_) {
-          continue;
-        }
-        final type = '${data['type'] ?? eventName ?? ''}';
-
-        if (type == 'message_start') {
-          final msg = data['message'] as Map<String, dynamic>?;
-          final usage = msg?['usage'] as Map<String, dynamic>?;
-          if (usage != null) {
-            final input = (usage['input_tokens'] as num?)?.toInt();
-            yield AgentStreamEvent(
-              promptTokens: input,
-              totalTokens: input,
-            );
-          }
-          continue;
-        }
-
-        if (type == 'content_block_start') {
-          final index = (data['index'] as num?)?.toInt() ?? 0;
-          final block = data['content_block'] as Map<String, dynamic>? ?? {};
-          final blockType = '${block['type'] ?? ''}';
-          if (blockType == 'tool_use') {
-            toolBuffers[index] = {
-              'id': '${block['id'] ?? 'tool_$index'}',
-              'name': '${block['name'] ?? ''}',
-              'arguments': '',
-            };
-          }
-          continue;
-        }
-
-        if (type == 'content_block_delta') {
-          final index = (data['index'] as num?)?.toInt() ?? 0;
-          final delta = data['delta'] as Map<String, dynamic>? ?? {};
-          final deltaType = '${delta['type'] ?? ''}';
-          if (deltaType == 'text_delta') {
-            final text = delta['text'];
-            if (text is String && text.isNotEmpty) {
-              yield AgentStreamEvent(content: text);
-            }
-          } else if (deltaType == 'input_json_delta') {
-            final partial = delta['partial_json'];
-            // stop 后复用 index 即新块：旧残留已结算，不得 putIfAbsent 复用。
-            if (settledIndexes.contains(index) && !toolBuffers.containsKey(index)) {
-              settledIndexes.remove(index);
-            }
-            final buf = toolBuffers.putIfAbsent(
-                index, () => {'id': 'tool_$index', 'name': '', 'arguments': ''});
-            if (partial != null) {
-              buf['arguments'] = '${buf['arguments'] ?? ''}$partial';
-              budget.checkToolArgs(_utf8Length('${buf['arguments']}'));
-            }
-          } else if (deltaType == 'thinking_delta') {
-            final thinking = delta['thinking'];
-            if (thinking is String && thinking.isNotEmpty) {
-              yield AgentStreamEvent(reasoning: thinking);
-            }
-          }
-          continue;
-        }
-
-        if (type == 'content_block_stop') {
-          final index = (data['index'] as num?)?.toInt() ?? 0;
-          settledIndexes.add(index);
-          final buf = toolBuffers.remove(index);
-          if (buf != null && '${buf['name'] ?? ''}'.isNotEmpty) {
-            yield AgentStreamEvent(
-              toolCall: AgentToolCall(
-                id: '${buf['id'] ?? 'tool_$index'}',
-                name: '${buf['name'] ?? ''}',
-                arguments: _parseArgs('${buf['arguments'] ?? '{}'}'),
-              ),
-            );
-          }
-          continue;
-        }
-
-        if (type == 'message_delta') {
-          final usage = data['usage'] as Map<String, dynamic>?;
-          if (usage != null) {
-            final out = (usage['output_tokens'] as num?)?.toInt();
-            yield AgentStreamEvent(
-              completionTokens: out,
-              totalTokens: out,
-            );
-          }
-          continue;
-        }
-
-        if (type == 'message_stop') {
-          for (final entry in toolBuffers.entries) {
-            final buf = entry.value;
-            if ('${buf['name'] ?? ''}'.isEmpty) continue;
-            yield AgentStreamEvent(
-              toolCall: AgentToolCall(
-                id: '${buf['id'] ?? 'tool_${entry.key}'}',
-                name: '${buf['name'] ?? ''}',
-                arguments: _parseArgs('${buf['arguments'] ?? '{}'}'),
-              ),
-            );
-          }
-          toolBuffers.clear();
-          yield AgentStreamEvent(done: true);
-          return;
-        }
-
-        if (type == 'error') {
-          final err = data['error'];
-          throw Exception('Anthropic stream error: $err');
-        }
-    }
-    for (final entry in toolBuffers.entries) {
-      final buf = entry.value;
-      if ('${buf['name'] ?? ''}'.isEmpty) continue;
-      yield AgentStreamEvent(
-        toolCall: AgentToolCall(
-          id: '${buf['id'] ?? 'tool_${entry.key}'}',
-          name: '${buf['name'] ?? ''}',
-          arguments: _parseArgs('${buf['arguments'] ?? '{}'}'),
-        ),
-      );
-    }
-    yield AgentStreamEvent(done: true);
-  }
-
-  /// Responses input：沿用 chat messages 结构，服务端接受同形 input。
-  /// tool 结果（role=tool）转为 function_call_output，保持 call_id 关联。
-  List<Map<String, dynamic>> _toResponsesInput(
-      List<Map<String, dynamic>> messages) {
-    final out = <Map<String, dynamic>>[];
-    for (final m in messages) {
-      final role = '${m['role'] ?? ''}';
-      if (role == 'tool') {
-        out.add({
-          'type': 'function_call_output',
-          'call_id': '${m['tool_call_id'] ?? ''}',
-          'output': '${m['content'] ?? ''}',
-        });
-        continue;
-      }
-      if (role == 'assistant' && m['tool_calls'] is List) {
-        final content = m['content'];
-        if (content is String && content.isNotEmpty) {
-          out.add({'role': 'assistant', 'content': content});
-        }
-        for (final tc in (m['tool_calls'] as List)) {
-          if (tc is! Map) continue;
-          final fn = tc['function'] as Map?;
-          out.add({
-            'type': 'function_call',
-            'call_id': '${tc['id'] ?? ''}',
-            'name': '${fn?['name'] ?? ''}',
-            'arguments': '${fn?['arguments'] ?? '{}'}',
-          });
-        }
-        continue;
-      }
-      out.add(Map<String, dynamic>.from(m));
-    }
-    return out;
-  }
-
-  /// Responses tools：chat tools 的 function 体与 Responses function 结构一致，直接透传。
-  /// 另按供应商开关追加内置 web_search / code_interpreter（默认关闭保持旧行为）。
-  List<Map<String, dynamic>> _toResponsesTools(
-    List<Map<String, dynamic>>? tools, {
-    bool webSearch = false,
-    bool codeInterpreter = false,
-  }) {
-    final out = <Map<String, dynamic>>[];
-    if (webSearch) out.add({'type': 'web_search'});
-    if (codeInterpreter) {
-      out.add({
-        'type': 'code_interpreter',
-        'container': {'type': 'auto'},
-      });
-    }
-    for (final t in (tools ?? const <Map<String, dynamic>>[])) {
-      final fn = t['function'] as Map<String, dynamic>?;
-      if (fn != null) {
-        out.add({
-          'type': 'function',
-          'name': '${fn['name'] ?? ''}',
-          'description': '${fn['description'] ?? ''}',
-          'parameters': fn['parameters'] ??
-              {
-                'type': 'object',
-                'properties': <String, dynamic>{},
-              },
-        });
-        continue;
-      }
-      if (t['type'] == 'function' && t['name'] != null) {
-        out.add(Map<String, dynamic>.from(t));
-      }
-    }
-    final functions =
-        out.where((e) => '${e['name'] ?? ''}'.isNotEmpty).toList();
-    // 内置工具无 name，按 type 保留，不被上面的 name 过滤丢掉。
-    final builtins = out.where((e) =>
-        e['type'] == 'web_search' || e['type'] == 'code_interpreter');
-    return [...builtins, ...functions];
-  }
-
-  /// Responses reasoning effort 白名单：仅 low/medium/high 透传，其它映射 medium。
-  String? _responsesEffort(AiModelOption model) {
-    if (!model.supportsThinking) return null;
-    final level = (model.thinkingLevel ?? '').trim();
-    if (level.isEmpty) return null;
-    switch (level) {
-      case 'low':
-      case 'medium':
-      case 'high':
-        return level;
-      default:
-        return 'medium';
-    }
-  }
-
-  int _anthropicMaxTokens(AiModelOption model) {
-    final ctx = model.contextLength;
-    if (ctx != null && ctx > 0) {
-      // 预留输入空间，输出上限夹在 1024~8192
-      final out = (ctx * 0.2).round();
-      return out.clamp(1024, 8192);
-    }
-    return 4096;
-  }
-
-  int _thinkingBudget(String level) {
-    switch (level) {
-      case 'minimal':
-        return 1024;
-      case 'low':
-        return 2048;
-      case 'medium':
-        return 4096;
-      case 'high':
-        return 8000;
-      case 'xhigh':
-      case 'max':
-        return 16000;
-      default:
-        return 4096;
-    }
-  }
-
-  List<Map<String, dynamic>> _toAnthropicTools(
-      List<Map<String, dynamic>>? tools) {
-    if (tools == null || tools.isEmpty) return const [];
-    final out = <Map<String, dynamic>>[];
-    for (final t in tools) {
-      final fn = t['function'] as Map<String, dynamic>?;
-      if (fn != null) {
-        out.add({
-          'name': '${fn['name'] ?? ''}',
-          'description': '${fn['description'] ?? ''}',
-          'input_schema': fn['parameters'] ??
-              {
-                'type': 'object',
-                'properties': <String, dynamic>{},
-              },
-        });
-        continue;
-      }
-      // 已是 Anthropic 形态
-      if (t['name'] != null && t['input_schema'] != null) {
-        out.add(Map<String, dynamic>.from(t));
-      }
-    }
-    return out.where((e) => '${e['name'] ?? ''}'.isNotEmpty).toList();
-  }
-
-  _AnthropicConverted _toAnthropicMessages(List<Map<String, dynamic>> messages) {
-    final systemParts = <String>[];
-    final out = <Map<String, dynamic>>[];
-
-    for (final m in messages) {
-      final role = '${m['role'] ?? ''}';
-      if (role == 'system') {
-        final c = m['content'];
-        if (c is String && c.isNotEmpty) systemParts.add(c);
-        continue;
-      }
-
-      if (role == 'tool') {
-        final toolResult = {
-          'type': 'tool_result',
-          'tool_use_id': '${m['tool_call_id'] ?? ''}',
-          'content': '${m['content'] ?? ''}',
-        };
-        if (out.isNotEmpty && out.last['role'] == 'user') {
-          final content = out.last['content'];
-          if (content is List) {
-            content.add(toolResult);
-          } else {
-            out.last['content'] = [
-              if (content != null && '$content'.isNotEmpty)
-                {'type': 'text', 'text': '$content'},
-              toolResult,
-            ];
-          }
-        } else {
-          out.add({
-            'role': 'user',
-            'content': [toolResult],
-          });
-        }
-        continue;
-      }
-
-      if (role == 'assistant') {
-        final blocks = <Map<String, dynamic>>[];
-        final content = m['content'];
-        if (content is String && content.isNotEmpty) {
-          blocks.add({'type': 'text', 'text': content});
-        } else if (content is List) {
-          for (final part in content) {
-            if (part is! Map) continue;
-            final partType = '${part['type'] ?? ''}';
-            if (partType == 'text') {
-              blocks.add({'type': 'text', 'text': '${part['text'] ?? ''}'});
-            } else if (partType == 'thinking' ||
-                partType == 'redacted_thinking') {
-              // thinking 开启后多轮必须原样回传，否则必 400。
-              blocks.add(Map<String, dynamic>.from(part));
-            }
-          }
-        }
-        final toolCalls = m['tool_calls'];
-        if (toolCalls is List) {
-          for (final tc in toolCalls) {
-            if (tc is! Map) continue;
-            final fn = tc['function'] as Map?;
-            final name = '${fn?['name'] ?? tc['name'] ?? ''}';
-            if (name.isEmpty) continue;
-            final argsRaw = fn?['arguments'] ?? tc['input'] ?? '{}';
-            Map<String, dynamic> input;
-            if (argsRaw is Map) {
-              input = Map<String, dynamic>.from(argsRaw);
-            } else {
-              input = _parseArgs('$argsRaw');
-            }
-            blocks.add({
-              'type': 'tool_use',
-              'id': '${tc['id'] ?? 'tool_${blocks.length}'}',
-              'name': name,
-              'input': input,
-            });
-          }
-        }
-        if (blocks.isEmpty) {
-          blocks.add({'type': 'text', 'text': ''});
-        }
-        out.add({'role': 'assistant', 'content': blocks});
-        continue;
-      }
-
-      if (role == 'user') {
-        out.add({
-          'role': 'user',
-          'content': _toAnthropicUserContent(m['content']),
-        });
-      }
-    }
-
-    // Anthropic 要求 messages 非空，且首条通常为 user
-    if (out.isEmpty) {
-      out.add({
-        'role': 'user',
-        'content': [
-          {'type': 'text', 'text': ' '}
-        ],
-      });
-    }
-
-    return _AnthropicConverted(
-      system: systemParts.isEmpty ? null : systemParts.join('\n\n'),
-      messages: out,
-    );
-  }
-
-  dynamic _toAnthropicUserContent(dynamic content) {
-    if (content is String) {
-      return content;
-    }
-    if (content is! List) {
-      return '$content';
-    }
-    final blocks = <Map<String, dynamic>>[];
-    for (final part in content) {
-      if (part is! Map) continue;
-      final type = '${part['type'] ?? ''}';
-      if (type == 'text') {
-        blocks.add({'type': 'text', 'text': '${part['text'] ?? ''}'});
-      } else if (type == 'image_url') {
-        final imageUrl = part['image_url'];
-        final url = imageUrl is Map
-            ? '${imageUrl['url'] ?? ''}'
-            : '$imageUrl';
-        final parsed = _parseDataUrl(url);
-        if (parsed != null) {
-          blocks.add({
-            'type': 'image',
-            'source': {
-              'type': 'base64',
-              'media_type': parsed.mediaType,
-              'data': parsed.data,
-            },
-          });
-        } else if (url.startsWith('http://') || url.startsWith('https://')) {
-          // Anthropic 只接受 base64 source，不支持 url source：
-          // http(s) 图片降级为文本占位，避免整轮 400。
-          blocks.add({'type': 'text', 'text': '[图片：$url]'});
-        }
-      } else if (type == 'image') {
-        blocks.add(Map<String, dynamic>.from(part));
-      } else if (type == 'tool_result') {
-        blocks.add(Map<String, dynamic>.from(part));
-      }
-    }
-    return blocks.isEmpty ? '' : blocks;
-  }
-
-  _DataUrlParts? _parseDataUrl(String url) {
-    final m = RegExp(r'^data:([^;]+);base64,(.+)$', dotAll: true)
-        .firstMatch(url.trim());
-    if (m == null) return null;
-    return _DataUrlParts(mediaType: m.group(1)!, data: m.group(2)!);
-  }
-
-  Future<String> _readErrorBody(
-    Stream<List<int>> stream,
-    StreamBudget budget,
-  ) async {
-    final buf = StringBuffer();
-    // R15R9：超限即排空残留——此前 break 即返，残留体污染连接复用下次请求。
-    // 同 R15R3/R15R6 fetch drain 口径。
-    await for (final chunk in stream.timeout(budget.connectTimeout)) {
-      buf.write(utf8.decode(chunk, allowMalformed: true));
-      if (buf.length >= budget.maxErrorBytes) break;
-    }
-    try {
-      await stream.drain<void>().timeout(const Duration(seconds: 5));
-    } catch (_) {}
-    return budget.clipError(buf.toString());
-  }
-
   /// UTF-8 字节长度：*_sseLines* 与预算口径统一按字节计数，
   /// 中文场景 String.length（字符数）会让字节超限 2-3 倍才触发。
   static int _utf8Length(String s) => utf8.encode(s).length;
 
-  Stream<String> _sseLines(
-    Stream<List<int>> byteStream,
-    StreamBudget budget,
-  ) async* {
-    var buffer = '';
-    // 增量解码：多字节字符跨 chunk 时不能按包直接 utf8.decode，
-    // 否则 allowMalformed 会把半个字符替换成乱码。用 decoder 绑定字节流。
-    final textStream = utf8.decoder.bind(
-      withIdleTimeout(byteStream, budget.idleTimeout)
-          .timeout(budget.totalDeadline),
+  /// R-SSE-OBS：SSE 非 JSON 行限频日志（网关多行 data 拆分/污染排查）。
+  static int _sseParseFailureCount = 0;
+  static void logSseParseFailure(String line) {
+    _sseParseFailureCount++;
+    if (_sseParseFailureCount > 50) return; // 进程级限频防刷屏
+    final snippet = line.length > 120 ? '${line.substring(0, 120)}…' : line;
+    AppLogger.instance.warn(
+      'sse',
+      'SSE 行解析失败(#$_sseParseFailureCount)：$snippet',
     );
-    await for (final text in textStream) {
-      budget.addBytes(_utf8Length(text));
-      buffer += text;
-      budget.checkBuffer(_utf8Length(buffer));
-      while (true) {
-        final idx = buffer.indexOf('\n');
-        if (idx < 0) break;
-        final line = buffer.substring(0, idx).trimRight();
-        buffer = buffer.substring(idx + 1);
-        budget.checkLine(_utf8Length(line));
-        yield line;
-      }
-    }
-    if (buffer.isNotEmpty) {
-      budget.checkLine(_utf8Length(buffer));
-      yield buffer.trimRight();
-    }
   }
 
-  Map<String, dynamic> _parseArgs(String raw) {
-    try {
-      final v = jsonDecode(raw);
-      if (v is Map<String, dynamic>) return v;
-      if (v is Map) return Map<String, dynamic>.from(v);
-    } catch (_) {}
-    // 空参打标：截断/半包 JSON 不再静默变 {}，调用方靠该标记识别
-    // “幻觉 tool→空参→报错回填→再幻觉”循环，熔断更快停。
-    if (raw.trim().isEmpty || raw.trim() == '{}') {
-      return <String, dynamic>{};
-    }
-    return <String, dynamic>{'_parseError': '参数 JSON 解析失败，已按空参处理', '_rawLength': raw.length};
+  /// R-ABORTMAP：会话删除时清理取消标记表，防 _abortResetAt 长期运行无界残留。
+  void forgetSession(String sessionId) {
+    _abortedSessions.remove(sessionId);
+    _abortAt.remove(sessionId);
+    _abortResetAt.remove(sessionId);
   }
 
   void dispose() {
@@ -1274,18 +376,4 @@ class AgentClient {
   }
 
   static int _stableHash(String s) => stableHashForTest(s);
-}
-
-class _AnthropicConverted {
-  _AnthropicConverted({required this.system, required this.messages});
-
-  final String? system;
-  final List<Map<String, dynamic>> messages;
-}
-
-class _DataUrlParts {
-  _DataUrlParts({required this.mediaType, required this.data});
-
-  final String mediaType;
-  final String data;
 }

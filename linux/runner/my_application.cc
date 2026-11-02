@@ -81,10 +81,10 @@ static void my_application_activate(GApplication* application) {
 
   gtk_window_set_default_size(window, 1280, 800);
 
-  // 与 macOS/Windows 一致的最小尺寸：1280x800。
+  // 与 macOS/Windows 一致的最小尺寸：1000x600。
   GdkGeometry hints = {};
-  hints.min_width = 1280;
-  hints.min_height = 800;
+  hints.min_width = 1000;
+  hints.min_height = 600;
   gtk_window_set_geometry_hints(window, nullptr, &hints, GDK_HINT_MIN_SIZE);
 
   g_autoptr(FlDartProject) project = fl_dart_project_new();

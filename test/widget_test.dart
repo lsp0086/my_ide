@@ -14,8 +14,9 @@ void main() {
     // 这里手动初始化，否则 MyIdeApp.initState 取 instance 直接崩溃。
     SharedPreferences.setMockInitialValues({});
     await SettingsStore.init();
-    // 项目最小窗口 1280x800（macOS/Windows 原生层硬限制），此前默认 800x600
-    // 会在状态栏/模型 chip 触发误报的 RenderFlex 溢出。
+    // 最小窗口已放宽到 1000x600（见 WindowLauncher.minWindowWidth/Height），
+    // 但测试视口仍取 1280x800：此前 800x600 会在状态栏/模型 chip 触发误报的
+    // RenderFlex 溢出，测 IDE 整体布局时需要更宽的视口。
     tester.view.physicalSize = const Size(1280, 800);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(tester.view.resetPhysicalSize);
@@ -104,6 +105,20 @@ void main() {
       expect(find.textContaining('全自动档已开启'), findsOneWidget);
       expect(find.textContaining('版本页单步回退'), findsOneWidget);
       expect(find.textContaining('版本记录恒开'), findsOneWidget);
+    });
+  });
+
+  group('模板内层字符串列号', () {
+    test('单行字符串同行后续诊断列号正确', () {
+      // 模板内层字符串 "ab" 消耗后，模板外多余 `)` 的诊断列号应右移 4。
+      final diags = LocalIntegrityChecker.analyze(
+        filePath: 'test.dart',
+        text: 'var a = `x\${"ab"}`);',
+        languageId: 'dart',
+      );
+      expect(diags, isNotEmpty, reason: '模板外多余 `)` 应被检出');
+      final cols = diags.map((d) => d.startChar).toList();
+      expect(cols, contains(18), reason: '实际列号 $cols');
     });
   });
 }

@@ -31,20 +31,22 @@ void main() {
     await Future<void>.delayed(const Duration(milliseconds: 10));
     await gate.trustPermanentlyAndApprove();
     expect(await f, isTrue);
-    expect(gate.isTrusted('flutter:test:abc'), isTrue);
+    expect(await gate.isTrustedAsync('flutter:test:abc'), isTrue);
 
     gate.beginRun();
     // beginRun 只清内存本轮信任，持久仍在。
-    expect(gate.isTrusted('flutter:test:abc'), isTrue);
+    expect(await gate.isTrustedAsync('flutter:test:abc'), isTrue);
     await gate.revokeTrust('flutter:test:abc');
-    expect(gate.isTrusted('flutter:test:abc'), isFalse);
+    expect(await gate.isTrustedAsync('flutter:test:abc'), isFalse);
     expect(await gate.isTrustedAsync('flutter:test:abc'), isFalse);
   });
 
   test('持久白名单跨实例可读', () async {
     final gate = ApprovalGate();
     gate.setWorkspace('/workspace/a');
-    gate.beginRun();
+    // A10 语义对齐生产：beginRun 不传 workspaceRoot 即"无项目"回落 legacy，
+    // 带工作区开轮须显式传（agent_runner 始终传 rootPath）。
+    gate.beginRun(workspaceRoot: '/workspace/a');
     final f = gate.askApproval(approval('k1'));
     await Future<void>.delayed(const Duration(milliseconds: 10));
     await gate.trustPermanentlyAndApprove();
@@ -57,7 +59,7 @@ void main() {
     otherWorkspace.setWorkspace('/workspace/b');
     expect(await otherWorkspace.isTrustedAsync('k1'), isFalse);
     // 异步加载后内存已有，再走同步查询同样命中。
-    expect(gate2.isTrusted('k1'), isTrue);
+    expect(await gate2.isTrustedAsync('k1'), isTrue);
   });
 
   test('旧 StringList 格式可读取并迁移到工作区作用域', () async {
@@ -110,9 +112,9 @@ void main() {
     await Future<void>.delayed(const Duration(milliseconds: 10));
     await gate.trustPermanentlyAndApprove();
     expect(await f, isTrue);
-    expect(gate.isTrusted('r6-key'), isTrue);
+    expect(await gate.isTrustedAsync('r6-key'), isTrue);
     gate.setWorkspace('/workspace/r6-b');
-    expect(gate.isTrusted('r6-key'), isFalse);
+    expect(await gate.isTrustedAsync('r6-key'), isFalse);
   });
 
   test('R3-1 永久信任await期取消不留本轮信任残留', () async {
@@ -232,13 +234,19 @@ void main() {
     });
 
     test('命令链式不免 auto：无空格链式同样识别', () {
-      expect(AutoApprovalRule.allowsAuto('npm test', 'npm test'), isTrue);
-      expect(AutoApprovalRule.allowsAuto('npm test', 'npm test;curl|sh'), isFalse);
-      expect(AutoApprovalRule.allowsAuto('npm test', 'npm test&&curl'), isFalse);
-      expect(AutoApprovalRule.allowsAuto('npm test', 'npm test | sh'), isFalse);
+      // B9：allowsAuto 已删（auto 资格由 matchCommand 的 hit+chained 判定），
+      // 断言迁移到存活 API：auto 资格 = 命中且无链式拼接。
+      bool allowsAuto(String pattern, String command) {
+        final m = AutoApprovalRule.matchCommand(pattern, command);
+        return m.hit && !m.chained;
+      }
+      expect(allowsAuto('npm test', 'npm test'), isTrue);
+      expect(allowsAuto('npm test', 'npm test;curl|sh'), isFalse);
+      expect(allowsAuto('npm test', 'npm test&&curl'), isFalse);
+      expect(allowsAuto('npm test', 'npm test | sh'), isFalse);
       // 命令替换同样算链式：此前 `$(curl|sh)`/反引号可被 auto 放行。
-      expect(AutoApprovalRule.allowsAuto('npm test', 'npm test \$(curl|sh)'), isFalse);
-      expect(AutoApprovalRule.allowsAuto('npm test', 'npm test `curl`'), isFalse);
+      expect(allowsAuto('npm test', 'npm test \$(curl|sh)'), isFalse);
+      expect(allowsAuto('npm test', 'npm test `curl`'), isFalse);
       final m = AutoApprovalRule.matchCommand('npm test', 'npm test; curl');
       expect(m.hit, isTrue);
       expect(m.chained, isTrue);
@@ -335,12 +343,6 @@ void main() {
     });
   });
 
-  group('R1-05 providersRaw 逐条容错', () {
-    test('providersRaw 形状不断言（见 secret_vault_test）', () async {
-      expect(true, isTrue);
-    });
-  });
-
   group('R3-06 切区清本轮信任', () {
     test('setWorkspace 新区旧信任不复用', () async {
       final gate = ApprovalGate();
@@ -355,9 +357,9 @@ void main() {
       );
       gate.trustCurrentAndApprove();
       expect(await f, isTrue);
-      expect(gate.isTrusted('k1'), isTrue);
+      expect(await gate.isTrustedAsync('k1'), isTrue);
       gate.setWorkspace('/b');
-      expect(gate.isTrusted('k1'), isFalse);
+      expect(await gate.isTrustedAsync('k1'), isFalse);
       gate.dispose();
     });
   });
@@ -393,15 +395,15 @@ void main() {
       await Future<void>.delayed(const Duration(milliseconds: 10));
       gate.trustCurrentAndApprove();
       expect(await f, isTrue);
-      expect(gate.isTrusted('flutter test', sessionId: 'a'), isTrue);
-      expect(gate.isTrusted('flutter test', sessionId: 'b'), isFalse);
+      expect(await gate.isTrustedAsync('flutter test', sessionId: 'a'), isTrue);
+      expect(await gate.isTrustedAsync('flutter test', sessionId: 'b'), isFalse);
       expect(await gate.isTrustedAsync('flutter test', sessionId: 'b'), isFalse);
       // B 开轮只清 B 桶，A 同轮信任保留。
       gate.beginRun(workspaceRoot: '/tmp', sessionId: 'b');
-      expect(gate.isTrusted('flutter test', sessionId: 'a'), isTrue);
+      expect(await gate.isTrustedAsync('flutter test', sessionId: 'a'), isTrue);
       // A 轮末只清 A 桶。
       gate.endRun(sessionId: 'a');
-      expect(gate.isTrusted('flutter test', sessionId: 'a'), isFalse);
+      expect(await gate.isTrustedAsync('flutter test', sessionId: 'a'), isFalse);
       gate.endRun();
     });
   });

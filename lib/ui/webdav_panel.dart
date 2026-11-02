@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../settings/settings_store.dart';
 import '../settings/webdav_backup.dart';
@@ -31,8 +32,9 @@ class _WebDavPanelState extends State<WebDavPanel> {
     super.initState();
     final store = SettingsStore.instance;
     _url = TextEditingController(text: store.getString('webdav.url') ?? '');
-    _username =
-        TextEditingController(text: store.getString('webdav.username') ?? '');
+    _username = TextEditingController(
+      text: store.getString('webdav.username') ?? '',
+    );
     // 轮次1：区分"未设置"与"密文损坏"——损坏时留空并提示重填，
     // 保存输入后走正常覆盖路径。
     final storedPw = store.getString('webdav.password');
@@ -67,8 +69,10 @@ class _WebDavPanelState extends State<WebDavPanel> {
       fillColor: colors.inputFill,
       contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       labelStyle: TextStyle(color: colors.textMuted, fontSize: 12),
-      hintStyle:
-          TextStyle(color: colors.textMuted.withValues(alpha: 0.7), fontSize: 12),
+      hintStyle: TextStyle(
+        color: colors.textMuted.withValues(alpha: 0.7),
+        fontSize: 12,
+      ),
       border: OutlineInputBorder(
         borderRadius: BorderRadius.circular(10),
         borderSide: BorderSide(color: colors.border),
@@ -87,7 +91,29 @@ class _WebDavPanelState extends State<WebDavPanel> {
 
   void _snack(String message) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  Future<void> _pastePassword() async {
+    // 快捷键/右键粘贴无响应时的显式兜底：从系统剪贴板读文本写入密码框。
+    try {
+      final data = await Clipboard.getData(Clipboard.kTextPlain);
+      final text = data?.text ?? '';
+      if (text.isEmpty) {
+        _snack('剪贴板为空，无法粘贴');
+        return;
+      }
+      setState(() {
+        _password.text = text;
+        _password.selection = TextSelection.collapsed(
+          offset: _password.text.length,
+        );
+      });
+    } catch (e) {
+      _snack('粘贴失败：$e');
+    }
   }
 
   WebDavConfig _configFromFields() {
@@ -151,8 +177,10 @@ class _WebDavPanelState extends State<WebDavPanel> {
         await _saveConfig();
         final payload = await WebDavBackup.download(cfg);
         // R6：restore 拒绝（version 不符等）返回 false，不得再报成功。
-        final restored =
-            await WebDavBackup.restore(SettingsStore.instance, payload);
+        final restored = await WebDavBackup.restore(
+          SettingsStore.instance,
+          payload,
+        );
         if (!restored) {
           _snack('远端备份版本不兼容，已拒绝恢复（本地设置未动）');
           return;
@@ -161,8 +189,11 @@ class _WebDavPanelState extends State<WebDavPanel> {
         // 非空即毒备份试图ask/deny→auto，弹窗点头后才落盘。
         final relaxed = WebDavBackup.approvalStoreForSettings;
         if (relaxed.isNotEmpty && mounted) {
-          final names = relaxed.entries.map((e) => '${e.key}→${e.value}').join('\n');
-          final ok = await showDialog<bool>(
+          final names = relaxed.entries
+              .map((e) => '${e.key}→${e.value}')
+              .join('\n');
+          final ok =
+              await showDialog<bool>(
                 context: context,
                 builder: (c) => AlertDialog(
                   title: const Text('远端备份请求放宽审批'),
@@ -212,9 +243,7 @@ class _WebDavPanelState extends State<WebDavPanel> {
           height: 44,
           padding: const EdgeInsets.symmetric(horizontal: 14),
           decoration: BoxDecoration(
-            border: Border(
-              bottom: BorderSide(color: colors.border),
-            ),
+            border: Border(bottom: BorderSide(color: colors.border)),
           ),
           child: Row(
             children: [
@@ -244,8 +273,11 @@ class _WebDavPanelState extends State<WebDavPanel> {
                   tooltip: '关闭',
                   visualDensity: VisualDensity.compact,
                   onPressed: widget.onClose,
-                  icon: Icon(Icons.close_rounded,
-                      size: 16, color: colors.textMuted),
+                  icon: Icon(
+                    Icons.close_rounded,
+                    size: 16,
+                    color: colors.textMuted,
+                  ),
                 ),
             ],
           ),
@@ -254,158 +286,317 @@ class _WebDavPanelState extends State<WebDavPanel> {
           child: ListView(
             padding: const EdgeInsets.fromLTRB(24, 20, 24, 24),
             children: [
-              Container(
-                decoration: BoxDecoration(
-                  color: colors.panel,
-                  borderRadius: BorderRadius.circular(14),
-                  border: Border.all(color: colors.border),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(14, 12, 14, 0),
-                      child: Row(
-                        children: [
-                          Container(
-                            width: 28,
-                            height: 28,
-                            decoration: BoxDecoration(
-                              color: colors.accentSoft,
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                            child: Icon(Icons.cloud_sync_outlined,
-                                size: 15, color: colors.accent),
-                          ),
-                          const SizedBox(width: 10),
-                          Text(
-                            '登录与备份',
-                            style: TextStyle(
-                              color: colors.textPrimary,
-                              fontSize: 13.5,
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    Divider(height: 20, color: colors.divider),
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          TextField(
-                            controller: _url,
-                            style: fieldStyle,
-                            decoration: _fieldDeco(
-                              colors,
-                              label: 'WebDAV URL',
-                              hint:
-                                  'https://dav.example.com/remote.php/dav/files/user',
-                            ),
-                          ),
-                          const SizedBox(height: 10),
-                          TextField(
-                            controller: _username,
-                            style: fieldStyle,
-                            decoration: _fieldDeco(colors, label: '用户名'),
-                          ),
-                          const SizedBox(height: 10),
-                          TextField(
-                            controller: _password,
-                            obscureText: !_passwordVisible,
-                            style: fieldStyle,
-                            decoration: _fieldDeco(
-                              colors,
-                              label: '密码',
-                              hint: _pwDamaged ? '已存密码损坏，请重新输入' : null,
-                              suffix: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  IconButton(
-                                    tooltip: '清除已存密码',
-                                    onPressed: _pwDamaged || _password.text.isEmpty
-                                        ? null
-                                        : () async {
-                                            try {
-                                              await SettingsStore.instance
-                                                  .removeSecret(
-                                                      'webdav.password');
-                                            } catch (_) {}
-                                            if (mounted) {
-                                              setState(() {
-                                                _password.clear();
-                                                _pwDamaged = false;
-                                              });
-                                            }
-                                          },
-                                    icon: Icon(
-                                      Icons.delete_outline_rounded,
-                                      size: 18,
-                                      color: colors.textMuted,
-                                    ),
-                                  ),
-                                  IconButton(
-                                    tooltip:
-                                        _passwordVisible ? '隐藏密码' : '显示密码',
-                                    onPressed: () => setState(
-                                        () => _passwordVisible = !_passwordVisible),
-                                    icon: Icon(
-                                      _passwordVisible
-                                          ? Icons.visibility_off_outlined
-                                          : Icons.visibility_outlined,
-                                      size: 18,
-                                      color: colors.textMuted,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 10),
-                          TextField(
-                            controller: _remotePath,
-                            style: fieldStyle,
-                            decoration: _fieldDeco(
-                              colors,
-                              label: '远端路径',
-                              hint: _defaultRemotePath,
-                            ),
-                          ),
-                          const SizedBox(height: 14),
-                          Wrap(
-                            spacing: 8,
-                            runSpacing: 8,
-                            children: [
-                              _ActionButton(
-                                icon: Icons.save_outlined,
-                                label: '保存配置',
-                                filled: true,
-                                onTap: _busy ? null : _saveConfig,
-                              ),
-                              _ActionButton(
-                                icon: Icons.cloud_upload_outlined,
-                                label: '备份上传',
-                                onTap: _busy ? null : _backupUpload,
-                              ),
-                              _ActionButton(
-                                icon: Icons.cloud_download_outlined,
-                                label: '从远端恢复',
-                                onTap: _busy ? null : _restoreFromRemote,
-                              ),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-              ),
+              _buildConfigCard(colors, fieldStyle),
+              const SizedBox(height: 12),
+              // F2：备份状态卡——上次备份时间/自动备份开关/最近失败原因，
+              // 替代此前全幅只有一张配置卡的纵向大片留白。
+              _buildStatusCard(colors),
             ],
           ),
         ),
       ],
+    );
+  }
+
+  /// F2：备份状态卡。监听 SettingsStore，上传成功（lastBackupAt 落盘）、
+  /// 开关切换、自动备份失败原因更新都会即时刷新。
+  Widget _buildStatusCard(IdeColors colors) {
+    final store = SettingsStore.instance;
+    return Container(
+      decoration: BoxDecoration(
+        color: colors.panel,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: colors.border),
+      ),
+      child: AnimatedBuilder(
+        animation: store,
+        builder: (context, _) {
+          final last = DateTime.tryParse(
+            store.getString('webdav.lastBackupAt') ?? '',
+          )?.toLocal();
+          final autoEnabled = store.getBool('webdav.autoBackupEnabled') == true;
+          final autoError =
+              (store.getString('webdav.lastAutoBackupError') ?? '').trim();
+          return Padding(
+            padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Icon(
+                      Icons.history_rounded,
+                      size: 15,
+                      color: colors.textMuted,
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      '备份状态',
+                      style: TextStyle(
+                        color: colors.textPrimary,
+                        fontSize: 13.5,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Text(
+                      '上次备份',
+                      style: TextStyle(
+                        color: colors.textSecondary,
+                        fontSize: 12,
+                      ),
+                    ),
+                    const Spacer(),
+                    Text(
+                      last == null ? '尚未备份' : _formatBackupTime(last),
+                      style: TextStyle(
+                        color: last == null
+                            ? colors.textMuted
+                            : colors.textPrimary,
+                        fontSize: 11.5,
+                        fontFamily: 'Menlo',
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            '自动备份',
+                            style: TextStyle(
+                              color: colors.textSecondary,
+                              fontSize: 12,
+                            ),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            '开启后每 24 小时自动备份一次设置',
+                            style: TextStyle(
+                              color: colors.textMuted,
+                              fontSize: 10.5,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    Switch(
+                      value: autoEnabled,
+                      onChanged: (v) => SettingsStore.instance.setBool(
+                        'webdav.autoBackupEnabled',
+                        v,
+                      ),
+                    ),
+                  ],
+                ),
+                if (autoError.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Icon(
+                          Icons.error_outline,
+                          size: 14,
+                          color: colors.danger,
+                        ),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(
+                            '最近自动备份失败：$autoError',
+                            style: TextStyle(
+                              color: colors.danger,
+                              fontSize: 11,
+                              height: 1.4,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  String _formatBackupTime(DateTime t) {
+    String two(int v) => v.toString().padLeft(2, '0');
+    return '${t.year}-${two(t.month)}-${two(t.day)} '
+        '${two(t.hour)}:${two(t.minute)}';
+  }
+
+  Widget _buildConfigCard(IdeColors colors, TextStyle fieldStyle) {
+    // F2：配置卡本体（自旧 build 原样拆出）。
+    return Container(
+      decoration: BoxDecoration(
+        color: colors.panel,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: colors.border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(14, 12, 14, 0),
+            child: Row(
+              children: [
+                Container(
+                  width: 28,
+                  height: 28,
+                  decoration: BoxDecoration(
+                    color: colors.accentSoft,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Icon(
+                    Icons.cloud_sync_outlined,
+                    size: 15,
+                    color: colors.accent,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Text(
+                  '登录与备份',
+                  style: TextStyle(
+                    color: colors.textPrimary,
+                    fontSize: 13.5,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Divider(height: 20, color: colors.divider),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                TextField(
+                  controller: _url,
+                  style: fieldStyle,
+                  decoration: _fieldDeco(
+                    colors,
+                    label: 'WebDAV URL',
+                    hint: 'https://dav.example.com/remote.php/dav/files/user',
+                  ),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: _username,
+                  style: fieldStyle,
+                  decoration: _fieldDeco(colors, label: '用户名'),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: _password,
+                  obscureText: !_passwordVisible,
+                  style: fieldStyle,
+                  decoration: _fieldDeco(
+                    colors,
+                    label: '密码',
+                    hint: _pwDamaged ? '已存密码损坏，请重新输入' : null,
+                    suffix: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        IconButton(
+                          tooltip: '从剪贴板粘贴密码',
+                          onPressed: _pastePassword,
+                          icon: Icon(
+                            Icons.content_paste_rounded,
+                            size: 16,
+                            color: colors.textMuted,
+                          ),
+                          visualDensity: VisualDensity.compact,
+                        ),
+                        IconButton(
+                          tooltip: '清除已存密码',
+                          onPressed: _pwDamaged || _password.text.isEmpty
+                              ? null
+                              : () async {
+                                  try {
+                                    await SettingsStore.instance.removeSecret(
+                                      'webdav.password',
+                                    );
+                                  } catch (_) {}
+                                  if (mounted) {
+                                    setState(() {
+                                      _password.clear();
+                                      _pwDamaged = false;
+                                    });
+                                  }
+                                },
+                          icon: Icon(
+                            Icons.delete_outline_rounded,
+                            size: 18,
+                            color: colors.textMuted,
+                          ),
+                        ),
+                        IconButton(
+                          tooltip: _passwordVisible ? '隐藏密码' : '显示密码',
+                          onPressed: () => setState(
+                            () => _passwordVisible = !_passwordVisible,
+                          ),
+                          icon: Icon(
+                            _passwordVisible
+                                ? Icons.visibility_off_outlined
+                                : Icons.visibility_outlined,
+                            size: 18,
+                            color: colors.textMuted,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: _remotePath,
+                  style: fieldStyle,
+                  decoration: _fieldDeco(
+                    colors,
+                    label: '远端路径',
+                    hint: _defaultRemotePath,
+                  ),
+                ),
+                const SizedBox(height: 14),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    _ActionButton(
+                      icon: Icons.save_outlined,
+                      label: '保存配置',
+                      filled: true,
+                      onTap: _busy ? null : _saveConfig,
+                    ),
+                    _ActionButton(
+                      icon: Icons.cloud_upload_outlined,
+                      label: '备份上传',
+                      onTap: _busy ? null : _backupUpload,
+                    ),
+                    _ActionButton(
+                      icon: Icons.cloud_download_outlined,
+                      label: '从远端恢复',
+                      onTap: _busy ? null : _restoreFromRemote,
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

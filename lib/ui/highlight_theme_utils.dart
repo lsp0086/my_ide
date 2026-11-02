@@ -76,15 +76,5 @@ Map<String, TextStyle> normalizeHighlightTheme(Map<String, TextStyle> theme) {
     }
   }
 
-  // 为所有已有 scope 生成一级子 scope 回退副本（避免漏网）
-  final keys = normalized.keys.toList(growable: false);
-  for (final key in keys) {
-    if (!key.contains('.')) continue;
-    final style = resolve(key);
-    if (style != null) {
-      normalized.putIfAbsent(key, () => style);
-    }
-  }
-
   return normalized;
 }

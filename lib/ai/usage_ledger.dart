@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'dart:convert';
 
+import 'package:meta/meta.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// 单日用量聚合。
@@ -17,8 +19,6 @@ class UsageDayEntry {
   int completionTokens;
   double cost;
   final Map<String, UsageModelEntry> models;
-
-  int get totalTokens => promptTokens + completionTokens;
 
   Map<String, dynamic> toJson() => {
         'day': day,
@@ -41,15 +41,24 @@ class UsageDayEntry {
         }
       });
     }
-    // 毒账本钳制：prefs 被篡改写负值/NaN 时读入即钳制，日费用熔断不被负数绕过。
-    final prompt = ((j['promptTokens'] as num?)?.toInt() ?? 0);
-    final completion = ((j['completionTokens'] as num?)?.toInt() ?? 0);
+    // 毒账本钳制：prefs 被篡改写负值/NaN/Infinity（如 1e400→double.infinity）
+    // 时读入即钳制。A5：token 非有限值直接 toInt 抛 UnsupportedError 会被
+    // load() 吞掉返回空账本，recordAndSave 整本清空历史——先判 isFinite 再钳 0。
+    int safeTokenInt(Object? v) {
+      final n = v is num ? v : null;
+      if (n == null || !n.isFinite) return 0;
+      final i = n.toInt();
+      return i < 0 ? 0 : i;
+    }
+
+    final prompt = safeTokenInt(j['promptTokens']);
+    final completion = safeTokenInt(j['completionTokens']);
     var cost = (j['cost'] as num?)?.toDouble() ?? 0.0;
     if (!cost.isFinite) cost = 0.0;
     return UsageDayEntry(
       day: '${j['day'] ?? ''}',
-      promptTokens: prompt < 0 ? 0 : prompt,
-      completionTokens: completion < 0 ? 0 : completion,
+      promptTokens: prompt,
+      completionTokens: completion,
       cost: cost < 0 ? 0.0 : cost,
       models: models,
     );
@@ -80,8 +89,16 @@ class UsageModelEntry {
       };
 
   static UsageModelEntry fromJson(Map<String, dynamic> j) {
-    final prompt = (j['promptTokens'] as num?)?.toInt() ?? 0;
-    final completion = (j['completionTokens'] as num?)?.toInt() ?? 0;
+    // A5：同 UsageDayEntry 口径——非有限值 toInt 会抛错清空账本，先钳 0。
+    int safeTokenInt(Object? v) {
+      final n = v is num ? v : null;
+      if (n == null || !n.isFinite) return 0;
+      final i = n.toInt();
+      return i < 0 ? 0 : i;
+    }
+
+    final prompt = safeTokenInt(j['promptTokens']);
+    final completion = safeTokenInt(j['completionTokens']);
     var cost = (j['cost'] as num?)?.toDouble() ?? 0;
     if (!cost.isFinite) cost = 0;
     return UsageModelEntry(
@@ -103,17 +120,22 @@ class UsageLedger {
 
   static const prefsKey = 'usageLedger';
   static const priceKey = 'usagePricePer1K';
+
+  /// A16-R2：账本按日保留上限——此前 _days 无界增长且每轮记账全量
+  /// load+serialize，200+ 天历史后每轮全量重写越来越重（内存+prefs 体积
+  /// 双膨胀）。record 内按 dayKey 保留最近 90 天再落盘（dayKey 为
+  /// YYYY-MM-DD，字典序即时间序；当日条目必在）。
+  static const int retainDays = 90;
   static Future<void> _saveQueue = Future<void>.value();
   // 写串行化：recordAndSave 并发调用时串行落盘，避免 prefs 读写竞态丢账。
   // 此前多轮并发记账可交错读-改-写，覆盖丢失其中一轮用量。
 
   /// 测试钩子：向记账链注入一次失败，验证后续记账不受毒化。
   // ignore: avoid_public_member_api_docs
+  @visibleForTesting
   static void poisonQueueForTest(Object error) {
     _saveQueue = _saveQueue.then((_) => throw error);
   }
-
-  Map<String, UsageDayEntry> get days => Map.unmodifiable(_days);
 
   static String dayKey([DateTime? at]) {
     final d = at ?? DateTime.now();
@@ -142,12 +164,15 @@ class UsageLedger {
     entry.completionTokens += completion;
     // 单价同样钳制：prefs/WebDAV 毒化写负单价/NaN 时费用为负可绕过日熔断，
     // 此前仅钳制 token 与累计 cost，单价直通。现负/NaN 单价按 0 计。
-    double safePrice(double v) => (v.isNaN || v < 0) ? 0 : v;
+    double safePrice(double v) => (!v.isFinite || v < 0) ? 0 : v;
     final promptPrice = safePrice(promptPricePer1K ?? pricePer1K);
     final completionPrice = safePrice(completionPricePer1K ?? pricePer1K);
     final cost = prompt / 1000.0 * promptPrice +
         completion / 1000.0 * completionPrice;
-    entry.cost += cost;
+    // S2-2尾巴：单价已钳但极大有限单价×大token仍可溢出为Infinity，
+    // 累加前对cost结果钳isFinite，非有限置0，防毒化日累计致永久熔断。
+    final safeCost = cost.isFinite ? cost : 0.0;
+    entry.cost += safeCost;
     final modelKey = '$provider/$model';
     final modelEntry = entry.models.putIfAbsent(
       modelKey,
@@ -155,7 +180,20 @@ class UsageLedger {
     );
     modelEntry.promptTokens += prompt;
     modelEntry.completionTokens += completion;
-    modelEntry.cost += cost;
+    modelEntry.cost += safeCost;
+    // A16-R2：记账后按 dayKey 修剪——保留最近 [retainDays] 天再落盘，
+    // 防历史无界增长拖慢每轮 load+serialize。
+    _pruneToRecentDays();
+  }
+
+  /// A16-R2：按 dayKey 升序摘除最旧的超限天数（保留最近 [retainDays] 天）。
+  void _pruneToRecentDays() {
+    if (_days.length <= retainDays) return;
+    final keys = _days.keys.toList()..sort();
+    final drop = keys.take(_days.length - retainDays);
+    for (final k in drop) {
+      _days.remove(k);
+    }
   }
 
   UsageDayEntry? day(String key) => _days[key];
@@ -181,23 +219,6 @@ class UsageLedger {
       }
     });
     return UsageLedger(days: days);
-  }
-
-  Future<void> save() {
-    // R7：链错误隔离——此前 then 回调抛错会污染 _saveQueue 为 error
-    // future，后续所有记账的 then((_)...) 永久跳过，用量静默全丢。
-    // 先吃掉前序错误再串行，保证一次失败不毒化整条链。
-    final prev = _saveQueue;
-    final next = prev.then((_) async {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(prefsKey, jsonEncode(toJson()));
-      // 避免 unawaited 警告：错误已在调用方处理，此处吞掉仅保链。
-    }, onError: (_) async {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(prefsKey, jsonEncode(toJson()));
-    });
-    _saveQueue = next;
-    return _saveQueue;
   }
 
   static Future<UsageLedger> load() async {
@@ -242,7 +263,18 @@ class UsageLedger {
     final prev = _saveQueue;
     final next = prev.then((_) => write(), onError: (_) => write());
     _saveQueue = next;
-    return _saveQueue;
+    // A19：返回本次写入的链尾 future 而非链首——调用方 await 得到的是
+    // 自己这次写入完成（含其前排队项）的时点，不再被后续并发写入顶掉；
+    // 链首 _saveQueue 语义保持不变。void 使用方兼容。
+    // A3：链尾复位——此前链尾只增不复位，长会话数百次记账后形成已完成
+    // future 链表缓慢常驻增长。链尾即本次 next 完成时 identical 命中即
+    // 复位为已完成 future（approval_gate _persistAllowlist 同口径）。
+    unawaited(next.whenComplete(() {
+      if (identical(_saveQueue, next)) {
+        _saveQueue = Future<void>.value();
+      }
+    }));
+    return next;
   }
 
   static Future<double> loadPricePer1K() async {

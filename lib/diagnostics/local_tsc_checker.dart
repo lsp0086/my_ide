@@ -1,10 +1,14 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
 
-import '../lsp/bundled_language_servers.dart';
+import 'package:meta/meta.dart';
+
 import '../settings/settings_store.dart';
+import 'app_logger.dart';
+import '../lsp/bundled_language_servers.dart';
 import 'ide_diagnostic.dart';
 
 /// 用已下载的 TypeScript `tsc` 做本地 JS/TS 语义检查（不写项目 jsconfig）。
@@ -16,7 +20,11 @@ import 'ide_diagnostic.dart';
 class LocalTscChecker {
   static const source = 'local:tsc';
   static int _inflight = 0;
-  static int get inflight => _inflight;
+  // R-DEADCODE-INFLIGHT：公共 getter 已删——全库零调用（_inflight 字段
+  // 本身仍由排队逻辑内部使用，勿删字段）。
+
+  /// E2：排队等待者计数——忙等队列上限用，防洪水调用无界滞留。
+  static int _waiters = 0;
 
   /// 测试专用：覆盖 tsc/node 解析，绕过 Application Support / path_provider。
   static ({String tsc, String node})? debugResolverOverride;
@@ -42,7 +50,12 @@ class LocalTscChecker {
     if (!supports(languageId, filePath)) return const [];
     final isJs = const {'.js', '.jsx', '.mjs', '.cjs'}
         .contains(p.extension(filePath).toLowerCase());
-    if (isJs && !SettingsStore.instance.jsImplicitCheckJs) {
+    // D6-L18：SettingsStore 未初始化时不得抛——此前 instance 的 `!`
+    // 在启动早期（checkJs 读取先于 SettingsStore.init）直接 StateError
+    // 崩分析调用点。未初始化按默认（jsImplicitCheckJs 默认 true）继续。
+    final store = SettingsStore.maybeInstance;
+    final implicitCheckJs = store?.jsImplicitCheckJs ?? true;
+    if (isJs && !implicitCheckJs) {
       return const [];
     }
 
@@ -54,8 +67,24 @@ class LocalTscChecker {
     if (node == null) return const [];
 
     // 全局队列：同一时刻最多 2 个 tsc 进程，超出排队，防止多进程轰炸。
+    // E2：等待者上限 8——此前忙等无界，洪水调用全部滞留排队撑内存；
+    // 等待者超上限直接放弃（返回空结果，语义同失败兜底）。
     while (_inflight >= 2) {
-      await Future.delayed(const Duration(milliseconds: 200));
+      if (_waiters >= 8) {
+        // D6-L18：过载放弃必须可观测——此前静默返回空，洪水调用下
+        // 诊断无声丢失无从排查。
+        AppLogger.instance.warn(
+          'local:tsc',
+          'tsc 等待队列已满（>=8），放弃本次检查：$filePath',
+        );
+        return const [];
+      }
+      _waiters++;
+      try {
+        await Future.delayed(const Duration(milliseconds: 200));
+      } finally {
+        _waiters--;
+      }
     }
     _inflight++;
     try {
@@ -131,14 +160,33 @@ class LocalTscChecker {
             tmpFile.path,
           ],
         ];
-        final result = await Process.run(
+        // E2：Process.run(...).timeout 超时后子进程仍在跑（run 不杀进程），
+        // hang 的 tsc 常驻占并发槽。改 Process.start，超时 sigkill 并
+        // await exitCode 收尸；超时返回空结果，语义不变。
+        final proc = await Process.start(
           node,
           args,
           workingDirectory: tmpDir.path,
           environment: BundledLanguageServers.instance.processEnvironment(),
-        ).timeout(const Duration(seconds: 12));
+        );
+        final stdoutFuture = proc.stdout.transform(utf8.decoder).join();
+        final stderrFuture = proc.stderr.transform(utf8.decoder).join();
+        String stdoutText;
+        String stderrText;
+        try {
+          await proc.exitCode.timeout(const Duration(seconds: 12));
+          stdoutText = await stdoutFuture;
+          stderrText = await stderrFuture;
+        } on TimeoutException {
+          try {
+            proc.kill(ProcessSignal.sigkill);
+          } catch (_) {}
+          // 收尸防僵尸；进程死后管道 EOF，join 自然完成。
+          await proc.exitCode;
+          return const [];
+        }
 
-        final out = '${result.stdout}\n${result.stderr}';
+        final out = '$stdoutText\n$stderrText';
         return _parseTscOutput(
           output: out,
           originalPath: filePath,
@@ -161,7 +209,35 @@ class LocalTscChecker {
 
   /// 向上查找项目/目录级 tsconfig.json 或 jsconfig.json，复用其中的 paths/types。
   /// 返回 null 表示项目未配置，无需再让 tsc 起临时虚拟工程。
+  /// R-TSCONFIG-CACHE：结果按 (startDir→config) 缓存 60s——此前每轮分析
+  /// 最多 64 次 existsSync 同步 IO，大仓深层路径每轮叠加微卡顿。
+  /// 文件 TTL 内被删除的兜底：非 null 命中后仍存在性复检一次（单次 stat）。
+  /// A4-11：null 命中（此前无配置）同样做存在性复检——项目中途新建
+  /// tsconfig 后，若直接返回缓存 null，TTL 内仍按"无配置"跑，新配置
+  /// 60s 不生效。null 命中重跑一次向上查找（existsSync 链为微秒级，
+  /// 远低于 tsc 起进程成本，正确性优先）并刷新时间戳。
+  static final Map<String, (String?, DateTime)> _tsConfigCache = {};
   static String? _findProjectTsConfig(String startDir) {
+    final cached = _tsConfigCache[startDir];
+    if (cached != null &&
+        DateTime.now().difference(cached.$2) < const Duration(seconds: 60)) {
+      final hit = cached.$1;
+      if (hit != null) {
+        if (File(hit).existsSync()) return hit;
+      } else {
+        final recheck = _scanTsConfigUpward(startDir);
+        _tsConfigCache[startDir] = (recheck, DateTime.now());
+        return recheck;
+      }
+    }
+    final found = _scanTsConfigUpward(startDir);
+    _tsConfigCache[startDir] = (found, DateTime.now());
+    if (_tsConfigCache.length > 256) _tsConfigCache.clear();
+    return found;
+  }
+
+  /// 向上扫描 tsconfig/jsconfig（最多 32 层），返回首个命中路径或 null。
+  static String? _scanTsConfigUpward(String startDir) {
     var dir = Directory(startDir);
     for (var depth = 0; depth < 32 && dir.path.isNotEmpty; depth++) {
       for (final name in const ['tsconfig.json', 'jsconfig.json']) {
@@ -174,6 +250,12 @@ class LocalTscChecker {
     }
     return null;
   }
+
+  /// A4-11 测试钩子：暴露 _findProjectTsConfig（含缓存与 null 命中复检）
+  /// 供回归——生产路径经 analyze(projectRoot) 调用。
+  @visibleForTesting
+  static String? findProjectTsConfigForTest(String startDir) =>
+      _findProjectTsConfig(startDir);
 
   static List<IdeDiagnostic> _parseTscOutput({
     required String output,

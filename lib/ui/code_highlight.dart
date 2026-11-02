@@ -1,9 +1,7 @@
-import 'package:flutter/material.dart';
+import 'package:flutter/painting.dart';
 import 'package:re_highlight/languages/all.dart';
 import 'package:re_highlight/re_highlight.dart';
 
-import '../theme/app_colors.dart';
-import '../theme/theme_controller.dart';
 import '../workspace/code_language.dart';
 import 'highlight_theme_utils.dart';
 
@@ -377,77 +375,3 @@ const _builtinWords = <String, Set<String>>{
     'wrap',
   },
 };
-
-class HighlightedCodeView extends StatelessWidget {
-  const HighlightedCodeView({
-    super.key,
-    required this.content,
-    required this.language,
-  });
-
-  final String content;
-  final CodeLanguage language;
-
-  @override
-  Widget build(BuildContext context) {
-    final colors = IdeColors.of(context);
-    final themeController = ThemeScope.of(context);
-    final baseStyle = TextStyle(
-      color: colors.textPrimary,
-      fontSize: 12.5,
-      height: 1.55,
-      fontFamily: 'Menlo',
-    );
-
-    final highlighted = CodeHighlighter.instance.highlight(
-      source: content.isEmpty ? ' ' : content,
-      language: language,
-      theme: themeController.highlightTheme,
-      baseStyle: baseStyle,
-    );
-
-    final lines = content.isEmpty ? <String>[''] : content.split('\n');
-
-    return Container(
-      color: colors.panelElevated,
-      child: Scrollbar(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.fromLTRB(0, 12, 16, 16),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              SizedBox(
-                width: 52,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.end,
-                  children: [
-                    for (var i = 1; i <= lines.length; i++)
-                      Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 1.5),
-                        child: Text(
-                          '$i',
-                          style: TextStyle(
-                            color: colors.textMuted,
-                            fontSize: 12.5,
-                            height: 1.55,
-                            fontFamily: 'Menlo',
-                          ),
-                        ),
-                      ),
-                  ],
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: SelectableText.rich(
-                  highlighted,
-                  style: baseStyle,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}

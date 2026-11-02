@@ -4,8 +4,30 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:my_ide/ai/agent_runner.dart';
 import 'package:my_ide/ai/agent_tools.dart';
 import 'package:my_ide/ai/approval_gate.dart';
+import 'package:my_ide/ai/provider_config.dart';
+import 'package:my_ide/ai/tool_registry.dart';
 import 'package:my_ide/fs/workspace_fs.dart';
 import 'package:path/path.dart' as p;
+
+/// 读取 lib 源码：主文件与同名 `_` 前缀的 part 文件（库拆分后按整库断言）。
+String readLibSource(String relPath) {
+  var out = File('lib/$relPath').readAsStringSync();
+  final stem = relPath.split('/').last.replaceAll('.dart', '');
+  final parts = File('lib/$relPath')
+      .parent
+      .listSync()
+      .whereType<File>()
+      .where((f) {
+        final name = f.uri.pathSegments.last;
+        return name.startsWith('${stem}_') && name.endsWith('.dart');
+      })
+      .toList()
+    ..sort((a, b) => a.path.compareTo(b.path));
+  for (final f in parts) {
+    out += f.readAsStringSync();
+  }
+  return out;
+}
 
 void main() {
   group('审批队列串行推进', () {
@@ -42,9 +64,9 @@ void main() {
     });
 
     test('队首超时只结算一次且不抛二次完成', () async {
-      approvalTimeoutForTest = const Duration(milliseconds: 30);
+      ApprovalGate.approvalTimeoutForTest = const Duration(milliseconds: 30);
       addTearDown(() {
-        approvalTimeoutForTest = const Duration(minutes: 5);
+        ApprovalGate.approvalTimeoutForTest = const Duration(minutes: 5);
       });
       final gate = ApprovalGate();
       final first = gate.askApproval(
@@ -57,9 +79,9 @@ void main() {
     test('审批超时与拒绝可区分：超时打标记拒绝不打', () async {
       // 复现：5分钟超时静默按拒绝，与用户拒绝/取消同口径返回false，
       // 下游无法区分审计与重试语义。现超时置位可消费区分。
-      approvalTimeoutForTest = const Duration(milliseconds: 30);
+      ApprovalGate.approvalTimeoutForTest = const Duration(milliseconds: 30);
       addTearDown(() {
-        approvalTimeoutForTest = const Duration(minutes: 5);
+        ApprovalGate.approvalTimeoutForTest = const Duration(minutes: 5);
       });
       final gate = ApprovalGate();
       final timed = gate.askApproval(
@@ -79,6 +101,47 @@ void main() {
       gate2.resolveApproval(false);
       expect(await denied, isFalse);
       expect(gate2.takeApprovalTimeout('s-deny'), isFalse);
+    });
+
+    test('审批超时标记随轮起/轮末清理：残留不误判下次拒绝', () async {
+      // 复现：_timedOutSessions 只增不清——超时打标后若下游未消费，
+      // 同会话后续审批被拒时被误判为"审批超时可重试"而非用户拒绝。
+      // 修复：beginRun/endRun 按会话摘标记。
+      ApprovalGate.approvalTimeoutForTest = const Duration(milliseconds: 30);
+      addTearDown(() {
+        ApprovalGate.approvalTimeoutForTest = const Duration(minutes: 5);
+      });
+      final gate = ApprovalGate();
+      final timed = gate.askApproval(
+        PendingApproval(kind: 'file', title: 't', detail: 't'),
+        sessionId: 's-a13',
+      );
+      expect(await timed, isFalse);
+      expect(gate.takeApprovalTimeout('s-a13'), isTrue);
+      // 再超时一次但不消费，直接开新轮：beginRun 应摘残留标记。
+      final timed2 = gate.askApproval(
+        PendingApproval(kind: 'file', title: 't2', detail: 't2'),
+        sessionId: 's-a13',
+      );
+      expect(await timed2, isFalse);
+      gate.beginRun(sessionId: 's-a13');
+      // 下次用户拒绝不再被残留标记误判为超时。
+      final denied = gate.askApproval(
+        PendingApproval(kind: 'file', title: 'd', detail: 'd'),
+        sessionId: 's-a13',
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      gate.resolveApproval(false);
+      expect(await denied, isFalse);
+      expect(gate.takeApprovalTimeout('s-a13'), isFalse);
+      // endRun 同口径：轮末同样摘标记。
+      final timed3 = gate.askApproval(
+        PendingApproval(kind: 'file', title: 't3', detail: 't3'),
+        sessionId: 's-a13',
+      );
+      expect(await timed3, isFalse);
+      gate.endRun(sessionId: 's-a13');
+      expect(gate.takeApprovalTimeout('s-a13'), isFalse);
     });
 
     test('队列推进/结算同步UI：监听器随队列变化收到通知', () async {
@@ -301,6 +364,46 @@ void main() {
       expect(await File(p.join(root.path, 'len.txt')).readAsString(), big);
     });
 
+    test('B10 空串基线同样参与乐观锁：窗口内被写入即拒绝', () async {
+      // 复现：expectedContent 空串被 isNotEmpty 静默跳锁——预览时空文件，
+      // 窗口内被后台写入内容后提交，write/edit 静默覆盖外部改动。
+      final tools = AgentTools(rootPath: root.path);
+      // 预览时为空文件。
+      await File(p.join(root.path, 'empty.txt')).writeAsString('');
+      // 窗口内被写入内容。
+      await File(p.join(root.path, 'empty.txt')).writeAsString('窗口内写入');
+      final w = await tools.execute('write_file', {
+        'path': 'empty.txt',
+        'content': 'new-content',
+        'expectedContent': '',
+      });
+      expect(w.ok, isFalse);
+      expect(w.output, contains('发生变化'));
+      expect(
+        await File(p.join(root.path, 'empty.txt')).readAsString(),
+        '窗口内写入',
+        reason: '拒绝后不得覆盖窗口内写入的外部内容',
+      );
+      // edit 同口径：空串基线，文件内容与基线不符即拒绝提交。
+      final e = await tools.execute('edit_file', {
+        'path': 'empty.txt',
+        'oldText': '窗口内写入',
+        'newText': '被改',
+        'expectedContent': '',
+      });
+      expect(e.ok, isFalse);
+      expect(e.output, contains('发生变化'));
+      expect(await File(p.join(root.path, 'empty.txt')).readAsString(), '窗口内写入');
+      // 正向对照：文件仍为空且基线为空串 → 内容一致，正常放行（比对不误伤）。
+      await File(p.join(root.path, 'still-empty.txt')).writeAsString('');
+      final ok = await tools.execute('write_file', {
+        'path': 'still-empty.txt',
+        'content': 'x',
+        'expectedContent': '',
+      });
+      expect(ok.ok, isTrue);
+    });
+
     test('R1-F1 直调写盘同样等restore（写盘统一关口）', timeout: const Timeout(Duration(seconds: 90)), () async {
       // 复现：直调execute()绕过ToolRegistry层等待，restore期间落盘被覆盖。
       // 现统一关口抛错中止（串行链内抛错口径），文件不落地。
@@ -309,6 +412,8 @@ void main() {
       tools.restoreGenCheck = () => 0;
       // restore常驻忙：30s超时抛错中止，不静默落盘。
       await File(p.join(root.path, 'gated.txt')).writeAsString('old');
+      // R1-10 read-before-write：覆盖已存在文件须先读，先登记已知基线。
+      await tools.execute('read_file', {'path': 'gated.txt'});
       await expectLater(
         tools
             .execute('write_file', {'path': 'gated.txt', 'content': 'late'})
@@ -324,12 +429,677 @@ void main() {
       expect(await File(p.join(root.path, 'gated.txt')).readAsString(), 'old');
     });
 
-    test('R1-D5 空会话信任不污染非空会话', () {
+    test('R1-D5 空会话信任不污染非空会话', () async {
       // 复现：空路径写入''桶后非空会话同key自动放行。
+      // A7：同步版 isTrusted 已删，改走生产同口径的 isTrustedAsync。
       final gate = ApprovalGate();
-      gate.isTrusted('k-cmd', sessionId: '');
+      await gate.isTrustedAsync('k-cmd', sessionId: '');
       // 直接写空桶（模拟旧单测/关窗异常路径）。
-      expect(gate.isTrusted('no-such', sessionId: 'sess-b'), isFalse);
+      expect(await gate.isTrustedAsync('no-such', sessionId: 'sess-b'), isFalse);
+    });
+  });
+
+  group('会话写盘队列挂真实完成 Future', () {
+    test('超时后新写不与在途旧任务并发（源码口径）', () {
+      final src = readLibSource('ai/chat_store.dart');
+      final idx = src.indexOf('static Future<void> _enqueue(');
+      expect(idx, greaterThanOrEqualTo(0));
+      final body = src.substring(idx, idx + 1400);
+      // 队列链挂 real（真实完成），调用方才挂 timeout。
+      expect(body.contains('final real = previous.catchError'), isTrue);
+      expect(body.contains('real.timeout'), isTrue);
+      expect(body.contains('_writes[path] = queued'), isTrue);
+      // queued 必须挂在 real（catchError 兜底）而非 caller 的 timeout 层。
+      expect(body.contains('real.catchError'), isTrue,
+          reason: '链与摘队挂 real，后续写串在原任务之后');
+    });
+  });
+
+  group('ask_question 参数校验', () {
+    test('options >8条/单条>200字符截断并注明', () {
+      final longOpt = 'x' * 300;
+      final c = ToolArgs.validate('ask_question', {
+        'question': '选一个',
+        'options': [longOpt, ...List<String>.generate(12, (i) => 'opt$i')],
+      });
+      expect(c.ok, isTrue, reason: c.error);
+      final opts = (c.args['options'] as List).cast<String>();
+      // 8 条保留 + 1 条注明（共 13 条，丢弃 5 条）。
+      expect(opts.length, 9);
+      // 单条超长：截到 200 + 截断注记。
+      expect(opts.first.length, lessThanOrEqualTo(210));
+      expect(opts.first.startsWith('x'), isTrue);
+      expect(opts.first, contains('（截断）'));
+      // 条数超限：末位注明丢弃规模。
+      expect(opts.last, contains('超限已截断'));
+      expect(opts.last, contains('其余 5 项'));
+      // 正常小 options 原样保留。
+      final small = ToolArgs.validate('ask_question', {
+        'question': 'q',
+        'options': ['a', 'b'],
+      });
+      expect((small.args['options'] as List).length, 2);
+      expect((small.args['options'] as List).first, 'a');
+    });
+  });
+
+  group('MCP 与读取门禁', () {
+    AiProviderConfig provider() => AiProviderConfig(
+          id: 't',
+          name: 't',
+          baseUrl: 'http://127.0.0.1',
+          fullUrl: true,
+        );
+
+    test('approveReadOutside=deny：敏感路径读取一律拒绝不弹窗', () async {
+      final gate = ApprovalGate();
+      final model = AiModelOption(id: 'm');
+      final root = await Directory.systemTemp.createTemp('deny-read-');
+      final reg = ToolRegistry(gate: gate)
+        ..approveReadOutside = ApprovalAction.deny;
+      try {
+        await File('${root.path}/.env').writeAsString('SECRET=1\n');
+        final r = await reg.executeWithGuards(
+          toolName: 'read_file',
+          args: {'path': '.env'},
+          mode: AgentMode.agent,
+          provider: provider(),
+          model: model,
+          rootPath: root.path,
+          sessionId: 's',
+        );
+        expect(r?.ok, isFalse);
+        // deny 档不再被 readZone==sensitive 分支降级为 ask。
+        expect(r?.output, contains('读取已被审批策略拒绝'));
+        // 直接拒绝：不落待审批弹窗。
+        expect(gate.pendingApproval, isNull);
+      } finally {
+        await reg.dispose();
+        gate.dispose();
+        try {
+          if (await root.exists()) await root.delete(recursive: true);
+        } catch (_) {}
+      }
+    });
+
+    test('无工作区时 MCP 参数命中敏感路径仍被门禁拦截', () async {
+      final gate = ApprovalGate();
+      final reg = ToolRegistry(gate: gate);
+      final root = await Directory.systemTemp.createTemp('no-ws-gate-');
+      try {
+        // ~ 前缀展开 HOME 后命中 .ssh 黑名单（rootPath 为空不再整体短路）。
+        expect(
+          reg.mcpArgsHitDeniedZoneForTest(
+            {'path': '~/.ssh/id_rsa'},
+            rootPath: '',
+          ),
+          isTrue,
+        );
+        // file:// 绝对路径命中敏感段。
+        final home = Platform.environment['HOME'] ?? '';
+        if (home.isNotEmpty) {
+          expect(
+            reg.mcpArgsHitDeniedZoneForTest({
+              'uri': 'file://$home/.ssh/id_rsa',
+            }, rootPath: null),
+            isTrue,
+          );
+        }
+        // 非敏感路径不误伤。
+        expect(
+          reg.mcpArgsHitDeniedZoneForTest({
+            'path': '/usr/share/doc/readme.md',
+          }, rootPath: ''),
+          isFalse,
+        );
+        // 有工作区时区外路径仍按原口径拒绝（回归不弱化）。
+        expect(
+          reg.mcpArgsHitDeniedZoneForTest(
+            {'path': '/etc/passwd'},
+            rootPath: root.path,
+          ),
+          isTrue,
+        );
+      } finally {
+        await reg.dispose();
+        gate.dispose();
+        try {
+          if (await root.exists()) await root.delete(recursive: true);
+        } catch (_) {}
+      }
+    });
+
+    test('无工作区时 mcp_read_resource 敏感 file:// 直达被拒', () async {
+      final gate = ApprovalGate();
+      final reg = ToolRegistry(gate: gate);
+      final home = Platform.environment['HOME'] ?? '';
+      try {
+        final r = await reg.executeWithGuards(
+          toolName: 'mcp_read_resource',
+          args: {'serverId': 's1', 'uri': 'file://$home/.ssh/id_rsa'},
+          mode: AgentMode.agent,
+          provider: provider(),
+          model: AiModelOption(id: 'm'),
+          rootPath: null,
+          sessionId: 's',
+        );
+        expect(r?.ok, isFalse);
+        expect(r?.output, contains('已按门禁拒绝'));
+        expect(gate.pendingApproval, isNull);
+      } finally {
+        await reg.dispose();
+        gate.dispose();
+      }
+    });
+  });
+
+  group('first-seen 首见提级 ask（未知/新工具）', () {
+    AiProviderConfig provider() => AiProviderConfig(
+      id: 't',
+      name: 't',
+      baseUrl: 'http://127.0.0.1',
+      fullUrl: true,
+    );
+
+    AiModelOption model() => AiModelOption(id: 'm');
+
+    test('未登记 MCP 工具首次调用 ask、同会话二次落 auto 档执行', () async {
+      final gate = ApprovalGate();
+      final reg = ToolRegistry(gate: gate);
+      final root = await Directory.systemTemp.createTemp('first-seen-mcp-');
+      try {
+        // 首次：'mcp__foo__bar' 未登记（无该 server）→ first-seen 提级 ask。
+        final first = reg.executeWithGuards(
+          toolName: 'mcp__foo__bar',
+          args: const {},
+          mode: AgentMode.agent,
+          provider: provider(),
+          model: model(),
+          rootPath: root.path,
+          sessionId: 's-mcp-first',
+        );
+        for (var i = 0; i < 200 && gate.pendingApproval == null; i++) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+        expect(
+          gate.pendingApproval,
+          isNotNull,
+          reason: '新连接/未登记 MCP 工具会话首见必须弹人审',
+        );
+        expect(gate.pendingApproval!.kind, 'mcp');
+        // 用户拒绝：消费即已入桶，不再重复打扰。
+        gate.resolveApproval(false);
+        expect(await first, isNull);
+
+        // 二次：同 key 已进信任桶 → 落预期档位（approveMcp 默认 auto）直执行，
+        // 未登记 server 执行业务失败，但关键是未经二次人审。
+        final second = await reg.executeWithGuards(
+          toolName: 'mcp__foo__bar',
+          args: const {},
+          mode: AgentMode.agent,
+          provider: provider(),
+          model: model(),
+          rootPath: root.path,
+          sessionId: 's-mcp-first',
+        );
+        expect(
+          gate.pendingApproval,
+          isNull,
+          reason: '同 key 二次应按规则走（默认 auto），不再弹审',
+        );
+        expect(second, isNotNull);
+        expect(second!.output, contains('未找到 MCP 服务器'));
+      } finally {
+        await reg.dispose();
+        gate.dispose();
+        try {
+          if (await root.exists()) await root.delete(recursive: true);
+        } catch (_) {}
+      }
+    });
+
+    test('deny 规则对 first-seen 工具仍优先：命中即拒不弹窗', () async {
+      final gate = ApprovalGate();
+      final reg = ToolRegistry(gate: gate)
+        ..autoApprovalRules = [
+          AutoApprovalRule(
+            tool: 'mcp__foo__bar',
+            pattern: '',
+            action: ApprovalAction.deny,
+          ),
+        ];
+      final root = await Directory.systemTemp.createTemp('first-seen-deny-');
+      try {
+        final r = await reg.executeWithGuards(
+          toolName: 'mcp__foo__bar',
+          args: const {},
+          mode: AgentMode.agent,
+          provider: provider(),
+          model: model(),
+          rootPath: root.path,
+          sessionId: 's-mcp-deny',
+        );
+        expect(r?.ok, isFalse);
+        expect(r?.output, contains('MCP 工具已被自动审批规则拒绝'));
+        expect(gate.pendingApproval, isNull, reason: 'deny 优先于 first-seen，不弹审');
+      } finally {
+        await reg.dispose();
+        gate.dispose();
+        try {
+          if (await root.exists()) await root.delete(recursive: true);
+        } catch (_) {}
+      }
+    });
+
+    test('显式 auto 规则命中不触发 first-seen 打扰', () async {
+      final gate = ApprovalGate();
+      final reg = ToolRegistry(gate: gate)
+        ..autoApprovalRules = [
+          AutoApprovalRule(
+            tool: 'mcp__foo__bar',
+            pattern: '',
+            action: ApprovalAction.auto,
+          ),
+        ];
+      final root = await Directory.systemTemp.createTemp('first-seen-rule-');
+      try {
+        final r = await reg.executeWithGuards(
+          toolName: 'mcp__foo__bar',
+          args: const {},
+          mode: AgentMode.agent,
+          provider: provider(),
+          model: model(),
+          rootPath: root.path,
+          sessionId: 's-mcp-rule',
+        );
+        expect(gate.pendingApproval, isNull, reason: '用户显式配置的规则优先于 first-seen');
+        expect(r?.output, contains('未找到 MCP 服务器'));
+      } finally {
+        await reg.dispose();
+        gate.dispose();
+        try {
+          if (await root.exists()) await root.delete(recursive: true);
+        } catch (_) {}
+      }
+    });
+
+    test('按会话分桶 + endSessionLedger 清理后重新首见 ask', () async {
+      final gate = ApprovalGate();
+      final reg = ToolRegistry(gate: gate);
+      final root = await Directory.systemTemp.createTemp('first-seen-sess-');
+      try {
+        // 会话 A 首见：ask（拒绝即入桶）。
+        final a1 = reg.executeWithGuards(
+          toolName: 'mcp__foo__bar',
+          args: const {},
+          mode: AgentMode.agent,
+          provider: provider(),
+          model: model(),
+          rootPath: root.path,
+          sessionId: 'sess-a',
+        );
+        for (var i = 0; i < 200 && gate.pendingApproval == null; i++) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+        expect(gate.pendingApproval, isNotNull);
+        gate.resolveApproval(false);
+        expect(await a1, isNull);
+
+        // 会话 A 二次：直接落 auto 档执行（不再打扰）。
+        final a2 = await reg.executeWithGuards(
+          toolName: 'mcp__foo__bar',
+          args: const {},
+          mode: AgentMode.agent,
+          provider: provider(),
+          model: model(),
+          rootPath: root.path,
+          sessionId: 'sess-a',
+        );
+        expect(gate.pendingApproval, isNull);
+        expect(a2?.output, contains('未找到 MCP 服务器'));
+
+        // 会话 B 首见：独立分桶，同样先 ask 一次。
+        final b1 = reg.executeWithGuards(
+          toolName: 'mcp__foo__bar',
+          args: const {},
+          mode: AgentMode.agent,
+          provider: provider(),
+          model: model(),
+          rootPath: root.path,
+          sessionId: 'sess-b',
+        );
+        for (var i = 0; i < 200 && gate.pendingApproval == null; i++) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+        expect(gate.pendingApproval, isNotNull, reason: 'A 会话见过不得替 B 免问');
+        gate.resolveApproval(false);
+        expect(await b1, isNull);
+
+        // 结束会话 A 台账：桶清理，A 再调同工具重新首见 ask。
+        reg.endSessionLedger('sess-a');
+        final a3 = reg.executeWithGuards(
+          toolName: 'mcp__foo__bar',
+          args: const {},
+          mode: AgentMode.agent,
+          provider: provider(),
+          model: model(),
+          rootPath: root.path,
+          sessionId: 'sess-a',
+        );
+        for (var i = 0; i < 200 && gate.pendingApproval == null; i++) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+        expect(
+          gate.pendingApproval,
+          isNotNull,
+          reason: 'endSessionLedger 后 first-seen 桶应重新武装',
+        );
+        gate.resolveApproval(false);
+        expect(await a3, isNull);
+      } finally {
+        await reg.dispose();
+        gate.dispose();
+        try {
+          if (await root.exists()) await root.delete(recursive: true);
+        } catch (_) {}
+      }
+    });
+
+    test('内置工具同样首见 ask：run_command 首次 ask、二次 auto 执行', () async {
+      final gate = ApprovalGate();
+      final reg = ToolRegistry(gate: gate); // approveCommand 默认 auto。
+      final root = await Directory.systemTemp.createTemp('first-seen-cmd-');
+      try {
+        await File(p.join(root.path, 'inside.txt')).writeAsString('x');
+        // 首次：first-seen 提级 ask（即便全局档位 auto）。
+        final first = reg.executeWithGuards(
+          toolName: 'run_command',
+          args: {'command': 'echo hi'},
+          mode: AgentMode.agent,
+          provider: provider(),
+          model: model(),
+          rootPath: root.path,
+          sessionId: 's-cmd-first',
+        );
+        for (var i = 0; i < 200 && gate.pendingApproval == null; i++) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+        expect(
+          gate.pendingApproval,
+          isNotNull,
+          reason: '会话首见的任意工具（含内置）强制 ask 一次',
+        );
+        expect(gate.pendingApproval!.kind, 'command');
+        gate.resolveApproval(false);
+        expect(await first, isNull);
+
+        // 二次：入信任桶后按规则走（auto 直执行，不再弹审）。
+        final second = await reg.executeWithGuards(
+          toolName: 'run_command',
+          args: {'command': 'echo hi'},
+          mode: AgentMode.agent,
+          provider: provider(),
+          model: model(),
+          rootPath: root.path,
+          sessionId: 's-cmd-first',
+        );
+        expect(gate.pendingApproval, isNull);
+        expect(second?.ok, isTrue);
+        expect(second!.output, contains('hi'));
+      } finally {
+        await reg.dispose();
+        gate.dispose();
+        try {
+          if (await root.exists()) await root.delete(recursive: true);
+        } catch (_) {}
+      }
+    });
+
+    test('endSession（连后台任务）同样清理 first-seen 会话桶', () {
+      // 源码口径：清理点与其它分账表同址。
+      final src = readLibSource('ai/tool_registry.dart');
+      expect(
+        src.contains('_firstSeenBySession.remove(sessionId)'),
+        isTrue,
+        reason: 'endSession/endSessionLedger 必须清理 first-seen 会话桶',
+      );
+      expect(
+        src.split('_firstSeenBySession.remove(sessionId)').length - 1,
+        greaterThanOrEqualTo(2),
+        reason: 'endSession 与 endSessionLedger 两处都要清理',
+      );
+    });
+  });
+
+  group('风险分层审批', () {
+    test('纯函数：档位与下限抬升语义', () {
+      // HIGH 档枚举完整（动作/交互写）。
+      for (final t in const [
+        'computer_click',
+        'computer_move',
+        'computer_drag',
+        'computer_scroll',
+        'computer_press',
+        'computer_type',
+        'computer_open',
+        'browser_click',
+        'browser_fill',
+        'browser_select',
+        'browser_upload',
+        'browser_drag',
+        'browser_press',
+        'browser_eval',
+      ]) {
+        expect(ToolRegistry.isHighRiskToolForTest(t), isTrue, reason: t);
+      }
+      // LOW 档：只读观测不抬升。
+      for (final t in const [
+        'computer_screenshot',
+        'browser_read',
+        'browser_snapshot',
+        'browser_console',
+        'browser_network',
+        'browser_status',
+        'read_file',
+        'write_file',
+      ]) {
+        expect(ToolRegistry.isHighRiskToolForTest(t), isFalse, reason: t);
+      }
+      // 下限：global auto + HIGH → ask。
+      expect(
+        ToolRegistry.applyRiskFloor(ApprovalAction.auto, 'computer_click'),
+        ApprovalAction.ask,
+      );
+      expect(
+        ToolRegistry.applyRiskFloor(ApprovalAction.auto, 'browser_click'),
+        ApprovalAction.ask,
+      );
+      // LOW / ask / deny 原样。
+      expect(
+        ToolRegistry.applyRiskFloor(ApprovalAction.auto, 'browser_read'),
+        ApprovalAction.auto,
+      );
+      expect(
+        ToolRegistry.applyRiskFloor(ApprovalAction.ask, 'computer_click'),
+        ApprovalAction.ask,
+      );
+      expect(
+        ToolRegistry.applyRiskFloor(ApprovalAction.deny, 'computer_click'),
+        ApprovalAction.deny,
+      );
+      // 显式 per-tool·path 规则优先于分层。
+      expect(
+        ToolRegistry.applyRiskFloor(
+          ApprovalAction.auto,
+          'computer_click',
+          explicitRule: true,
+        ),
+        ApprovalAction.auto,
+      );
+    });
+
+    test('行为：browser_click 全局 auto 下强制人审（HIGH 档）', () async {
+      final gate = ApprovalGate();
+      final provider = AiProviderConfig(
+        id: 't',
+        name: 't',
+        baseUrl: 'http://127.0.0.1',
+        fullUrl: true,
+      );
+      final model = AiModelOption(id: 'm');
+      final root = await Directory.systemTemp.createTemp('risk-tier-');
+      final reg = ToolRegistry(gate: gate);
+      try {
+        // 默认 approveBrowser=auto。
+        expect(reg.approveBrowser, ApprovalAction.auto);
+        final fut = reg.executeWithGuards(
+          toolName: 'browser_click',
+          args: {'selector': '#buy'},
+          mode: AgentMode.agent,
+          provider: provider,
+          model: model,
+          rootPath: root.path,
+          sessionId: 's-browser-high',
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        expect(
+          gate.pendingApproval,
+          isNotNull,
+          reason: 'HIGH 档在全局 auto 下必须弹人审',
+        );
+        expect(gate.pendingApproval!.kind, 'network');
+        expect(gate.pendingApproval!.title, contains('【高风险】'));
+        gate.resolveApproval(false);
+        expect(await fut, isNull);
+      } finally {
+        reg.dispose();
+        gate.dispose();
+        try {
+          if (await root.exists()) await root.delete(recursive: true);
+        } catch (_) {}
+      }
+    });
+
+    test('行为：browser_read 全局 auto 下不弹审（LOW 档直达执行）', () async {
+      final gate = ApprovalGate();
+      final provider = AiProviderConfig(
+        id: 't',
+        name: 't',
+        baseUrl: 'http://127.0.0.1',
+        fullUrl: true,
+      );
+      final model = AiModelOption(id: 'm');
+      final root = await Directory.systemTemp.createTemp('risk-tier-low-');
+      final reg = ToolRegistry(gate: gate);
+      try {
+        final r = await reg.executeWithGuards(
+          toolName: 'browser_read',
+          args: const {},
+          mode: AgentMode.agent,
+          provider: provider,
+          model: model,
+          rootPath: root.path,
+          sessionId: 's-browser-low',
+        );
+        expect(gate.pendingApproval, isNull, reason: 'LOW 档不得被分层误伤');
+        expect(r, isNotNull);
+        // 直达执行：尚未打开页面的业务错误（而非审批拦截）。
+        expect(r!.output, contains('尚未打开页面'));
+      } finally {
+        reg.dispose();
+        gate.dispose();
+        try {
+          if (await root.exists()) await root.delete(recursive: true);
+        } catch (_) {}
+      }
+    });
+
+    test('行为：computer_click 全局 auto 下强制人审且拒绝即不执行', () async {
+      final gate = ApprovalGate();
+      final provider = AiProviderConfig(
+        id: 't',
+        name: 't',
+        baseUrl: 'http://127.0.0.1',
+        fullUrl: true,
+      );
+      final model = AiModelOption(id: 'm');
+      final root = await Directory.systemTemp.createTemp('risk-tier-comp-');
+      final reg = ToolRegistry(gate: gate)
+        ..approveComputer = ApprovalAction.auto;
+      try {
+        final fut = reg.executeWithGuards(
+          toolName: 'computer_click',
+          args: {'x': 100, 'y': 100},
+          mode: AgentMode.agent,
+          provider: provider,
+          model: model,
+          rootPath: root.path,
+          sessionId: 's-comp-high',
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        expect(
+          gate.pendingApproval,
+          isNotNull,
+          reason: 'computer_click 全局 auto 不得无感放行',
+        );
+        expect(gate.pendingApproval!.kind, 'computer');
+        expect(gate.pendingApproval!.title, contains('【高风险】'));
+        // 拒绝后不执行（返回 null = 调用方按拒绝跳过）。
+        gate.resolveApproval(false);
+        expect(await fut, isNull);
+      } finally {
+        reg.dispose();
+        gate.dispose();
+        try {
+          if (await root.exists()) await root.delete(recursive: true);
+        } catch (_) {}
+      }
+    });
+
+    test('行为：显式 per-tool 规则 auto 优先于分层（computer_click）', () async {
+      final gate = ApprovalGate();
+      final provider = AiProviderConfig(
+        id: 't',
+        name: 't',
+        baseUrl: 'http://127.0.0.1',
+        fullUrl: true,
+      );
+      final model = AiModelOption(id: 'm');
+      final root = await Directory.systemTemp.createTemp('risk-tier-rule-');
+      final reg = ToolRegistry(gate: gate)
+        ..approveComputer = ApprovalAction.auto
+        ..autoApprovalRules = [
+          AutoApprovalRule(
+            tool: 'computer_click',
+            pattern: '',
+            action: ApprovalAction.auto,
+          ),
+        ];
+      try {
+        // 显式规则放行：不弹审，直达执行层（执行会因无屏幕环境失败，
+        // 但关键是未经人审——证明显式规则优先于分层）。
+        final r = await reg.executeWithGuards(
+          toolName: 'computer_click',
+          args: {'x': 1, 'y': 1},
+          mode: AgentMode.agent,
+          provider: provider,
+          model: model,
+          rootPath: root.path,
+          sessionId: 's-comp-rule',
+        );
+        expect(
+          gate.pendingApproval,
+          isNull,
+          reason: '显式 per-tool 规则（用户显式配置）优先于分层',
+        );
+        expect(r, isNotNull);
+      } finally {
+        reg.dispose();
+        gate.dispose();
+        try {
+          if (await root.exists()) await root.delete(recursive: true);
+        } catch (_) {}
+      }
     });
   });
 }

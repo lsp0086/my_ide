@@ -6,8 +6,12 @@ import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import '../ai/remote_channel.dart' show clipRunes;
 import '../settings/settings_store.dart';
 import 'skill_model.dart';
+
+part 'skill_manager_lifecycle.dart';
+part 'skill_manager_scan.dart';
 
 /// 全局 Skill 管理：多源发现、启用状态、额外全局目录、导入。
 ///
@@ -43,6 +47,9 @@ class SkillManager extends ChangeNotifier {
   bool _loaded = false;
   String? _lastError;
 
+  /// B3-8：严格解析开关（SettingsStore.skillsStrictParse，默认 false）。
+  bool _strictParse = false;
+
   List<AgentSkill> get skills => List.unmodifiable(_skills);
 
   List<AgentSkill> get enabledSkills =>
@@ -66,8 +73,16 @@ class SkillManager extends ChangeNotifier {
   }) {
     // 轮次1：首次加载挂起期间并发调用——此前 _loaded 已同步置 true，
     // 并发方直接返回未加载的空 skills 列表。现合并返回在途 future。
+    // E11：in-flight 且请求了不同 workspaceRoot 时直接返回在途 future 会
+    // 丢新 root 的项目级 skills——等在途完成后按新 root 链式补载。补载时
+    // _loadFuture 已被 whenComplete 清空（后注册回调后执行），不会无限递归。
     final inFlight = _loadFuture;
-    if (inFlight != null && !forceRefresh) return inFlight;
+    if (inFlight != null && !forceRefresh) {
+      if (workspaceRoot != _workspaceRoot) {
+        return inFlight.whenComplete(() => ensureLoaded(workspaceRoot: workspaceRoot));
+      }
+      return inFlight;
+    }
     final f = _ensureLoadedInner(workspaceRoot, forceRefresh);
     _loadFuture = f;
     // 完成后清占位：下一次 rootChanged/forceRefresh 触发新加载。
@@ -76,90 +91,6 @@ class SkillManager extends ChangeNotifier {
       if (identical(_loadFuture, f)) _loadFuture = null;
     });
     return f;
-  }
-
-  Future<void> _ensureLoadedInner(
-    String? workspaceRoot,
-    bool forceRefresh,
-  ) async {
-    final first = !_loaded;
-    if (first) {
-      _loaded = true;
-      _restorePrefs();
-      await _ensureAppGlobalDir();
-    }
-    final rootChanged = workspaceRoot != _workspaceRoot;
-    if (rootChanged) {
-      _workspaceRoot = workspaceRoot;
-    }
-    if (first || rootChanged || forceRefresh) {
-      await refresh();
-    }
-  }
-
-  void _restorePrefs() {
-    _disabledIds
-      ..clear()
-      ..addAll(_readStringList(_disabledKey));
-    _extraGlobalDirs
-      ..clear()
-      ..addAll(_readStringList(_extraGlobalDirsKey));
-    final sources = _readStringList(_enabledSourcesKey);
-    if (sources.isNotEmpty) {
-      _enabledSources
-        ..clear()
-        ..addAll(sources.where(knownSourceIds.containsKey));
-      // 至少保留 my_ide，避免全关后无法用本应用目录
-      if (_enabledSources.isEmpty) {
-        _enabledSources.add('my_ide');
-      }
-    }
-  }
-
-  List<String> _readStringList(String key) {
-    final raw = SettingsStore.instance.getString(key);
-    if (raw == null || raw.isEmpty) return const [];
-    try {
-      final list = jsonDecode(raw) as List;
-      return list.map((e) => '$e').where((e) => e.isNotEmpty).toList();
-    } catch (_) {
-      return const [];
-    }
-  }
-
-  Future<void> _persistDisabled() async {
-    await SettingsStore.instance
-        .setString(_disabledKey, jsonEncode(_disabledIds.toList()));
-  }
-
-  Future<void> _persistExtraDirs() async {
-    await SettingsStore.instance
-        .setString(_extraGlobalDirsKey, jsonEncode(_extraGlobalDirs));
-  }
-
-  Future<void> _persistSources() async {
-    await SettingsStore.instance
-        .setString(_enabledSourcesKey, jsonEncode(_enabledSources.toList()));
-  }
-
-  Future<void> _ensureAppGlobalDir() async {
-    try {
-      final support = await getApplicationSupportDirectory();
-      final dir = Directory(p.join(support.path, 'skills'));
-      if (!await dir.exists()) {
-        await dir.create(recursive: true);
-      }
-      _appGlobalSkillsDir = dir.path;
-    } catch (e) {
-      _lastError = '无法创建应用全局 skills 目录：$e';
-    }
-  }
-
-  String? get _home {
-    final h = Platform.environment['HOME'] ??
-        Platform.environment['USERPROFILE'];
-    if (h == null || h.isEmpty) return null;
-    return h;
   }
 
   Future<void> refresh() async {
@@ -199,7 +130,12 @@ class SkillManager extends ChangeNotifier {
             continue;
           }
           if (entity is! Directory) continue;
-          if (++seen > 200) break;
+          if (++seen > 200) {
+            // R-SKILL-CAP：扫描截断不再静默——skills 目录超 200 项时
+            // 后面的永不加载，用户需在 errors 里看到原因。
+            errors.add('$sourceLabel 技能目录超过 200 项，其余未加载');
+            break;
+          }
           final skill = await _tryLoadSkillDir(
             entity,
             scope: scope,
@@ -277,73 +213,6 @@ class SkillManager extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<AgentSkill?> _tryLoadSkillDir(
-    Directory dir, {
-    required SkillScope scope,
-    required String sourceLabel,
-  }) async {
-    final skillMd = File(p.join(dir.path, 'SKILL.md'));
-    if (!await skillMd.exists()) {
-      // 兼容 skill.md
-      final alt = File(p.join(dir.path, 'skill.md'));
-      if (!await alt.exists()) return null;
-      return _loadFromFile(
-        alt,
-        dir: dir,
-        scope: scope,
-        sourceLabel: sourceLabel,
-      );
-    }
-    return _loadFromFile(
-      skillMd,
-      dir: dir,
-      scope: scope,
-      sourceLabel: sourceLabel,
-    );
-  }
-
-  Future<AgentSkill?> _loadFromFile(
-    File file, {
-    required Directory dir,
-    required SkillScope scope,
-    required String sourceLabel,
-  }) async {
-    try {
-      // 大文件门禁：SKILL.md 先 stat，超 1MB 即拒载（8000 截断在拼接后，
-      // 无门禁时大文件全量进内存可 OOM）。
-      try {
-        if (await file.length() > 1024 * 1024) {
-          debugPrint('Skill too large, skip ${file.path}');
-          return null;
-        }
-      } catch (_) {}
-      final raw = await file.readAsString();
-      final parsed = SkillMdParser.parse(
-        raw,
-        directoryName: p.basename(dir.path),
-      );
-      return AgentSkill(
-        name: parsed.name,
-        description: parsed.description,
-        body: parsed.body,
-        directoryPath: dir.path,
-        skillMdPath: file.path,
-        scope: scope,
-        sourceLabel: sourceLabel,
-        license: parsed.license,
-        compatibility: parsed.compatibility,
-        version: parsed.version,
-        author: parsed.author,
-        metadata: parsed.metadata,
-        allowedTools: parsed.allowedTools,
-        parseWarning: parsed.warning,
-      );
-    } catch (e) {
-      debugPrint('Skill load failed ${file.path}: $e');
-      return null;
-    }
-  }
-
   AgentSkill? findByName(String name) {
     final n = name.trim();
     if (n.isEmpty) return null;
@@ -373,7 +242,9 @@ class SkillManager extends ChangeNotifier {
       }
       final scope = s.scope == SkillScope.project ? 'project' : 'global';
       var d = s.description;
-      if (d.length > maxDescLen) d = '${d.substring(0, maxDescLen)}…';
+      // D17：目录摘要截断改按 rune——substring 按 UTF-16 码元切，emoji/
+      // 扩展区中文落边界即被拦腰切成代理对乱码进 system prompt。
+      if (d.runes.length > maxDescLen) d = '${clipRunes(d, maxDescLen)}…';
       buf.writeln('- ${s.name} [$scope/${s.sourceLabel}]: $d');
       shown++;
     }
@@ -538,6 +409,24 @@ class SkillManager extends ChangeNotifier {
     'browser_download_dir',
     'browser_wait',
     'browser_frames',
+    // B6/B8/B9/后续轮新工具：白名单补齐，否则 validateAllowedTools 误报未知。
+    'browser_emulate',
+    'browser_metrics',
+    'browser_trace',
+    'browser_mhtml',
+    'browser_pdf',
+    'browser_route',
+    'computer_screenshot',
+    'computer_click',
+    'computer_move',
+    'computer_drag',
+    'computer_scroll',
+    'computer_press',
+    'computer_type',
+    'computer_open',
+    // B3：动作补齐（修饰键按住/释放分离、渲染等待）。
+    'computer_key',
+    'computer_wait',
   };
 
   /// 校验 skill 的 allowed-tools：返回不在白名单的未知工具名。
@@ -582,13 +471,25 @@ class SkillManager extends ChangeNotifier {
     if (skill.allowedTools != null) {
       buf.writeln('allowed-tools: ${skill.allowedTools}');
     }
+    // B3-3：MCP 导入来源保留（SEP-2640 要求 hosts 保留 server 身份与
+    // 资源 URI）——快照带出，模型可判断 skill 的可信来源。
+    final mcpServer = skill.metadata['mcp-server'];
+    if (mcpServer != null && mcpServer.isNotEmpty) {
+      buf.writeln('mcp-server: $mcpServer');
+      final mcpUri = skill.metadata['mcp-skill-uri'];
+      if (mcpUri != null && mcpUri.isNotEmpty) {
+        buf.writeln('mcp-skill-uri: $mcpUri');
+      }
+    }
     buf.writeln();
     // 正文预算截断：超长只给前 8000 字符 + 截断提示，不整段塞上下文。
     const bodyBudget = 8000;
     if (skill.body.length <= bodyBudget) {
       buf.writeln(skill.body);
     } else {
-      buf.writeln(skill.body.substring(0, bodyBudget));
+      // D17：截断改按 rune——emoji/扩展区中文落 8000 边界即被 substring
+      // 拦腰切成代理对乱码（提示文案的"字符"按 rune 口径计数）。
+      buf.writeln(clipRunes(skill.body, bodyBudget));
       buf.writeln();
       buf.writeln('…（正文已按预算截断到 $bodyBudget 字符，可按需 read_file 读取 SKILL.md 全文）');
     }
@@ -654,6 +555,18 @@ class SkillManager extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// B3-8：切换严格解析模式——落盘 SettingsStore 后立即按新口径重扫，
+  /// 宽松→严格时不合规 skill 直接移出列表，严格→宽松时恢复加载。
+  Future<void> setStrictParse(bool value) async {
+    _strictParse = value;
+    try {
+      await SettingsStore.instance.setSkillsStrictParse(value);
+    } catch (_) {}
+    await refresh();
+  }
+
+  bool get strictParse => _strictParse;
+
   Future<void> setSourceEnabled(String sourceId, bool enabled) async {
     if (!knownSourceIds.containsKey(sourceId)) return;
     if (enabled) {
@@ -682,6 +595,12 @@ class SkillManager extends ChangeNotifier {
         !p.isAbsolute(normalized)) {
       return;
     }
+    // D9：与 WebDAV 恢复侧同向收敛（按任务口径取"至少系统前缀/~ 拒绝"
+    // 替代档）——UI 此前可把 /etc、/、~/.ssh 加成 skill 扫描源（SKILL.md
+    // 无审批进系统提示）。恢复侧 isSafeExtraGlobalDirForRestore 因备份
+    // 文件可被恶意构造，保持 home/app-support 白名单严格档；UI 手动添加
+    // 属用户显式授权，按系统目录拒绝 + 用户可控子树放行折中。
+    if (_isSystemForbiddenDir(normalized)) return;
     if (_extraGlobalDirs.contains(normalized)) return;
     _extraGlobalDirs.add(normalized);
     await _persistExtraDirs();
@@ -690,14 +609,6 @@ class SkillManager extends ChangeNotifier {
 
   /// 轮次1：'..' 路径分段判定（测试可见，与子串 contains 区分合法路径）。
   static bool hasDotDotSegmentForTest(String path) => _hasDotDotSegment(path);
-
-  static bool _hasDotDotSegment(String path) {
-    for (final seg in path.split('/')) {
-      if (seg == '..') return true;
-    }
-    return false;
-  }
-
   /// 测试可见：R7-K1 门禁纯判定。
   static bool isSafeExtraGlobalDirForTest(String raw) {
     final t = raw.trim();
@@ -737,9 +648,15 @@ class SkillManager extends ChangeNotifier {
     if (md == null) {
       throw StateError('源目录缺少 SKILL.md');
     }
+    // R-SKILL-LINK：导入同样拒文件级链接（与 _loadFromFile 对齐）——
+    // 否则链接指向的区外文件内容被 parse 且拷入全局目录。
+    if (FileSystemEntity.isLinkSync(md.path)) {
+      throw StateError('SKILL.md 是符号链接，已拒绝导入：${md.path}');
+    }
     final parsed = SkillMdParser.parse(
       await md.readAsString(),
       directoryName: p.basename(src.path),
+      strict: _strictParse,
     );
     // 路径穿越门禁：parsed.name 直接拼 dest 路径，非严格模式下 `../`、
     // 绝对路径可逃出 targetRoot，且此前先递归删 dest。仅允许规范名。
@@ -766,10 +683,32 @@ class SkillManager extends ChangeNotifier {
       }
       return existing;
     }
+    // E3：src 是 dest 的子孙时，下方 dest.delete(recursive) 会递归进入
+    // src 连源一起删（拷贝时源已不存在必炸且 skill 数据全丢）。反向包含
+    // 校验不满足即拒绝导入，保源目录完好。
+    if (p.isWithin(p.normalize(dest.path), p.normalize(src.path))) {
+      throw StateError(
+          '源目录位于目标目录内部，拒绝导入以避免删除源目录：${src.path}');
+    }
+    // S4-12：反向包含同样拒绝——dest ⊂ src 时 _copyDir(src→dest) 把
+    // 位于 src 子树内的 dest 当目标递归自拷贝，源数据自吞/膨胀。
+    // 两个包含方向都拒，保源目录完好。
+    if (p.isWithin(p.normalize(src.path), p.normalize(dest.path))) {
+      throw StateError(
+          '目标目录位于源目录内部，拒绝导入：${dest.path}');
+    }
     if (await dest.exists()) {
       await dest.delete(recursive: true);
     }
-    await _copyDir(src, dest);
+    // R3-3：拷贝中止（总量门禁/IO 失败）时清理半拷贝残留，失败语义不留垃圾。
+    try {
+      await _copyDir(src, dest);
+    } catch (_) {
+      try {
+        if (await dest.exists()) await dest.delete(recursive: true);
+      } catch (_) {}
+      rethrow;
+    }
     await refresh();
     final loaded = findByName(parsed.name);
     if (loaded == null) {
@@ -784,7 +723,7 @@ class SkillManager extends ChangeNotifier {
     String raw, {
     String? targetRoot,
   }) async {
-    final parsed = SkillMdParser.parse(raw);
+    final parsed = SkillMdParser.parse(raw, strict: _strictParse);
     if (!RegExp(r'^[a-z0-9]+(?:-[a-z0-9]+)*$').hasMatch(parsed.name)) {
       throw StateError('skill 名称不合法，仅允许小写字母/数字/单连字符：${parsed.name}');
     }
@@ -807,13 +746,28 @@ class SkillManager extends ChangeNotifier {
       '${skillFile.path}.${DateTime.now().microsecondsSinceEpoch}-$rand.tmp',
     );
     await tmp.writeAsString(raw, flush: true);
-    try {
-      await tmp.rename(skillFile.path);
-    } catch (_) {
-      await skillFile.writeAsString(raw, flush: true);
+    // R-ATOMIC-RETRY：重试 rename 不直写——SKILL.md 半写即 skill 解析失败。
+    Object? renameError;
+    for (final wait in [
+      const Duration(milliseconds: 5),
+      const Duration(milliseconds: 25),
+      const Duration(milliseconds: 50),
+      null,
+    ]) {
+      if (wait != null) await Future<void>.delayed(wait);
       try {
-        await tmp.delete();
+        await tmp.rename(skillFile.path);
+        renameError = null;
+        break;
+      } catch (e) {
+        renameError = e;
+      }
+    }
+    if (renameError != null) {
+      try {
+        if (await tmp.exists()) await tmp.delete();
       } catch (_) {}
+      throw StateError('skill 落盘 rename 失败：$renameError');
     }
     await refresh();
     final loaded = findByName(parsed.name);
@@ -823,28 +777,23 @@ class SkillManager extends ChangeNotifier {
     return loaded;
   }
 
-  Future<void> _copyDir(Directory src, Directory dest) async {
-    await dest.create(recursive: true);
-    await for (final entity in src.list(recursive: false, followLinks: false)) {
-      final name = p.basename(entity.path);
-      // 导入跳过外链：copy 语义跟随外链会把区外文件拷入 skills，
-      // 此前 Directory/File 分支按实体类型仍会拷贝外链目标内容。
-      try {
-        if (FileSystemEntity.typeSync(entity.path, followLinks: false) ==
-            FileSystemEntityType.link) {
-          continue;
-        }
-      } catch (_) {
-        continue;
-      }
-      if (entity is Directory) {
-        await _copyDir(entity, Directory(p.join(dest.path, name)));
-      } else if (entity is File) {
-        await entity.copy(p.join(dest.path, name));
-      }
-    }
+  /// B3-3：从 MCP server 的 skills 资源（SEP-2640）导入 SKILL.md 文本到
+  /// 应用全局目录。与 [importSkillMdText] 共用原子写/名称门禁/路径穿越
+  /// 防护，差异仅两点：
+  /// - frontmatter 的 metadata 下注入 `mcp-server: <serverName>` 保留来源
+  ///   （规范要求 hosts 保留 server 身份；loadSkill 快照会带出该行）；
+  /// - 文本来自远端 server，按不可信数据处理由调用方围栏，此处只做与
+  ///   本地导入完全同构的校验（名称非法即拒，不含额外特权）。
+  Future<AgentSkill> importSkillFromMcpText({
+    required String serverName,
+    required String skillUri,
+    required String skillMdText,
+    String? targetRoot,
+  }) async {
+    final withOrigin = _injectMcpOrigin(skillMdText, serverName, skillUri);
+    final loaded = await importSkillMdText(withOrigin, targetRoot: targetRoot);
+    return loaded;
   }
-
   /// 删除仅位于应用全局目录内的 skill（不删项目/兼容目录里的）。
   Future<bool> deleteAppGlobalSkill(AgentSkill skill) async {
     final appDir = _appGlobalSkillsDir;
@@ -899,7 +848,17 @@ class SkillManager extends ChangeNotifier {
     }
     ParsedSkillMd parsed;
     try {
-      parsed = SkillMdParser.parse(raw, directoryName: p.basename(d.path));
+      // validateSkillDir 为静态工具方法：严格开关直接读 SettingsStore
+      // （与 _restorePrefs 同口径），不依赖实例状态。
+      var strict = false;
+      try {
+        strict = SettingsStore.instance.skillsStrictParse;
+      } catch (_) {}
+      parsed = SkillMdParser.parse(
+        raw,
+        directoryName: p.basename(d.path),
+        strict: strict,
+      );
     } catch (e) {
       return ['SKILL.md 解析失败：$e'];
     }

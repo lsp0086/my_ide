@@ -6,6 +6,7 @@
 //   object-full-sync    textDocumentSync = {'kind': 1}（对象形态，全量）
 //   collision           初始化后第一个请求：先发同 id 反向请求，收到响应再回真结果
 //   stale-diag          收到 didOpen/didChange 后推 version 陈旧 + 新鲜两条诊断
+//   hang                初始化后对任何请求一律不应答（模拟 server 挂起）
 // 观察通道：除 initialize / collision 首请求外，其余请求一律回
 // result = 已收到事件列表（客户端通知 + 客户端响应），供测试断言。
 import 'dart:async';
@@ -85,6 +86,9 @@ void main(List<String> args) {
       });
       return;
     }
+    // hang：initialize 之后的任何请求一律不应答——模拟服务端挂起，
+    // 客户端 _request 10s 超时路径（definition 等不得冒泡异常）。
+    if (scenario == 'hang') return;
     if (scenario == 'collision' && !collisionDone) {
       collisionDone = true;
       final rid = id as int;

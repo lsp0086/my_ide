@@ -10,6 +10,13 @@ class MainFlutterWindowController: NSWindowController {
   /// 待直达的项目路径：窗口 ready 后由 Dart 经通道拉取，取走即清空。
   var pendingOpenPath: String?
 
+  /// 方法通道引用：屏幕变化时据此主动推送最新可用屏幕尺寸（见 postScreenChanged）。
+  private var methodChannel: FlutterMethodChannel?
+
+  /// 退出前清理访问器：AppDelegate 在 applicationShouldTerminate 里经它
+  /// 对每个存活引擎调用 prepareEngineShutdown（快杀远控隧道等子进程）。
+  var shutdownChannel: FlutterMethodChannel? { methodChannel }
+
   static func create(openPath: String?) -> MainFlutterWindowController {
     let window = MainFlutterWindow(
       contentRect: NSRect(x: 200, y: 200, width: 1280, height: 800),
@@ -26,7 +33,7 @@ class MainFlutterWindowController: NSWindowController {
     window.collectionBehavior = [.managed, .participatesInCycle, .fullScreenPrimary]
     window.title = "my_ide"
     // 与首窗口一致的最小尺寸。
-    window.minSize = NSSize(width: 1280, height: 800)
+    window.minSize = MainFlutterWindow.minimumWindowSize
     let controller = MainFlutterWindowController(window: window)
     controller.pendingOpenPath = openPath?.trimmingCharacters(in: .whitespacesAndNewlines)
     if controller.pendingOpenPath?.isEmpty == true {
@@ -61,6 +68,7 @@ class MainFlutterWindowController: NSWindowController {
       name: "my_ide/window",
       binaryMessenger: flutterVC.engine.binaryMessenger
     )
+    methodChannel = channel
     func register(retries: Int) {
       if flutterVC.engine.viewController != nil || retries <= 0 {
         channel.setMethodCallHandler { [weak self] call, result in
@@ -87,6 +95,14 @@ class MainFlutterWindowController: NSWindowController {
               self.window?.title = title
             }
             result(nil)
+          case "getScreenVisibleFrame":
+            // Dart 侧门禁：与外接大屏同进程新建窗口；同样取所有屏幕中最大的
+            // 可视区域判定（见 bestScreenVisibleSize），不能因窗口所在屏幕
+            // 未知/偏小而误判“不支持”。
+            let size = MainFlutterWindow.bestScreenVisibleSize(
+              NSScreen.screens.map { $0.visibleFrame.size }
+            )
+            result(["w": Double(size.width), "h": Double(size.height)])
           default:
             result(FlutterMethodNotImplemented)
           }
@@ -100,5 +116,68 @@ class MainFlutterWindowController: NSWindowController {
       }
     }
     register(retries: 50)
+    observeScreenChanges()
+  }
+
+  /// 推送当前可用屏幕尺寸给 Dart 侧门禁（屏幕变化时动态重判）。
+  private func postScreenChanged() {
+    guard let channel = methodChannel else { return }
+    let size = MainFlutterWindow.bestScreenVisibleSize(
+      NSScreen.screens.map { $0.visibleFrame.size }
+    )
+    channel.invokeMethod(
+      "screenChanged",
+      arguments: ["w": Double(size.width), "h": Double(size.height)]
+    )
+  }
+
+  /// 窗口关闭前的 Dart 清理窗口期：先经 'my_ide/window' 通道调用
+  /// prepareEngineShutdown 让 Dart 做同步清理（手机远控隧道快杀等），
+  /// 回执或 0.3s 超时（Dart 卡死也不能卡住关窗）后拆引擎。
+  /// [completion] 只跑一次（回执/超时都汇到 finish）。
+  /// 背景：cloudflared 以独立进程组启动，引擎/父进程退出不会连带杀它；
+  /// 直接 shutDownEngine 时 Dart 的 dispose/detached 来不及跑，
+  /// 表现为点 × 后隧道仍在后台跑（安全红线 4.7 退出无残留）。
+  func shutdownAfterDartCleanup(completion: @escaping () -> Void) {
+    // 强引用 engine：控制器随后会从 windowControllers 移除，不能依赖 self。
+    guard let flutterVC = window?.contentViewController as? FlutterViewController
+    else {
+      completion()
+      return
+    }
+    let engine = flutterVC.engine
+    var finished = false
+    let finish: () -> Void = {
+      guard !finished else { return }
+      finished = true
+      engine.shutDownEngine()
+      completion()
+    }
+    // 0.3s 兜底：回执慢/丢失时窗口也必须能关掉。
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { finish() }
+    methodChannel?.invokeMethod(
+      "prepareEngineShutdown",
+      arguments: nil
+    ) { _ in
+      DispatchQueue.main.async { finish() }
+    }
+  }
+
+  /// 屏幕变化观察：与新窗口链路一致（见 MainFlutterWindow.observeScreenChanges），
+  /// 窗口挪屏 / 插拔显示器 / 改缩放都主动推，Dart 侧据此动态重判门禁。
+  private func observeScreenChanges() {
+    let notifications: [Notification.Name] = [
+      NSWindow.didChangeScreenNotification,
+      NSApplication.didChangeScreenParametersNotification,
+    ]
+    for name in notifications {
+      NotificationCenter.default.addObserver(
+        forName: name,
+        object: nil,
+        queue: nil,
+      ) { [weak self] _ in
+        DispatchQueue.main.async { self?.postScreenChanged() }
+      }
+    }
   }
 }

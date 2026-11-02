@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -7,8 +8,26 @@ import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import '../diagnostics/app_logger.dart';
+import '../mcp/mcp_config.dart' show McpConfigImporter;
+import '../mcp/mcp_manager.dart' show McpManager, McpManagerLoadExt;
 import 'settings_store.dart';
 import 'secret_vault.dart';
+
+part 'webdav_backup_guard.dart';
+part 'webdav_backup_redact.dart';
+part 'webdav_backup_io.dart';
+
+/// R-WEBDAV-TIMEOUT：WebDAV HTTP 统一 60s 超时。
+const Duration _webdavHttpTimeout = Duration(seconds: 60);
+
+/// D6-M7：备份响应体上限 16MB——settings 备份（脱敏 JSON）正常量级在
+/// 数百 KB；超限视为劫持/误配，HEAD 预检 + 流式累加双保险，拒收防 OOM。
+const int _maxBackupBytes = 16 * 1024 * 1024;
+
+/// D6-M7：错误响应体（HTTP 非 2xx）读取上限——1KB 足够带出服务端
+/// 错误信息，防止错误页同样巨大撑内存。
+const int _maxErrBodyBytes = 1024;
 
 class WebDavConfig {
   const WebDavConfig({
@@ -56,17 +75,12 @@ class WebDavBackup {
   /// 由调用方（webdav 面板）弹窗确认后经 applyRelaxedApprovals 落盘。
   static final Map<String, String> approvalStoreForSettings = {};
 
-  /// 档位强度：deny(2) > ask(1) > auto(0)，数字小即放宽。
-  static int _approvalLevel(String v) {
-    if (v == 'deny') return 2;
-    if (v == 'ask') return 1;
-    return 0;
-  }
-
-  static bool _isRelaxed(String cur, String next) =>
-      _approvalLevel(next) < _approvalLevel(cur);
-
-  static Map<String, String> get _relaxedApprovals => approvalStoreForSettings;
+  /// D6-M8：恢复守卫暂存（显式确认而非静默丢弃）——毒备份中被白名单
+  /// 拒绝的条目（MCP command/url/cwd 越界、skills extraGlobalDirs 越界、
+  /// 自定义 LSP 结构异常）不再无声 drop，按类别记入此处由调用方（恢复
+  /// 面板）展示给用户确认。每次 restore 开始时清空重建（防跨会话残留
+  /// 误展示），用户确认后随 applyRelaxedApprovals 一并清理。
+  static final Map<String, List<String>> restoreRejectedForConfirm = {};
 
   /// 放宽档位确认落盘：调用方弹窗用户点头后调此。
   static Future<void> applyRelaxedApprovals(SettingsStore store) async {
@@ -74,86 +88,14 @@ class WebDavBackup {
       await store.setString(e.key, e.value);
     }
     approvalStoreForSettings.clear();
+    // D6-M8：确认落盘同步清恢复守卫暂存（用户已看过拒绝项）。
+    restoreRejectedForConfirm.clear();
   }
-
-  static Uri _join(String base, String path) {
-    final b = base.endsWith('/') ? base.substring(0, base.length - 1) : base;
-    final p = path.startsWith('/') ? path : '/$path';
-    return Uri.parse('$b$p');
-  }
-
-  static Uri _checkedUri(WebDavConfig cfg, String path) {
-    final uri = _join(cfg.url, path);
-    return _validateUri(cfg, uri);
-  }
-
-  static Uri _validateUri(WebDavConfig cfg, Uri uri) {
-    if (uri.scheme != 'https' && !(cfg.allowInsecureHttp && uri.scheme == 'http')) {
-      throw StateError('WebDAV 仅允许使用 HTTPS URL');
-    }
-    if (uri.host.isEmpty || uri.userInfo.isNotEmpty) {
-      throw StateError('WebDAV URL 无效');
-    }
-    return uri;
-  }
-
-  static const _lspCommandNames = <String>{
-    'dart',
-    'typescript-language-server',
-    'pyright-langserver',
-    'gopls',
-    'rust-analyzer',
-    'clangd',
-    'jdtls',
-    'kotlin-language-server',
-    'sourcekit-lsp',
-  };
-  static const _lspIds = <String>{
-    'dart',
-    'typescript',
-    'python',
-    'go',
-    'rust',
-    'java',
-    'clangd',
-  };
 
   static bool isSafeLanguageServerCommand(String raw) => _safeCommand(raw);
 
   static Map<String, dynamic>? validateCustomLanguageServer(dynamic raw) =>
       _validatedCustomServer(raw);
-
-  /// 毒备份恢复门禁：MCP command 不得含 shell 元字符/穿越，url 仅 http(s)，
-  /// cwd 不得为绝对路径逃逸。返回 false 即整条丢弃，不写入本地。
-  static bool _safeRestoreMcp(Map<String, dynamic> m) {
-    final command = '${m['command'] ?? ''}'.trim();
-    final url = '${m['url'] ?? ''}'.trim();
-    final cwd = '${m['cwd'] ?? ''}'.trim();
-    if (command.isNotEmpty) {
-      if (command.length > 4096 ||
-          command.contains(RegExp('[\\s;&|<>`\$()]')) ||
-          command.contains('..')) {
-        return false;
-      }
-    } else if (url.isEmpty) {
-      return false;
-    }
-    if (url.isNotEmpty) {
-      final uri = Uri.tryParse(url);
-      if (uri == null ||
-          (uri.scheme != 'http' && uri.scheme != 'https') ||
-          uri.host.isEmpty) {
-        return false;
-      }
-    }
-    if (cwd.isNotEmpty &&
-        (cwd.contains('..') ||
-            cwd.startsWith('/') ||
-            (cwd.length > 2 && cwd[1] == ':'))) {
-      return false;
-    }
-    return true;
-  }
 
   /// restore 白名单（纯判定便于测试）：skills.extraGlobalDirs 只接受
   /// 用户 home 目录或应用支持目录下的绝对路径。`..` 穿越、`~` 前缀
@@ -199,78 +141,6 @@ class WebDavBackup {
     return false;
   }
 
-  /// 与 skill_manager 同口径的 home 获取方式。
-  static String _userHomeDir() =>
-      Platform.environment['HOME'] ?? Platform.environment['USERPROFILE'] ?? '';
-
-  static bool _safeCommand(String raw) {
-    final command = raw.trim();
-    if (command.isEmpty ||
-        command.length > 4096 ||
-        command.contains(RegExp(r'[\s;&|<>`$()]')) ||
-        command.contains('..')) {
-      return false;
-    }
-    final isAbsolute = command.startsWith('/') ||
-        (command.length > 2 && command[1] == ':' &&
-            (command[2] == '\\' || command[2] == '/'));
-    if (isAbsolute &&
-        ![
-          '/bin/',
-          '/usr/bin/',
-          '/usr/local/bin/',
-          '/opt/homebrew/bin/',
-          '/opt/local/bin/',
-        ].any(command.startsWith)) {
-      return false;
-    }
-    final name = command.split(RegExp(r'[/\\]')).last;
-    return _lspCommandNames.contains(name);
-  }
-
-  static Map<String, dynamic>? _validatedCustomServer(dynamic raw) {
-    if (raw is! Map) return null;
-    final m = Map<String, dynamic>.from(raw);
-    final id = m['id'];
-    final label = m['label'];
-    final command = m['command'];
-    final extensions = m['extensions'];
-    final args = m['args'];
-    if (id is! String || !RegExp(r'^[A-Za-z0-9._-]{1,64}$').hasMatch(id) ||
-        label is! String || label.length > 200 ||
-        !_safeCommand(command is String ? command : '') ||
-        extensions is! List || args is! List || extensions.isEmpty) {
-      return null;
-    }
-    final cleanExts = <String>[];
-    for (final ext in extensions) {
-      if (ext is! String || !RegExp(r'^\.?[A-Za-z0-9_-]{1,32}$').hasMatch(ext)) {
-        return null;
-      }
-      cleanExts.add(ext.startsWith('.') ? ext.toLowerCase() : '.$ext'.toLowerCase());
-    }
-    final cleanArgs = <String>[];
-    for (final arg in args) {
-      if (arg is! String || arg.length > 512 || arg.contains(RegExp(r'[;&|<>`$]'))) {
-        return null;
-      }
-      cleanArgs.add(arg);
-    }
-    return {
-      'id': id,
-      'label': label,
-      'extensions': cleanExts,
-      'command': command.trim(),
-      'args': cleanArgs,
-    };
-  }
-
-  static Map<String, String> _auth(WebDavConfig cfg) {
-    if (cfg.username.isEmpty && cfg.password.isEmpty) return {};
-    final token = base64Encode(utf8.encode('${cfg.username}:${cfg.password}'));
-    return {'Authorization': 'Basic $token'};
-  }
-
   static Future<void> ensureParent(WebDavConfig cfg) async {
     final uri = _checkedUri(cfg, cfg.remotePath);
     final segments = uri.pathSegments.where((e) => e.isNotEmpty).toList();
@@ -284,64 +154,24 @@ class WebDavBackup {
       final req = http.Request('MKCOL', _validateUri(cfg, Uri.parse(built)))
         ..headers.addAll(_auth(cfg));
       try {
-        await req.send();
-      } catch (_) {}
-    }
-  }
-
-  static List<Map<String, dynamic>> _redactedProviders(SettingsStore store) {
-    return store.providersRaw.map((e) {
-      final m = Map<String, dynamic>.from(e);
-      if ('${m['token'] ?? ''}'.isNotEmpty) m['token'] = redacted;
-      // 自定义请求头同样脱敏，恢复时遇打码保留本地原值。
-      final headers = m['extraHeaders'];
-      if (headers is Map) {
-        m['extraHeaders'] = {
-          for (final k in headers.keys) '$k': redacted,
-        };
-      }
-      final mcpHeaders = m['mcpHeaders'];
-      if (mcpHeaders is Map) {
-        m['mcpHeaders'] = {
-          for (final k in mcpHeaders.keys) '$k': redacted,
-        };
-      }
-      return m;
-    }).toList();
-  }
-
-  static List<Map<String, dynamic>> _redactedMcpServers(SettingsStore store) {
-    final raw = _decodeJsonString(store.getString('mcpServers'));
-    final list =
-        raw is List ? raw.whereType<Map>().toList() : <Map>[];
-    return [
-      for (final e in list)
-        _redactStringMapValues(Map<String, dynamic>.from(e), ['env', 'headers']),
-    ];
-  }
-
-  static Map<String, dynamic> _redactStringMapValues(
-    Map<String, dynamic> m,
-    List<String> keys,
-  ) {
-    final out = Map<String, dynamic>.from(m);
-    for (final key in keys) {
-      final v = out[key];
-      if (v is Map) {
-        out[key] = {for (final k in v.keys) '$k': redacted};
+        // R-WEBDAV-TIMEOUT：MKCOL 加超时，失败记日志不再全静默。
+        await req.send().timeout(_webdavHttpTimeout);
+      } catch (e) {
+        try {
+          AppLogger.instance.warn('webdav', '建父目录失败 $built：$e');
+        } catch (_) {}
       }
     }
-    return out;
   }
 
-  static dynamic _decodeJsonString(String? raw) {
-    if (raw == null || raw.isEmpty) return null;
-    try {
-      return jsonDecode(raw);
-    } catch (_) {
-      return null;
-    }
-  }
+  /// D5：单条 mcpServers 备份脱敏——env/headers 整表打码之外，url 与
+  /// args 此前原样进第三方 WebDAV：url 内嵌凭据（user:pass@ / ?token=）
+  /// 经 redactUrl 清除；args 中 `(token|key|secret|password)[=:]` 形态
+  /// 的参数（如 `--api-key=sk-…`）整条打码，恢复侧按同序回填本地原值。
+  @visibleForTesting
+  static Map<String, dynamic> redactMcpServerEntryForTest(
+          Map<String, dynamic> m) =>
+      _redactMcpServerEntry(m);
 
   static Future<Map<String, dynamic>> collectBackupPayload(
       SettingsStore store) async {
@@ -353,7 +183,7 @@ class WebDavBackup {
       'localeCode': store.localeCode,
       'activeProviderId': store.activeProviderId,
       'activeModelId': store.activeModelId,
-      'aiProviders': _redactedProviders(store),
+      'aiProviders': await _redactedProviders(store),
       'recentProjects': store.recentProjects,
       'mcpServers': _redactedMcpServers(store),
       'skills': {
@@ -418,16 +248,31 @@ class WebDavBackup {
     final payload = await collectBackupPayload(store);
     final body = const JsonEncoder.withIndent('  ').convert(payload);
     final uri = _checkedUri(cfg, cfg.remotePath);
-    final res = await http.put(
-      uri,
-      headers: {
-        ..._auth(cfg),
-        'Content-Type': 'application/json; charset=utf-8',
-      },
-      body: body,
-    );
+    // R-WEBDAV-TIMEOUT：PUT 加 60s 超时——建连后服务端不响应时
+    // 此前永久挂起，自动备份静默失效。
+    final res = await http
+        .put(
+          uri,
+          headers: {
+            ..._auth(cfg),
+            'Content-Type': 'application/json; charset=utf-8',
+          },
+          body: body,
+        )
+        .timeout(_webdavHttpTimeout);
     if (res.statusCode < 200 || res.statusCode >= 300) {
-      throw Exception('WebDAV 上传失败 HTTP ${res.statusCode}: ${res.body}');
+      // D12：上传失败错误体同样 1KB 有界——下载侧已有 _readBounded 口径，
+      // 上传侧此前整段 res.body 进异常并持久化 prefs（Basic 令牌经网关
+      // 错误页回显即泄漏）。截断后经 redactSensitiveText 再落 prefs。
+      // http.Response（非流式）无 .stream：bodyBytes 已在内存，按 1KB
+      // 上限截取后脱敏（下载侧 _readBounded 同口径的同步等价）。
+      final raw = res.bodyBytes;
+      final bounded = raw.length > _maxErrBodyBytes
+          ? raw.sublist(0, _maxErrBodyBytes)
+          : raw;
+      final body = utf8.decode(bounded, allowMalformed: true);
+      final redacted = AppLogger.redactSensitiveText(body);
+      throw Exception('WebDAV 上传失败 HTTP ${res.statusCode}: $redacted');
     }
     await store.setString(
         'webdav.lastBackupAt', '${payload['exportedAt'] ?? ''}');
@@ -437,40 +282,64 @@ class WebDavBackup {
   /// 未配置/未开启/上传失败返回 false，不抛错。
   /// R6：失败原因持久化到 webdav.lastAutoBackupError（成功即清空），
   /// UI 可展示坏点提示——此前 catch 直接吞掉长期丢备份无感知。
+  /// R-WEBDAV-TIMEOUT：静态 _inFlight 重入护栏——挂起请求此前每 6h
+  /// 叠加一个（24h 门形同虚设），护栏保证同一时刻至多一个在途备份。
   static Future<bool> maybeAutoBackup(SettingsStore store) async {
+    if (_autoBackupInFlight) return false;
+    _autoBackupInFlight = true;
     try {
-      if (store.getBool('webdav.autoBackupEnabled') != true) return false;
-      final lastRaw = store.getString('webdav.lastBackupAt') ?? '';
-      final last = DateTime.tryParse(lastRaw);
-      if (last != null &&
-          DateTime.now().difference(last) < const Duration(hours: 24)) {
-        return false;
-      }
-      final cfg = await WebDavConfig.fromStore(store);
-      if (cfg == null) {
-        await store.setString('webdav.lastAutoBackupError', '未配置 WebDAV 连接');
-        return false;
-      }
-      await upload(store, cfg);
-      await store.setString('webdav.lastAutoBackupError', '');
-      return true;
-    } catch (e) {
-      try {
-        await store.setString('webdav.lastAutoBackupError', '$e');
-      } catch (_) {}
-      return false;
+      return await _maybeAutoBackupInner(store);
+    } finally {
+      _autoBackupInFlight = false;
     }
   }
 
   static Future<Map<String, dynamic>> download(WebDavConfig cfg) async {
     final uri = _checkedUri(cfg, cfg.remotePath);
-    final res = await http.get(uri, headers: _auth(cfg));
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      throw Exception('WebDAV 下载失败 HTTP ${res.statusCode}: ${res.body}');
+    // D6-M7：响应体大小上限——此前整量 readAsBytes+decode，服务端返回
+    // GB 级响应（劫持/误配）即 OOM。HEAD 预检 Content-Length + 流式累加
+    // 双保险（HEAD 不保/谎报长度时按实际字节仍拦）。
+    final client = http.Client();
+    try {
+      // HEAD 预检：Content-Length 超限直接拒，不开始下载。HEAD 不受
+      // 支持/失败不阻断（部分 WebDAV 服务端不实现 HEAD），走流式兜底。
+      int? declaredLen;
+      try {
+        final head = await client
+            .head(uri, headers: _auth(cfg))
+            .timeout(_webdavHttpTimeout);
+        if (head.statusCode >= 200 && head.statusCode < 300) {
+          declaredLen = int.tryParse(head.headers['content-length'] ?? '');
+        }
+      } catch (_) {}
+      if (declaredLen != null && declaredLen > _maxBackupBytes) {
+        throw Exception(
+          'WebDAV 备份过大（$declaredLen 字节，上限 $_maxBackupBytes），拒绝下载',
+        );
+      }
+      final req = http.Request('GET', uri)..headers.addAll(_auth(cfg));
+      final res = await client.send(req).timeout(_webdavHttpTimeout);
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        final body = await _readBounded(
+          res.stream,
+          _maxErrBodyBytes,
+          label: '错误响应',
+        );
+        throw Exception(
+          'WebDAV 下载失败 HTTP ${res.statusCode}: ${utf8.decode(body)}',
+        );
+      }
+      final bytes = await _readBounded(
+        res.stream,
+        _maxBackupBytes,
+        label: '备份',
+      );
+      final data = jsonDecode(utf8.decode(bytes));
+      if (data is! Map) throw Exception('备份内容不是 JSON 对象');
+      return Map<String, dynamic>.from(data);
+    } finally {
+      client.close();
     }
-    final data = jsonDecode(utf8.decode(res.bodyBytes));
-    if (data is! Map) throw Exception('备份内容不是 JSON 对象');
-    return Map<String, dynamic>.from(data);
   }
 
   /// 合并远端/本地 recent：以 exportedAt 新者顺序优先，去重保留最多 12 条。
@@ -503,21 +372,23 @@ class WebDavBackup {
     // R5-W1：此前仅num才比对，缺version毒备份直接穿透写盘。
     final version = payload['version'];
     if (version is! num || version.toInt() != backupVersion) return false;
-    final theme = payload['themeMode'] as String?;
-    if (theme == 'dark') {
-      await store.setThemeMode(ThemeMode.dark);
-    } else if (theme == 'light') {
-      await store.setThemeMode(ThemeMode.light);
-    }
-    final hl = payload['highlightStyleId'] as String?;
-    if (hl != null && hl.isNotEmpty) await store.setHighlightStyleId(hl);
-    final locale = payload['localeCode'] as String?;
-    if (locale != null && locale.isNotEmpty) await store.setLocaleCode(locale);
-
+    // D6-L21：新一次恢复即取代上一次未确认的暂存——静态残留的旧键
+    // 不应被后续一次 confirm 误落盘（跨会话/取消后残留）。
+    approvalStoreForSettings.clear();
+    restoreRejectedForConfirm.clear();
+    // D6-M8：预检阶段（只读不写）——aiProviders 合并计算先行：跨设备
+    // 恢复（B 机恢复 A 备份）时本地新增 provider 合入表尾保留，避免
+    // 进入写入阶段后才被 _saveProvidersLocked 损坏守卫抛错（无事务性，
+    // 前半主题/语言已落盘）。
+    List<Map<String, dynamic>>? mergedProviders;
     final providers = payload['aiProviders'];
     if (providers is List) {
+      // R17-03（A4-3）：本地侧同样异步解密——resolved 对坏 key 条目保留
+      // 盘上原密文（enc: 前缀），redacted 分支回填后 _saveProvidersLocked
+      // 不再重加密，本地 v5 密文不会被空串覆写；可解条目回填明文重加密，
+      // 明文不变。
       final localById = <String, Map<String, dynamic>>{
-        for (final p in store.providersRaw)
+        for (final p in await store.providersResolved())
           '${p['id'] ?? ''}': Map<String, dynamic>.from(p),
       };
       final next = <Map<String, dynamic>>[];
@@ -547,7 +418,34 @@ class WebDavBackup {
         }
         next.add(m);
       }
-      await store.saveProviders(next, notify: true);
+      // D6-M8：保留本地新增——备份表之外的本地 provider 原样并入表尾
+      // （其 token 已是 enc: 密文或明文，_saveProvidersLocked 同口径
+      // 不重加密/重加密），B 机恢复 A 备份不丢 B 的本地新增。
+      final backupIds = {for (final e in next) '${e['id'] ?? ''}'};
+      for (final entry in localById.entries) {
+        if (entry.key.isNotEmpty && !backupIds.contains(entry.key)) {
+          next.add(entry.value);
+        }
+      }
+      mergedProviders = next;
+    }
+    final theme = payload['themeMode'] as String?;
+    if (theme == 'dark') {
+      await store.setThemeMode(ThemeMode.dark);
+    } else if (theme == 'light') {
+      await store.setThemeMode(ThemeMode.light);
+    }
+    final hl = payload['highlightStyleId'] as String?;
+    if (hl != null && hl.isNotEmpty) await store.setHighlightStyleId(hl);
+    final locale = payload['localeCode'] as String?;
+    if (locale != null && locale.isNotEmpty) await store.setLocaleCode(locale);
+
+    // D6-M8：写入阶段用预检合并表（local-only 已并入、损坏守卫已
+    // 规避）；confirmReplace:true 为显式确认整表替换（对齐 restoring
+    // 语义），默认 fail-closed 不受影响。
+    if (mergedProviders != null) {
+      await store.saveProviders(mergedProviders, notify: true,
+          confirmReplace: true);
     }
     final pid = payload['activeProviderId'] as String?;
     final mid = payload['activeModelId'] as String?;
@@ -556,7 +454,9 @@ class WebDavBackup {
       // 禁用仍选中致对话无模型可用。
       var valid = false;
       try {
-        for (final p in store.providersRaw) {
+        // R17-03（A4-3）：模型存在性校验同样走异步解密列表——只读
+        // models/enabled，不涉 token，但统一口径避免同步降级空条目。
+        for (final p in await store.providersResolved()) {
           if ('${p['id'] ?? ''}' != pid) continue;
           final models = p['models'];
           if (models is List) {
@@ -608,10 +508,15 @@ class WebDavBackup {
         }
       }
       final next = <Map<String, dynamic>>[];
+      final rejectedMcp = <String>[];
       for (final e in mcpServers.whereType<Map>()) {
         final m = Map<String, dynamic>.from(e);
         // 毒备份门禁：command/url/cwd 白名单复检，恶意 MCP 不得借恢复下发 RCE。
-        if (!_safeRestoreMcp(m)) continue;
+        if (!_safeRestoreMcp(m)) {
+          // D6-M8：拒绝项显式暂存（供恢复面板展示确认），不再静默 drop。
+          rejectedMcp.add('${m['id'] ?? m['name'] ?? '?'}');
+          continue;
+        }
         final local = localById['${m['id'] ?? m['name'] ?? ''}'];
         for (final hKey in ['env', 'headers']) {
           final hv = m[hKey];
@@ -633,9 +538,36 @@ class WebDavBackup {
             m[hKey] = restored;
           }
         }
+        // D5：args 打码项按同序回填本地原值（与 env 打码同口径）；本地
+        // 无对应原值时丢弃该条——打码值不可恢复，保留占位串会被当真实
+        // 参数下发给 MCP 命令。
+        final rargs = m['args'];
+        if (rargs is List && rargs.contains(redacted)) {
+          final localArgs =
+              local?['args'] is List ? List<Object>.from(local!['args'] as List) : const <Object>[];
+          final restoredArgs = <String>[];
+          for (var i = 0; i < rargs.length; i++) {
+            final v = '${rargs[i]}';
+            if (v == redacted) {
+              if (i < localArgs.length) restoredArgs.add('${localArgs[i]}');
+              continue;
+            }
+            restoredArgs.add(v);
+          }
+          m['args'] = restoredArgs;
+        }
         next.add(m);
       }
+      if (rejectedMcp.isNotEmpty) restoreRejectedForConfirm['mcpServers'] = rejectedMcp;
       await store.setString('mcpServers', jsonEncode(next));
+      // D4：恢复直写后通知 McpManager 重载内存表（重置 _loaded 重读 +
+      // 断开已不存在/配置已变的 session）——否则会话内旧表在下次
+      // _persist（如 setEnabled）时整体回灌，覆盖刚恢复的数据。
+      try {
+        await McpManager.instance.reloadFromStore();
+      } catch (e) {
+        debugPrint('[webdav_backup] reloadFromStore 失败（不阻断恢复）：$e');
+      }
     }
     final skills = payload['skills'];
     if (skills is Map) {
@@ -666,6 +598,10 @@ class WebDavBackup {
               if (!ok) rejected.add(e);
               return !ok;
             });
+            // D6-M8：拒绝项显式暂存，不再仅 debugPrint 无声丢弃。
+            if (rejected.isNotEmpty) {
+              restoreRejectedForConfirm['skills.extraGlobalDirs'] = rejected;
+            }
             if (rejected.isNotEmpty) {
               debugPrint('[webdav_backup] restore 拒绝 extraGlobalDirs: $rejected');
             }
@@ -760,18 +696,37 @@ class WebDavBackup {
     if (custom is List) {
       final validated = <Map<String, dynamic>>[];
       final ids = <String>{};
+      final rejectedCustom = <String>[];
       for (final item in custom) {
         final server = _validatedCustomServer(item);
-        if (server == null || !ids.add(server['id'] as String)) continue;
+        // D6-M8：结构异常的自定义 LSP 显式暂存，不再静默跳过。
+        if (server == null) {
+          rejectedCustom.add('${item is Map ? (item['id'] ?? item['label'] ?? '?') : '?'}');
+          continue;
+        }
+        if (!ids.add(server['id'] as String)) continue;
         validated.add(server);
+      }
+      if (rejectedCustom.isNotEmpty) {
+        restoreRejectedForConfirm['customLanguageServers'] = rejectedCustom;
       }
       await store.setCustomLanguageServers(validated);
     }
     final webdav = payload['webdav'];
     if (webdav is Map) {
       final rp = webdav['remotePath'];
+      // D6-L21：恢复的 remotePath 同样过形态校验——毒备份写进一个
+      // 「https://evil/x」或「../..」路径，后续 upload/download 才在
+      // _checkedUri 炸错；此处先校验，非法即跳过不写。
       if (rp is String && rp.trim().isNotEmpty) {
-        await store.setString('webdav.remotePath', rp.trim());
+        final candidate = rp.trim();
+        try {
+          _validateRemotePath(candidate);
+          await store.setString('webdav.remotePath', candidate);
+        } on StateError catch (e) {
+          restoreRejectedForConfirm['webdav.remotePath'] = [candidate];
+          debugPrint('[webdav_backup] restore 拒绝 remotePath：$e');
+        }
       }
     }
     final lsp = payload['lsp'];

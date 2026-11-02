@@ -108,7 +108,11 @@ class _SkillsSettingsPanelState extends State<SkillsSettingsPanel> {
         ],
       ),
     );
-    if (ok != true || !mounted) return;
+    if (ok != true || !mounted) {
+      // F6：dialog 已返回，controller 不再被 TextField 持有，必须释放。
+      controller.dispose();
+      return;
+    }
     try {
       final skill = await _manager.importSkillMdText(controller.text);
       if (!mounted) return;
@@ -120,6 +124,9 @@ class _SkillsSettingsPanelState extends State<SkillsSettingsPanel> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('导入失败：$e')),
       );
+    } finally {
+      // F6：所有路径（含异常）都保证 controller 释放。
+      controller.dispose();
     }
   }
 
@@ -275,6 +282,48 @@ class _SkillsSettingsPanelState extends State<SkillsSettingsPanel> {
                 onSelected: (v) => _manager.setSourceEnabled(e.key, v),
               ),
           ],
+        ),
+        const SizedBox(height: 12),
+        // B3-8：严格模式开关——开启后不符合 agentskills 规范的 skill
+        // （name 非法/与目录名不一致、description>1024、compatibility>
+        // 500）直接拒载；关闭（默认）时告警放行，警告在详情与列表可见。
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          decoration: BoxDecoration(
+            color: colors.panelHover.withValues(alpha: 0.35),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: colors.border),
+          ),
+          child: Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '严格模式（agentskills 规范校验）',
+                      style: TextStyle(
+                        color: colors.textPrimary,
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      _manager.strictParse
+                          ? '开启：不合规 skill 直接拒载（description>1024、compatibility>500、name 与目录名不一致等）。'
+                          : '关闭（默认）：不合规 skill 告警放行，警告在详情中可见。',
+                      style: TextStyle(color: colors.textMuted, fontSize: 11.5),
+                    ),
+                  ],
+                ),
+              ),
+              Switch(
+                value: _manager.strictParse,
+                onChanged: (v) => _manager.setStrictParse(v),
+              ),
+            ],
+          ),
         ),
         const SizedBox(height: 12),
         Row(
@@ -473,8 +522,9 @@ class _SkillTile extends StatelessWidget {
                       const SizedBox(height: 4),
                       Text(
                         skill.parseWarning!,
-                        style: const TextStyle(
-                          color: Color(0xFFE5A000),
+                        // E14：语义状态色随亮暗主题切换。
+                        style: TextStyle(
+                          color: colors.statusWarn,
                           fontSize: 11,
                         ),
                       ),

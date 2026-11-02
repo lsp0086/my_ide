@@ -168,4 +168,128 @@ x
     );
     expect(mgr.lastError, contains('跳过链接技能目录'));
   });
+
+  group('skill 解析与目录门禁', () {
+    test('超长 name 非 strict 截断到 64', () {
+      final parsed = SkillMdParser.parse(
+        '---\nname: ${'a' * 70}\ndescription: d\n---\nbody',
+      );
+      expect(parsed.name.length, 64);
+      expect(parsed.warning, contains('64'));
+    });
+
+    test("'..' 按路径分段判定，合法含..子串路径不再误拒", () {
+      expect(SkillManager.hasDotDotSegmentForTest('/Users/a..b/skills'),
+          isFalse);
+      expect(SkillManager.hasDotDotSegmentForTest('../x'), isTrue);
+      expect(SkillManager.isSafeExtraGlobalDirForTest('/Users/a..b/skills'),
+          isTrue);
+      expect(SkillManager.isSafeExtraGlobalDirForTest('a/../b'), isFalse);
+    });
+  });
+
+  group('B3-8 SKILL.md 严格/宽松校验', () {
+    test('规范 valid 样例：strict 解析通过且无告警', () {
+      const raw = '''
+---
+name: pdf-processing
+description: Extract text from PDFs. Use when user mentions PDF.
+license: MIT
+compatibility: RequiresNode18
+---
+# PDF
+Do the work.
+''';
+      final parsed = SkillMdParser.parse(
+        raw,
+        directoryName: 'pdf-processing',
+        strict: true,
+      );
+      expect(parsed.name, 'pdf-processing');
+      expect(parsed.warning, isNull);
+      expect(parsed.compatibility, 'RequiresNode18');
+    });
+
+    test('description>1024：严格拒、宽松截断+告警', () {
+      final raw = '---\nname: d\ndescription: ${'x' * 1100}\n---\nb';
+      expect(
+        () => SkillMdParser.parse(raw, strict: true),
+        throwsA(isA<SkillParseException>()),
+      );
+      final lenient = SkillMdParser.parse(raw);
+      expect(lenient.description.length, 1024);
+      expect(lenient.warning, contains('1024'));
+    });
+
+    test('name 以 -- 开头：严格拒（对齐 skills-ref invalid 判定）', () {
+      const raw = '---\nname: --evil\ndescription: d\n---\nb';
+      expect(
+        () => SkillMdParser.parse(raw, strict: true),
+        throwsA(isA<SkillParseException>()),
+      );
+      // 宽松仅告警不阻断（进 UI 提示）。
+      final lenient = SkillMdParser.parse(raw);
+      expect(lenient.warning, contains('--evil'));
+      expect(lenient.name, '--evil');
+    });
+
+    test('compatibility>500：严格拒、宽松截断+告警', () {
+      final raw =
+          '---\nname: c\ndescription: d\ncompatibility: ${'y' * 600}\n---\nb';
+      expect(
+        () => SkillMdParser.parse(raw, strict: true),
+        throwsA(isA<SkillParseException>()),
+      );
+      final lenient = SkillMdParser.parse(raw);
+      expect(lenient.compatibility!.length, 500);
+      expect(lenient.warning, contains('compatibility'));
+    });
+
+    test('name 与目录名不一致：严格拒、宽松告警', () {
+      const raw = '---\nname: other\ndescription: d\n---\nb';
+      expect(
+        () => SkillMdParser.parse(raw, directoryName: 'dir-name', strict: true),
+        throwsA(isA<SkillParseException>()),
+      );
+      final lenient = SkillMdParser.parse(raw, directoryName: 'dir-name');
+      expect(lenient.warning, contains('不一致'));
+    });
+
+    test('严格模式开关接线：SettingsStore 落盘 + 不合规 skill 拒载', () async {
+      SharedPreferences.setMockInitialValues({});
+      await SettingsStore.init();
+      expect(SettingsStore.instance.skillsStrictParse, isFalse, reason: '默认宽松');
+      final root = await Directory.systemTemp.createTemp('skill-strict-');
+      addTearDown(() async {
+        if (await root.exists()) await root.delete(recursive: true);
+      });
+      // 不合规 skill：name 与目录名不一致（严格模式下违规）。
+      final badDir = Directory(p.join(root.path, 'dir-name'));
+      await badDir.create();
+      await File(
+        p.join(badDir.path, 'SKILL.md'),
+      ).writeAsString('---\nname: other\ndescription: d\n---\nbody\n');
+      final mgr = SkillManager.instance;
+      await mgr.addExtraGlobalDir(root.path);
+      // 宽松：告警放行。
+      await mgr.refresh();
+      expect(mgr.findByName('other'), isNotNull);
+      expect(mgr.findByName('other')!.parseWarning, contains('不一致'));
+      // 开严格：拒载 + 落盘。
+      await mgr.setStrictParse(true);
+      expect(mgr.strictParse, isTrue);
+      expect(mgr.findByName('other'), isNull, reason: '严格模式下不合规 skill 必须拒载');
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getBool('skills.strictParse'), isTrue);
+      // 关严格：恢复加载（渐进式，用户可随时回退）。
+      await mgr.setStrictParse(false);
+      expect(mgr.findByName('other'), isNotNull);
+    });
+
+    test('严格模式 UI 开关存在（源码口径）', () {
+      final src = File('lib/ui/skills_settings_panel.dart').readAsStringSync();
+      expect(src.contains('严格模式'), isTrue);
+      expect(src.contains('setStrictParse'), isTrue);
+    });
+  });
 }

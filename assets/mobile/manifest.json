@@ -1,0 +1,9 @@
+{
+  "name": "my_ide 远控",
+  "short_name": "my_ide",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0d1117",
+  "theme_color": "#0d1117",
+  "icons": []
+}

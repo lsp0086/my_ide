@@ -1,8 +1,9 @@
 import 'dart:convert';
 
+import '../diagnostics/app_logger.dart';
 import 'provider_config.dart';
 
-/// Agent 角色档：systemPrompt 片段 + 推荐步数/预算。
+/// Agent 角色档：systemPrompt 片段 + 推荐步数/预算 + 工具白名单。
 class AgentProfile {
   const AgentProfile({
     required this.id,
@@ -10,6 +11,7 @@ class AgentProfile {
     required this.systemPrompt,
     required this.recommendedSteps,
     required this.recommendedBudget,
+    this.allowedTools,
   });
 
   final String id;
@@ -18,21 +20,27 @@ class AgentProfile {
   final int recommendedSteps;
   final int recommendedBudget;
 
-  Map<String, dynamic> toJson() => {
-    'id': id,
-    'label': label,
-    'systemPrompt': systemPrompt,
-    'recommendedSteps': recommendedSteps,
-    'recommendedBudget': recommendedBudget,
-  };
+  /// 工具白名单（B5，Roo Code Modes/Zed Agent Profiles 口径）：
+  /// null = 不限制（沿用 mode 级 chat/plan/agent 默认集）；非 null = 只允许
+  /// 这些工具（load_skill 恒保留，防锁死无法切档）。与 skill 的
+  /// allowed-tools、逐工具路径审批规则叠加，deny 优先语义不变。
+  final Set<String>? allowedTools;
 
-  static AgentProfile fromJson(Map<String, dynamic> j) => AgentProfile(
-    id: '${j['id'] ?? ''}',
-    label: '${j['label'] ?? j['id'] ?? ''}',
-    systemPrompt: '${j['systemPrompt'] ?? ''}',
-    recommendedSteps: ((j['recommendedSteps'] as num?)?.toInt() ?? 45),
-    recommendedBudget: ((j['recommendedBudget'] as num?)?.toInt() ?? 500000),
-  );
+  /// 只读调研档工具集（architect 用）：读文件/搜索/诊断/git 只读 + 只读
+  /// 子 Agent 派生。写/命令/浏览器/computer-use 一律不进白名单。
+  static const readOnlyTools = <String>{
+    'read_file',
+    'list_files',
+    'search_text',
+    'search_symbols',
+    'get_diagnostics',
+    'lsp_hover',
+    'git_status',
+    'git_diff',
+    'git_log',
+    'spawn_subagent',
+    'poll_task',
+  };
 }
 
 /// profile 绑定解析结果：主用 + 可选 fallback。
@@ -75,6 +83,9 @@ class AgentProfiles {
       systemPrompt: '你专注于架构设计：先只读调研，再输出分层方案与风险点。',
       recommendedSteps: 30,
       recommendedBudget: 400000,
+      // B5：architect 纯只读——工具白名单收紧到只读集，越权工具
+      // 连 schema 都不下发（双重保险：schema 层 + 执行层拒绝）。
+      allowedTools: AgentProfile.readOnlyTools,
     ),
     AgentProfile(
       id: 'ask',
@@ -82,6 +93,8 @@ class AgentProfiles {
       systemPrompt: '你专注于问答解释：不写文件，简洁中文说明原理与步骤。',
       recommendedSteps: 10,
       recommendedBudget: 100000,
+      // B5：与 systemPrompt 的"不写文件"语义对齐——只读白名单。
+      allowedTools: AgentProfile.readOnlyTools,
     ),
     AgentProfile(
       id: 'debug',
@@ -117,9 +130,6 @@ class AgentProfiles {
     }
   }
 
-  static String encodeBindings(Map<String, AgentProfileBinding> m) =>
-      jsonEncode({for (final e in m.entries) e.key: e.value.toJson()});
-
   /// 绑定落到本次 run 的 provider/model：绑定未命中时回退传入的默认。
   /// fallback 格式 "providerId/modelId"，缺失任一段即视为无 fallback。
   /// 注意：始终返回新对象，避免调用方 ??= 推荐预算时污染传入的共享 model。
@@ -139,6 +149,7 @@ class AgentProfiles {
       anthropicVersion: p.anthropicVersion,
       models: p.models,
       extraHeaders: Map<String, String>.from(p.extraHeaders),
+      mcpHeaders: Map<String, String>.from(p.mcpHeaders),
       useApiKeyHeader: p.useApiKeyHeader,
       responsesBackground: p.responsesBackground,
       responsesPreviousResponse: p.responsesPreviousResponse,
@@ -172,6 +183,15 @@ class AgentProfiles {
       for (final candidate in resolvedProvider.models) {
         if (candidate.id == id) return copyOfModel(candidate);
       }
+      // D6-L20：模型未命中不再静默套用主模型能力——绑定配置打错模型 id
+      // 时，此前沿用 main 模型的 contextLength/视觉/思考档位，本地能力
+      // 与真实模型不符且无任何提示。现 warn 可观测（仍返回请求 id 的
+      // 模型占位，由服务端对不存在的 id 报出真实错误）。
+      AppLogger.instance.warn(
+        'agent',
+        '角色档绑定模型「$id」在供应商「${resolvedProvider.name}」中不存在，'
+        '已按请求 id 继续（能力档位为默认值），请检查 agentProfileBindings 配置',
+      );
       return copyOfModel(fallback, id: id);
     }
 
@@ -196,10 +216,28 @@ class AgentProfiles {
       final fbModelId = fallback.substring(idx + 1).trim();
       if (fbProviderId.isNotEmpty && fbModelId.isNotEmpty) {
         final configuredFallback = configuredProvider(fbProviderId);
-        if (providers == null || configuredFallback != null) {
-          fallbackProvider = copyOf(configuredFallback ?? provider);
-          if (configuredFallback == null) fallbackProvider.name = fbProviderId;
+        // D6-L20：providers 未下发（null）时 fallback 只能落在主供应商上
+        // （旧调用方兼容语义保留），但配置打错/供应商表缺失时该静默同主
+        // 完全不可见——此处 warn 可观测，重试路径的实际落点不再隐蔽。
+        if (providers == null) {
+          AppLogger.instance.warn(
+            'agent',
+            '角色档 fallback「$fallback」未校验（供应商表未下发），'
+            '重试将落在主供应商上，请确认配置',
+          );
+          fallbackProvider = copyOf(provider);
+          fallbackProvider.name = fbProviderId;
           fallbackModel = resolveModel(fallbackProvider, fbModelId, model);
+        } else if (configuredFallback != null) {
+          fallbackProvider = copyOf(configuredFallback);
+          fallbackModel = resolveModel(fallbackProvider, fbModelId, model);
+        } else {
+          // D6-L20：fallback 供应商 id 打错——同样可观测，不静默丢弃。
+          AppLogger.instance.warn(
+            'agent',
+            '角色档 fallback 供应商「$fbProviderId」不存在，'
+            '本次不启用 fallback 重试',
+          );
         }
       }
     }

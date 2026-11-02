@@ -218,13 +218,13 @@ Win32Window::MessageHandler(HWND hwnd,
       return 0;
 
     case WM_GETMINMAXINFO: {
-      // 与初始窗口一致：1280×800
+      // 最小窗口尺寸（与初始窗口分开）：1000×600，够显示即可
       auto minmax = reinterpret_cast<MINMAXINFO*>(lparam);
       HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
       UINT dpi = FlutterDesktopGetDpiForMonitor(monitor);
       double scale = dpi / 96.0;
-      minmax->ptMinTrackSize.x = static_cast<LONG>(1280 * scale);
-      minmax->ptMinTrackSize.y = static_cast<LONG>(800 * scale);
+      minmax->ptMinTrackSize.x = static_cast<LONG>(1000 * scale);
+      minmax->ptMinTrackSize.y = static_cast<LONG>(600 * scale);
       return 0;
     }
   }

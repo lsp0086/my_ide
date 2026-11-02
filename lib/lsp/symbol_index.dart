@@ -1,10 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:math';
 
 import 'package:crypto/crypto.dart';
-import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 
 import 'lsp_client.dart';
@@ -127,10 +127,13 @@ class SymbolIndex {
     try {
       // R4-06：rebuild超时30s——compute无超时，大仓慢扫卡死常驻indexing。
       // 超时抛错走catch记状态，代际仍丢弃旧扫。
-      final result = await compute(_indexIsolate, <String, Object?>{
+      // R-SYM-KILL：手动 spawn+kill 对齐 workspace_search 口径——
+      // compute+timeout 超时后孤儿 isolate 继续扫盘（CPU/IO 空转），
+      // 且用户"重建索引"会再起并发 isolate；现超时即 kill。
+      final result = await _runIndexIsolate(<String, Object?>{
         'rootPath': root,
         'maxFiles': maxFilesOverride,
-      }).timeout(const Duration(seconds: 30));
+      }, timeout: const Duration(seconds: 30));
       if (gen != _generation) return;
       _byName
         ..clear()
@@ -186,12 +189,10 @@ class SymbolIndex {
       rootReal = p.normalize(root);
     }
     if (canon != rootReal && !p.isWithin(rootReal, canon)) return;
-    if (!p.isWithin(root, absolutePath) &&
-        !p.equals(root, p.dirname(absolutePath))) {
-      // 允许根下任意文件
-      final rel = p.relative(absolutePath, from: root);
-      if (rel.startsWith('..')) return;
-    }
+    // E15：删除第二道词法 isWithin 门禁——第一道 realpath（canon）已保证
+    // 真实文件落在区内，两道门禁此前互相矛盾：canon 判区放行的区外 symlink
+    // （指向区内文件）会被词法路径再拒。symlink 语义统一按 canon（真实路径）
+    // 判定：指向区内的链接放行是预期行为，指向区外仍被第一道拒。
     final ext = p.extension(absolutePath).toLowerCase();
     final rules = rulesForExtension(ext);
     if (rules == null) return;
@@ -234,8 +235,11 @@ class SymbolIndex {
     for (final sym in extracted) {
       (_byName[sym.name] ??= <IndexedSymbol>[]).add(sym);
     }
-    for (final list in _byName.values) {
-      list.sort((a, b) => b.priority.compareTo(a.priority));
+    // S5-8：仅对本次 extracted 涉及名称的桶排序——此前全量 _byName 重排，
+    // 大仓每次保存 O(全符号) 排序卡顿。无关桶内容/顺序保持不动。
+    final touchedNames = {for (final sym in extracted) sym.name};
+    for (final name in touchedNames) {
+      _byName[name]?.sort((a, b) => b.priority.compareTo(a.priority));
     }
 
     // 用当前全量定义名重建本文件引用
@@ -379,20 +383,79 @@ class SymbolIndex {
   List<IndexedSymbol> allForName(String name) =>
       List.unmodifiable(_byName[name] ?? const []);
 
-  /// 大纲用：取前 [limit] 个符号（按名字排序），空索引返回空。
-  List<IndexedSymbol> topSymbols({int limit = 200}) {
-    final all = <IndexedSymbol>[];
-    final names = _byName.keys.toList()..sort();
-    for (final n in names) {
-      for (final s in _byName[n] ?? const <IndexedSymbol>[]) {
-        all.add(s);
-        if (all.length >= limit) return all;
+  // —— isolate ——
+
+  /// R-SYM-KILL：手动 spawn+kill（对齐 workspace_search）——超时即
+  /// kill(priority: immediate)，不再留下继续扫盘的孤儿 isolate。
+  static Future<Map<String, Object?>> _runIndexIsolate(
+    Map<String, Object?> job, {
+    required Duration timeout,
+  }) async {
+    final port = ReceivePort();
+    final done = Completer<Object?>();
+    Isolate? isolate;
+    StreamSubscription<Object?>? sub;
+    try {
+      try {
+        isolate = await Isolate.spawn(
+          _indexIsolateEntry,
+          <Object?>[port.sendPort, job],
+        );
+      } catch (_) {
+        port.close();
+        rethrow;
       }
+      sub = port.listen(
+        (msg) {
+          // R-SYM-KILL：isolate 内错误经标记列表回传，转错误完成。
+          if (msg is List &&
+              msg.length == 2 &&
+              msg[0] == '\x00index-error\x00') {
+            if (!done.isCompleted) done.completeError(StateError('$msg'));
+            return;
+          }
+          if (!done.isCompleted) done.complete(msg);
+        },
+        onError: (Object e) {
+          if (!done.isCompleted) done.completeError(e);
+        },
+        onDone: () {
+          if (!done.isCompleted) {
+            done.completeError(StateError('索引 isolate 提前退出'));
+          }
+        },
+      );
+      final result = await done.future.timeout(timeout);
+      return result as Map<String, Object?>;
+    } finally {
+      isolate?.kill(priority: Isolate.immediate);
+      await sub?.cancel();
+      port.close();
+      if (!done.isCompleted) done.complete(const {});
     }
-    return all;
   }
 
-  // —— isolate ——
+  /// isolate 入口：包一层顶层函数（Isolate.spawn 需顶层/静态入口），
+  /// 错误经错误端口回传主 isolate 而非 uncaught 退出。
+  static void _indexIsolateEntry(List<Object?> args) {
+    final port = args[0] as SendPort;
+    final errorPort = ReceivePort();
+    late final StreamSubscription<Object?> errSub;
+    errSub = errorPort.listen((msg) {
+      port.send(['\x00index-error\x00', '$msg']);
+      errorPort.close();
+      errSub.cancel();
+    });
+    try {
+      final result = _indexIsolate(args[1] as Map<String, Object?>);
+      port.send(result);
+    } catch (e) {
+      port.send(['\x00index-error\x00', '$e']);
+    } finally {
+      errorPort.close();
+      errSub.cancel();
+    }
+  }
 
   static Map<String, Object?> _indexIsolate(Map<String, Object?> job) {
     final rootPath = job['rootPath'] as String;
@@ -426,8 +489,9 @@ class SymbolIndex {
       // R6-A1 深度上限32：此前无depth参数，深树/链环可致栈溢出（与R5-A5同类）。
       // R16R5：深度/数量截断同样计入skipped——此前只计大小/二进制，
       // hasSkipped假阴性致UI显示“已索引N”实为partial。
+      // E7：数量截断同样 skipped++（此前仅 depth 计数），两条路径口径对齐。
       if (candidates.length >= maxFiles || depth > 32) {
-        if (depth > 32) skipped++;
+        skipped++;
         return;
       }
       late final List<FileSystemEntity> entities;
@@ -437,7 +501,11 @@ class SymbolIndex {
         return;
       }
       for (final entity in entities) {
-        if (candidates.length >= maxFiles) return;
+        // E7：数量截断提前退出同样计 skipped，不静默。
+        if (candidates.length >= maxFiles) {
+          skipped++;
+          return;
+        }
         final name = p.basename(entity.path);
         if (entity is Directory) {
           if (_skipDirs.contains(name) ||
