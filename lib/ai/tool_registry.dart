@@ -1,5 +1,6 @@
 import 'dart:convert';
-import 'dart:io' show Directory, File, Platform, pid;
+import 'dart:io'
+    show Directory, File, FileSystemEntity, FileSystemEntityType, Platform, pid;
 import 'dart:math' show Random;
 
 import 'package:crypto/crypto.dart';
@@ -372,7 +373,16 @@ $writeAllows
 
     add(rootPath);
     try {
-      add(WorkspaceFs.realpathOf(p.posix.normalize(p.posix.absolute(rootPath))));
+      final lex = p.posix.normalize(p.posix.absolute(rootPath));
+      // realpath 仅对真实存在的路径解析符号链接（seatbelt 按规范路径判
+      // 定）。词法路径不存在时不得让 realpath 逐级向上拼存在父目录——
+      // Windows 上 '/tmp/x' 会被当前盘符根拼出 'D:\tmp\x' 伪路径混进
+      // profile（写侧语义对 seatbelt 档生成无意义，/tmp、/var、/etc 的
+      // 规范变体由下方 special-case 覆盖，不依赖 realpath）。
+      if (FileSystemEntity.typeSync(lex, followLinks: false) !=
+          FileSystemEntityType.notFound) {
+        add(WorkspaceFs.realpathOf(lex));
+      }
     } catch (_) {}
     final extra = <String>[];
     for (final v in out) {

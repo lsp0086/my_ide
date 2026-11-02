@@ -74,14 +74,20 @@ extension AgentToolsGit on AgentTools {
     });
     final code = await proc.exitCode;
     timer.cancel();
+    // 先等流自然收干再取消订阅（2s 有界）：cancel 会丢弃已缓冲未投递的
+    // 数据事件且 onDone 不再送达——先 cancel 再 await outDone 会在
+    // exitCode 先于数据事件送达时挂死（macOS CI 30s 超时实测），先收干
+    // 则短命令 stdout 不丢。进程已退出/被杀，EOF 必达不悬挂。
+    try {
+      await Future.wait([outDone.future, errDone.future])
+          .timeout(const Duration(seconds: 2));
+    } catch (_) {}
     try {
       await outSub.cancel();
     } catch (_) {}
     try {
       await errSub.cancel();
     } catch (_) {}
-    await outDone.future;
-    await errDone.future;
     var out = utf8.decode(outBuf.takeBytes(), allowMalformed: true);
     var err = utf8.decode(errBuf.takeBytes(), allowMalformed: true);
     if (timedOut) {
