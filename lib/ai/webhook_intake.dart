@@ -102,7 +102,6 @@ class WebhookIntake {
       }
       final body = await _readBounded(req);
       if (body == null) {
-        await _drainDiscard(req);
         await _json(req, 413, {'error': 'body too large'});
         return;
       }
@@ -138,12 +137,27 @@ class WebhookIntake {
   }
 
   /// 有界读取：累计超限即中止（流式读防 content-length 撒谎的场景）。
+  /// 超限后在**同一次订阅内**继续排空剩余 body（丢弃不计内存，超 1MB
+  /// 丢弃上限即断）——请求流是单订阅，return 后二次 listen 会抛
+  /// StateError（被吞后等于没排空），客户端仍在上传时服务端关连接，
+  /// Windows 上客户端收到 RST 而非 413。
   Future<String?> _readBounded(HttpRequest req) async {
     final chunks = <int>[];
+    var overLimit = false;
+    var discarded = 0;
     await for (final chunk in req) {
+      if (overLimit) {
+        discarded += chunk.length;
+        if (discarded > 1 << 20) break;
+        continue;
+      }
       chunks.addAll(chunk);
-      if (chunks.length > maxBodyBytes) return null;
+      if (chunks.length > maxBodyBytes) {
+        overLimit = true;
+        chunks.clear();
+      }
     }
+    if (overLimit) return null;
     return utf8.decode(chunks, allowMalformed: true);
   }
 

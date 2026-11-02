@@ -200,16 +200,19 @@ class GitSnapshot {
       exitCode = -1;
     }
     timer.cancel();
-    // 管道收干防撑满阻塞：取消订阅并等流关闭（进程已杀，收尾有界）。
+    // 先等流自然收干再取消订阅：进程退出/被杀后 pipe EOF 必达，onDone 在
+    // 全部数据事件之后送达。若先 cancel，已缓冲未投递的 stdout 事件会被
+    // 整段丢弃——快速退出的短命令（echo hello）在 Linux CI 上 stdout 被
+    // 清空、返回空串。等待有界（2s），进程已死 EOF 即到，不构成悬挂。
+    try {
+      await Future.wait([outDone.future, errDone.future])
+          .timeout(const Duration(seconds: 2));
+    } catch (_) {}
     try {
       await outSub.cancel();
     } catch (_) {}
     try {
       await errSub.cancel();
-    } catch (_) {}
-    try {
-      await Future.wait([outDone.future, errDone.future])
-          .timeout(const Duration(seconds: 2));
     } catch (_) {}
     if (killed) return null;
     return ProcessResult(
