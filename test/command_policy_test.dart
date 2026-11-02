@@ -1209,6 +1209,7 @@ void main() {
       // 区内读取此前完全不进规则求值：区内 symlink（字面路径不含 deny
       // 模式）指向受限目录时 deny 规则整体失效。G6-R2 起区内入口先做
       // deny-only 求值（ask/auto 仍不打扰区内读取）。
+      if (Platform.isWindows) return; // symlink 创建需特权
       await Directory('${workspace.path}/vault').create();
       await File('${workspace.path}/vault/notes.txt').writeAsString('notes');
       await Link('${workspace.path}/v')

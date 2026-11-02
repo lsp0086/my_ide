@@ -793,7 +793,23 @@ $writeAllows
     final tmp = File('${target.path}.$nonce.tmp');
     try {
       await tmp.writeAsString(content, flush: true);
-      await tmp.rename(target.path);
+      // Windows 上 rename 到已存在目标（或目标正被并发替换占用）会抛——
+      // 短退避重试，仍不行先移走旧目标再 rename（delete+rename 窗口极短，
+      // 仅作 Windows 兜底；POSIX rename 原子替换语义不受影响）。
+      for (var i = 0;; i++) {
+        try {
+          await tmp.rename(target.path);
+          break;
+        } catch (_) {
+          if (i >= 5) rethrow;
+          if (i > 0) {
+            try {
+              await target.delete();
+            } catch (_) {}
+          }
+          await Future<void>.delayed(Duration(milliseconds: 2 * (i + 1)));
+        }
+      }
     } finally {
       try {
         if (await tmp.exists()) await tmp.delete();

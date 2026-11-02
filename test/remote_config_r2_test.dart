@@ -693,7 +693,10 @@ void main() {
         } catch (_) {}
       });
       await Directory('${tmp.path}/bin').create(recursive: true);
-      final bin = File('${tmp.path}/bin/tailscale');
+      // Windows 上规格 binName 为 tailscale.exe（发现按规格名找）。
+      final bin = File(
+        '${tmp.path}/bin/${Platform.isWindows ? 'tailscale.exe' : 'tailscale'}',
+      );
       await bin.writeAsString('#!/bin/sh\n');
       final stdoutCtrl = StreamController<List<int>>();
       final stderrCtrl = StreamController<List<int>>();

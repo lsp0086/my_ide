@@ -261,6 +261,7 @@ void main() {
     // 修复：[MobileBridge.killTunnelSync] 同步发 kill 信号，isolate 即
     // 便随后被杀信号也已送达。本用例验证同步 kill 真实生效（exitCode
     // 在秒级完成、非 0 终止）。
+    if (Platform.isWindows) return; // /bin/sh 真进程在 Windows 不可用
     final proc = await Process.start(
       '/bin/sh',
       const ['-c', 'sleep 60'],

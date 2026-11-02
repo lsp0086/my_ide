@@ -62,12 +62,18 @@ class WindowLauncher {
   }) =>
       screen.width >= min.width && screen.height >= min.height;
 
+  /// 测试注入：非 macOS 单测里 mock 'my_ide/window' 通道时强制走通道
+  /// 查询（否则非 macOS 直接 return null，ScreenGateApp 拿不到检测尺寸，
+  /// 不支持页上的"当前检测到可用屏幕"文案在跨平台 CI 恒失败）。
+  @visibleForTesting
+  static bool debugScreenChannelForTest = false;
+
   /// 原生屏幕可视区域尺寸（macOS）：取所有已连接屏幕中最大的一块，多显示器下
   /// 外接大屏不会被 `screens.first`（通常是内置小屏）顶掉。
   /// 非 macOS 或通道不可用时返回 null。
   /// 通道在 engine.run 后注册，冷启动首调可能 race，故有限重试。
   static Future<Size?> screenVisibleFrame() async {
-    if (!Platform.isMacOS) return null;
+    if (!Platform.isMacOS && !debugScreenChannelForTest) return null;
     for (var i = 0; i < 5; i++) {
       try {
         final v = await _channel.invokeMethod('getScreenVisibleFrame');

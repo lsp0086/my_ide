@@ -114,6 +114,7 @@ void main() {
   });
   group('caffeinate 生命周期', () {
     test('run 后进程存在、stop 后退出', () async {
+      if (Platform.isWindows) return; // 注入的 /bin/sleep 在 Windows 不可用
       final chats = ChatStore();
       final cps = CheckpointStore();
       final runner = AgentRunner(chats: chats, checkpoints: cps);

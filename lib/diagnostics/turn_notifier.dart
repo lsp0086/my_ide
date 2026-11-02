@@ -38,7 +38,10 @@ class TurnNotifier {
     String? reason,
   }) async {
     if (!enabled) return;
-    if (!Platform.isMacOS) return;
+    // macOS 才有免依赖系统通知通道；默认通道在非 macOS 直接 no-op
+    // （不弹无关命令窗口）。注入 spawn 的单测（跨平台 CI）不受门禁限制，
+    // 否则 Linux/Windows 上假 spawn 永远收不到调用、测试无从断言。
+    if (!Platform.isMacOS && identical(_spawn, _defaultSpawn)) return;
     final label = title.trim().isEmpty ? '新对话' : title.trim();
     final body = ok ? '已完成' : '未完成：${(reason ?? '失败').trim()}';
     final script =

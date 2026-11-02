@@ -10,7 +10,12 @@ extension AgentRunnerCaffeinate on AgentRunner {
   @visibleForTesting
   void stopCaffeinateForTest() => _stopCaffeinate();
   void _startCaffeinate() {
-    if (!Platform.isMacOS || _caffeinateWanted) return;
+    // 非 macOS 只有默认 caffeinate 通道被门禁（Linux/Windows 无此命令）；
+    // 测试注入的可执行（caffeinateCommandForTest 非默认值）不受门禁，
+    // 否则跨平台 CI 上生命周期单测在 Linux/Windows 恒失败。
+    final injected = caffeinateCommandForTest != 'caffeinate';
+    if (!Platform.isMacOS && !injected) return;
+    if (_caffeinateWanted) return;
     _caffeinateWanted = true;
     try {
       unawaited(

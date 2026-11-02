@@ -1819,6 +1819,7 @@ void main() {
     test(
       'timeout=1s 执行 sleep 60：超时返回 124 且不悬挂',
       () async {
+        if (Platform.isWindows) return; // /bin/sleep 在 Windows 不可用
         final tools = AgentComputerTools();
         final sw = Stopwatch()..start();
         final r = await tools.runForTest('/bin/sleep', const [

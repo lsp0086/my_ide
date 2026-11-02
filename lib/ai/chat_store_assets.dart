@@ -93,7 +93,10 @@ extension ChatStoreAssets on ChatStore {
       p.join(root, '.my_ide', rel),
       from: p.join(root, '.my_ide'),
     );
-    return 'asset:$savedRel';
+    // asset: 是逻辑 URI（引用键、分叉前缀匹配均按 `chat_assets/<id>/` 正斜杠
+    // 口径），Windows 上 p.relative/p.join 产生反斜杠会破坏前缀匹配与落盘
+    // 引用——统一归一为正斜杠（resolveChatImage 的 p.join 对两种分隔符兼容）。
+    return 'asset:${savedRel.replaceAll('\\', '/')}';
   }
 
   /// R-PROBEIMG：压缩探针用——返回引用解析后的近似字符长度。
@@ -195,7 +198,7 @@ extension ChatStoreAssets on ChatStore {
           final dstFile = File(p.join(base, dstRel));
           await dstFile.parent.create(recursive: true);
           await srcFile.copy(dstFile.path);
-          next.add('asset:$dstRel');
+          next.add('asset:${dstRel.replaceAll('\\', '/')}');
           changed = true;
         } catch (_) {
           next.add(ref);

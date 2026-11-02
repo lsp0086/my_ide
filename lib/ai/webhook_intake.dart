@@ -94,11 +94,15 @@ class WebhookIntake {
       }
       final len = req.contentLength;
       if (len > maxBodyBytes) {
+        // 先有界排空再回 413：立即关闭会让仍在上传的客户端在 Windows 上
+        // 收到 RST 而非响应（丢弃不计内存，上限外直接断）。
+        await _drainDiscard(req);
         await _json(req, 413, {'error': 'body too large'});
         return;
       }
       final body = await _readBounded(req);
       if (body == null) {
+        await _drainDiscard(req);
         await _json(req, 413, {'error': 'body too large'});
         return;
       }
@@ -141,6 +145,19 @@ class WebhookIntake {
       if (chunks.length > maxBodyBytes) return null;
     }
     return utf8.decode(chunks, allowMalformed: true);
+  }
+
+  /// 拒绝前丢弃剩余请求体：只计数不留内存，超过丢弃上限（1MB）即断，
+  /// 防 content-length 谎报的巨型 body 拖死排空。任何错误吞掉（客户端
+  /// 提前断开是常态，不影响随后回 413）。
+  static Future<void> _drainDiscard(HttpRequest req) async {
+    var dropped = 0;
+    try {
+      await for (final chunk in req) {
+        dropped += chunk.length;
+        if (dropped > 1 << 20) break;
+      }
+    } catch (_) {}
   }
 
   static Future<void> _json(HttpRequest req, int code, Map body) async {

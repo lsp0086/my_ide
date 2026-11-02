@@ -502,6 +502,7 @@ void main() {
     });
 
     test('A4-7 安装子进程超时即 kill：忽略 TERM 的假 npm 也能收敛', () async {
+      if (Platform.isWindows) return; // 假 npm 是 #!/bin/sh 脚本
       final dir = await Directory.systemTemp.createTemp('install-timeout-');
       try {
         // 假 npm：忽略 TERM 后 sleep 30——必须靠 SIGKILL 收敛，

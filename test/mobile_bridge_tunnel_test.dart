@@ -102,7 +102,9 @@ void main() {
       final binDir = await Directory.systemTemp.createTemp('tunnel-bins-');
       try {
         // workDir 无缓存 bin（缓存分支 miss），binDir 放假二进制。
-        final fake = File(p.join(binDir.path, 'cloudflared'));
+        // Windows 上规格 binName 带 .exe 后缀，按平台取规格名。
+        final binName = Platform.isWindows ? 'cloudflared.exe' : 'cloudflared';
+        final fake = File(p.join(binDir.path, binName));
         await fake.writeAsString('#!/bin/sh\necho fake\n');
         final tunnel = MobileTunnel(
           workDir: workDir.path,
@@ -168,7 +170,12 @@ void main() {
       final workDir = await Directory.systemTemp.createTemp('tunnel-cache-');
       final binDir = await Directory.systemTemp.createTemp('tunnel-bins-');
       try {
-        await File(p.join(binDir.path, 'cloudflared')).writeAsString('fake');
+        await File(
+          p.join(
+            binDir.path,
+            Platform.isWindows ? 'cloudflared.exe' : 'cloudflared',
+          ),
+        ).writeAsString('fake');
         final captured = <ProcessStartMode>[];
         final tunnel = MobileTunnel(
           workDir: workDir.path,
@@ -203,6 +210,7 @@ void main() {
       // 端到端：真 Process.start + 假 cloudflared 脚本验证 URL 抓取路径。
       // 脚本打完 URL 即退出（部分沙箱桩化"退出才吐字节"，秒退脚本在真实
       // 管道/桩化管道两种环境都能验证；长驻流行为由上面的 mode 锁覆盖）。
+      if (Platform.isWindows) return; // #!/bin/sh 脚本无法在 Windows 执行
       final workDir = await Directory.systemTemp.createTemp('tunnel-cache-');
       final binDir = await Directory.systemTemp.createTemp('tunnel-bins-');
       MobileTunnelHandle? handle;

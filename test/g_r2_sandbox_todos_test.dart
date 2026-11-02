@@ -137,6 +137,7 @@ void main() {
 
     test('shellQuote 转义经真实 /bin/sh 往返无损（元字符/变量/反引号不展开）',
         () async {
+      if (Platform.isWindows) return; // /bin/sh 在 Windows 不可用
       const payload = r"""it's a "test" $HOME `id` ; rm -rf /|sh""";
       final quoted = ToolRegistry.seatbeltShellQuoteForTest(payload);
       final r = await Process.run('/bin/sh', ['-c', 'printf %s $quoted']);

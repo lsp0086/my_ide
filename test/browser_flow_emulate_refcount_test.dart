@@ -545,8 +545,15 @@ void main() {
           },
           'type': 'HistoryApi',
         });
-        await Future<void>.delayed(const Duration(milliseconds: 20));
-        expect(svc.currentUrl, 'https://main.test/a#tab2');
+        // 主帧导航走 _handleMainNavUrl 异步门禁（含网络侧校验）：CI 高负载
+        // 或 DNS 迟滞时 20ms 固定等待会漏——改为有界轮询直到归因到位。
+        var settled = false;
+        for (var i = 0; i < 200 && !settled; i++) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+          settled = svc.currentUrl == 'https://main.test/a#tab2';
+        }
+        expect(settled, isTrue,
+            reason: '同文档 pushState 归因超时：${svc.currentUrl}');
       } finally {
         await svc.dispose();
       }

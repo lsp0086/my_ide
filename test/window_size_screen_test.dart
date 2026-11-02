@@ -147,10 +147,14 @@ void main() {
     }
 
     setUp(() {
+      // 非 macOS CI 上强制走 mock 通道（screenVisibleFrame 有平台门禁），
+      // 否则"当前检测到可用屏幕"文案拿不到检测尺寸。
+      WindowLauncher.debugScreenChannelForTest = true;
       mockScreenVisibleFrame(const Size(640, 480));
     });
 
     tearDown(() {
+      WindowLauncher.debugScreenChannelForTest = false;
       messenger.setMockMethodCallHandler(windowChannel, null);
     });
 

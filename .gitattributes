@@ -1,2 +1,4 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Auto detect text files and force LF on all platforms.
+# eol=lf：Windows 检出不转 CRLF——大量"源码口径"测试断言（跨行 contains、
+# substring 偏移窗口、'\n' 分割/定位）依赖仓库文本为 LF，CRLF 会系统性破坏。
+* text=auto eol=lf
