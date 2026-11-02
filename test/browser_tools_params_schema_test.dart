@@ -12,9 +12,12 @@ import 'package:my_ide/browser/chrome_cdp.dart';
 Future<String> readLibSource(String relPath) async {
   final base = File('lib/$relPath');
   var out = await base.readAsString();
+  final stem = base.uri.pathSegments.last.replaceAll(RegExp(r'\.dart$'), '');
   for (final f in base.parent.listSync().whereType<File>()) {
-    if (f.path.startsWith('${base.path.replaceAll(RegExp(r'\.dart$'), '')}_') &&
-        f.path.endsWith('.dart')) {
+    // 按文件名匹配 part：f.path 在 Windows 是反斜杠，与 'lib/ai/xxx_' 前
+    // 缀比对恒 false（part 全部漏拼、源码口径断言在 Windows CI 必挂）。
+    final name = f.uri.pathSegments.last;
+    if (name.startsWith('${stem}_') && name.endsWith('.dart')) {
       out += '\n${await f.readAsString()}';
     }
   }
@@ -89,9 +92,11 @@ class _FakeDevTools {
 String _lib(String rel) {
   final base = File('lib/$rel');
   var out = base.readAsStringSync();
+  final stem = base.uri.pathSegments.last.replaceAll(RegExp(r'\.dart$'), '');
   for (final f in base.parent.listSync().whereType<File>()) {
-    if (f.path.startsWith('${base.path.replaceAll(RegExp(r'\.dart$'), '')}_') &&
-        f.path.endsWith('.dart')) {
+    // 按文件名匹配 part（Windows 反斜杠路径下 f.path 前缀比对恒 false）。
+    final name = f.uri.pathSegments.last;
+    if (name.startsWith('${stem}_') && name.endsWith('.dart')) {
       out += '\n${f.readAsStringSync()}';
     }
   }

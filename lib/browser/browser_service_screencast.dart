@@ -199,7 +199,7 @@ extension BrowserServiceScreencast on BrowserService {
     _snapshotBaselineCap = 0;
     // R-CLEARPAGE-NAV：主帧导航时刻与中断失败缓冲同属当页——切页后旧
     // 时刻戳保留，新页 abort 的"被导航中断"判定用旧时间戳归因失真。
-    _lastMainFrameNavAt = DateTime.fromMillisecondsSinceEpoch(0);
+    _lastMainFrameNavSeq = 0;
     _pendingAbortedFailures.clear();
     // G-B8：末帧缓存同属当页——切页后旧页残帧不得冒充当前页兜底数据。
     _lastScreencastFrame = null;

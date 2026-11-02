@@ -91,7 +91,7 @@ extension _BrowserServiceCdpReconnectExt on BrowserService {
     _abortedFlushTimer?.cancel();
     _abortedFlushTimer = null;
     _pendingAbortedFailures.clear();
-    _lastMainFrameNavAt = DateTime.fromMillisecondsSinceEpoch(0);
+    _lastMainFrameNavSeq = 0;
     // R-CTX-CLEAR：reset 同清 contextId 存活表（与 clearPageBuffers 对齐）。
     _ctxUniqueById.clear();
     _ctxFrameById.clear();

@@ -78,7 +78,7 @@ class BrowserService {
   // 2s 窗内出现主帧新导航即归类"被导航中断"降级展示。
   // G2-4：待定 abort 失败带资源类型（flush 落表时随 resourceType 入库）。
 
-  final Map<String, ({String url, String shown, String err, DateTime at, String resourceType})>
+  final Map<String, ({String url, String shown, String err, DateTime at, int seq, String resourceType})>
       _pendingAbortedFailures = {};
 
   static const _abortedFlushWindow = Duration(seconds: 2);
@@ -87,7 +87,12 @@ class BrowserService {
 
   int _abortedSeq = 0;
 
-  DateTime _lastMainFrameNavAt = DateTime.fromMillisecondsSinceEpoch(0);
+  // 导航/abort 事件的进程内逻辑序号（严格递增）：Windows 系统时钟分辨率
+  // ~15ms，同一 tick 内"先 abort 后导航"的 DateTime.now() 相等，
+  // isAfter 归因翻转成"未被导航中断"（CI 确定性复现）。用序号定序。
+  int _navAbortEventSeq = 0;
+
+  int _lastMainFrameNavSeq = 0;
 
   // C4：executionContextId → uniqueContextId（evaluate 防跨进程复用错域）。
 

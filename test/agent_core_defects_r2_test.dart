@@ -23,9 +23,12 @@ import 'package:shared_preferences/shared_preferences.dart';
 String readLibSourceSync(String relPath) {
   final base = File('lib/$relPath');
   var out = base.readAsStringSync();
+  final stem = base.uri.pathSegments.last.replaceAll(RegExp(r'\.dart$'), '');
   for (final f in base.parent.listSync().whereType<File>()) {
-    if (f.path.startsWith('${base.path.replaceAll(RegExp(r'\.dart$'), '')}_') &&
-        f.path.endsWith('.dart')) {
+    // 按文件名匹配 part：f.path 在 Windows 是反斜杠，与 'lib/ai/xxx_' 前
+    // 缀比对恒 false（part 全部漏拼、源码口径断言在 Windows CI 必挂）。
+    final name = f.uri.pathSegments.last;
+    if (name.startsWith('${stem}_') && name.endsWith('.dart')) {
       out += '\n${f.readAsStringSync()}';
     }
   }

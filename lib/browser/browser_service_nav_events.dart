@@ -305,6 +305,7 @@ extension BrowserServiceNavEvents on BrowserService {
         shown: shown,
         err: err,
         at: DateTime.now(),
+        seq: ++_navAbortEventSeq,
         resourceType: resourceType,
       );
       _abortedFlushTimer ??= Timer(BrowserService._abortedFlushWindow, _flushAbortedFailures);
@@ -395,7 +396,10 @@ extension BrowserServiceNavEvents on BrowserService {
     _pendingAbortedFailures.clear();
     for (final e in entries) {
       final r = e.value;
-      final interrupted = _lastMainFrameNavAt.isAfter(r.at);
+      // 序号定序（见 _navAbortEventSeq 注）：abort 事件序号小于最近主帧
+      // 导航序号即"先失败后到达新导航"=被中断。同 tick 的 DateTime 相等
+      // 不可用 isAfter 区分（Windows 粗时钟 CI 确定性误判）。
+      final interrupted = r.seq < _lastMainFrameNavSeq;
       if (interrupted) {
         // 降级：网络表保留条目并标注导航中断（排查仍可见），console 不推
         // pageError/warn——导航竞态不是站点错误。
@@ -415,7 +419,7 @@ extension BrowserServiceNavEvents on BrowserService {
   }
   /// C1：主帧导航时刻记录 + 到达即 flush（判定语义）。
   void _noteMainNavForAborted() {
-    _lastMainFrameNavAt = DateTime.now();
+    _lastMainFrameNavSeq = ++_navAbortEventSeq;
     if (_pendingAbortedFailures.isNotEmpty) _flushAbortedFailures();
   }
 }

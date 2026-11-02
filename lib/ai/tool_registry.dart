@@ -360,16 +360,19 @@ $writeAllows
   /// seatbelt 按规范路径判定）+ macOS /tmp→/private/tmp、/var→/private/var
   /// 双发变体，防允许面静默落空。
   static List<String> _seatbeltRootSubpaths(String rootPath) {
+    // Seatbelt profile 是 macOS 专属 POSIX 文本：路径必须按 posix 语境规整，
+    // 用平台语境（Windows 的 p.normalize/absolute）会把 /tmp/... 变成
+    // C:\tmp\...，subpath 双发变体静默落空、profile 断言在 Windows CI 必挂。
     final out = <String>[];
     void add(String cand) {
       if (cand.isEmpty) return;
-      final v = p.normalize(p.absolute(cand));
+      final v = p.posix.normalize(p.posix.absolute(cand));
       if (!out.contains(v)) out.add(v);
     }
 
     add(rootPath);
     try {
-      add(WorkspaceFs.realpathOf(p.normalize(p.absolute(rootPath))));
+      add(WorkspaceFs.realpathOf(p.posix.normalize(p.posix.absolute(rootPath))));
     } catch (_) {}
     final extra = <String>[];
     for (final v in out) {
